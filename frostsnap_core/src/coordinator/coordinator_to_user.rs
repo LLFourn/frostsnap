@@ -3,9 +3,9 @@ use frostsnap_macros::Kind;
 
 #[derive(Clone, Debug, Kind)]
 pub enum CoordinatorToUserMessage {
-    KeyGen {
+    Keygen {
         keygen_id: KeygenId,
-        inner: CoordinatorToUserKeyGenMessage,
+        inner: CoordinatorToUserKeygenMessage,
     },
     Signing(CoordinatorToUserSigningMessage),
     Restoration(super::restoration::ToUserRestoration),
@@ -30,14 +30,14 @@ pub enum CoordinatorToUserSigningMessage {
 }
 
 #[derive(Clone, Debug)]
-pub enum CoordinatorToUserKeyGenMessage {
+pub enum CoordinatorToUserKeygenMessage {
     ReceivedShares {
         from: DeviceId,
     },
-    CheckKeyGen {
+    CheckKeygen {
         session_hash: SessionHash,
     },
-    KeyGenAck {
+    KeygenAck {
         from: DeviceId,
         all_acks_received: bool,
     },

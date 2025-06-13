@@ -462,11 +462,11 @@ where
                         DeviceSend::ToCoordinator(boxed) => {
                             if matches!(
                                 boxed.as_ref(),
-                                DeviceToCoordinatorMessage::KeyGenResponse(_)
+                                DeviceToCoordinatorMessage::KeygenResponse(_)
                             ) {
                                 ui.set_workflow(ui::Workflow::WaitingFor(
                                     ui::WaitingFor::CoordinatorResponse(
-                                        ui::WaitingResponse::KeyGen,
+                                        ui::WaitingResponse::Keygen,
                                     ),
                                 ));
                             }
@@ -475,7 +475,7 @@ where
                         }
                         DeviceSend::ToUser(boxed) => {
                             match *boxed {
-                                DeviceToUserMessage::FinalizeKeyGen => {
+                                DeviceToUserMessage::FinalizeKeygen => {
                                     let new_name = ui
                                         .get_device_name()
                                         .expect("must have set name before starting keygen")
@@ -491,8 +491,8 @@ where
                                     ui.clear_busy_task();
                                     ui.clear_workflow();
                                 }
-                                DeviceToUserMessage::CheckKeyGen { phase } => {
-                                    ui.set_workflow(ui::Workflow::prompt(ui::Prompt::KeyGen {
+                                DeviceToUserMessage::CheckKeygen { phase } => {
+                                    ui.set_workflow(ui::Workflow::prompt(ui::Prompt::Keygen {
                                         phase,
                                     }));
                                 }
@@ -564,8 +564,8 @@ where
                     )); // this is just the default
 
                     match ui_event {
-                        UiEvent::KeyGenConfirm { phase } => {
-                            let waiting_for = ui::WaitingFor::WaitingForKeyGenFinalize {
+                        UiEvent::KeygenConfirm { phase } => {
+                            let waiting_for = ui::WaitingFor::WaitingForKeygenFinalize {
                                 key_name: phase.key_name().to_string(),
                                 t_of_n: phase.t_of_n(),
                                 session_hash: phase.session_hash(),

@@ -41,7 +41,7 @@ fn keygen_maliciously_replace_public_poly() {
         .into_iter()
         .find_map(|msg| match msg {
             CoordinatorSend::ToDevice {
-                message: dokeygen @ CoordinatorToDeviceMessage::KeyGen(Keygen::Begin(_)),
+                message: dokeygen @ CoordinatorToDeviceMessage::Keygen(Keygen::Begin(_)),
                 ..
             } => Some(dokeygen),
             _ => None,
@@ -54,7 +54,7 @@ fn keygen_maliciously_replace_public_poly() {
         for send in run.message_queue.iter_mut() {
             if let Send::DeviceToCoordinator {
                 from: _,
-                message: DeviceToCoordinatorMessage::KeyGenResponse(input),
+                message: DeviceToCoordinatorMessage::KeygenResponse(input),
             } = send
             {
                 // A "man in the middle" replace the polynomial the coordinator actually
@@ -67,7 +67,7 @@ fn keygen_maliciously_replace_public_poly() {
                     .into_iter()
                     .find_map(|send| match send {
                         DeviceSend::ToCoordinator(boxed) => match *boxed {
-                            DeviceToCoordinatorMessage::KeyGenResponse(response) => Some(response),
+                            DeviceToCoordinatorMessage::KeygenResponse(response) => Some(response),
                             _ => None,
                         },
                         _ => None,

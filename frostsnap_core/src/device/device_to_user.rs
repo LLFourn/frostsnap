@@ -7,9 +7,9 @@ use super::*;
 /// into the core module once the action is confirmed to make progress.
 #[derive(Clone, Debug)]
 pub enum DeviceToUserMessage {
-    FinalizeKeyGen,
-    CheckKeyGen {
-        phase: Box<KeyGenPhase2>,
+    FinalizeKeygen,
+    CheckKeygen {
+        phase: Box<KeygenPhase2>,
     },
     SignatureRequest {
         phase: Box<SignPhase1>,

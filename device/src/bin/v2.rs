@@ -287,7 +287,7 @@ where
             Workflow::None => {
                 if let Some(busy_task) = &self.busy_task {
                     match busy_task {
-                        BusyTask::KeyGen => self.display.print("Generating key.."),
+                        BusyTask::Keygen => self.display.print("Generating key.."),
                         BusyTask::Signing => self.display.print("Signing.."),
                         BusyTask::VerifyingShare => self.display.print("Verifying key.."),
                         BusyTask::Loading => self.display.print("loading.."),
@@ -317,7 +317,7 @@ where
                 self.display.ready_screen(new_name, self.recovery_mode);
             }
             Workflow::WaitingFor(waiting_for) => match waiting_for {
-                WaitingFor::WaitingForKeyGenFinalize {
+                WaitingFor::WaitingForKeygenFinalize {
                     key_name,
                     t_of_n,
                     session_hash,
@@ -353,7 +353,7 @@ where
                     };
                 }
                 WaitingFor::CoordinatorResponse(response) => match response {
-                    WaitingResponse::KeyGen => {
+                    WaitingResponse::Keygen => {
                         self.display.print("Finished!\nWaiting for coordinator..");
                     }
                 },
@@ -389,7 +389,7 @@ where
                             self.display.print(string);
                         }
                     },
-                    Prompt::KeyGen { phase } => {
+                    Prompt::Keygen { phase } => {
                         let session_hash = phase.session_hash();
                         self.display.show_keygen_check(
                             phase.key_name(),
@@ -563,7 +563,7 @@ where
                         }
                         AnimationProgress::Done => {
                             event = Some(match prompt {
-                                Prompt::KeyGen { phase } => UiEvent::KeyGenConfirm {
+                                Prompt::Keygen { phase } => UiEvent::KeygenConfirm {
                                     phase: phase.clone(),
                                 },
                                 Prompt::Signing { phase } => UiEvent::SigningConfirm {

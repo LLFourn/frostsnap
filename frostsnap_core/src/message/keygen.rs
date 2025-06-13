@@ -15,7 +15,7 @@ pub enum Keygen {
 
 impl From<Keygen> for CoordinatorToDeviceMessage {
     fn from(value: Keygen) -> Self {
-        Self::KeyGen(value)
+        Self::Keygen(value)
     }
 }
 
@@ -36,7 +36,7 @@ impl From<Begin> for Keygen {
 
 impl From<Begin> for CoordinatorToDeviceMessage {
     fn from(value: Begin) -> Self {
-        CoordinatorToDeviceMessage::KeyGen(value.into())
+        CoordinatorToDeviceMessage::Keygen(value.into())
     }
 }
 

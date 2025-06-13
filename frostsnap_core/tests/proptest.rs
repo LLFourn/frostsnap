@@ -10,9 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use frostsnap_core::{
     coordinator::{
-        CoordinatorToUserKeyGenMessage, CoordinatorToUserMessage, CoordinatorToUserSigningMessage,
+        CoordinatorToUserKeygenMessage, CoordinatorToUserMessage, CoordinatorToUserSigningMessage,
     },
-    device::{DeviceToUserMessage, KeyGenPhase2, KeyPurpose, SignPhase1},
+    device::{DeviceToUserMessage, KeyPurpose, KeygenPhase2, SignPhase1},
     message::keygen,
     AccessStructureRef, DeviceId, KeygenId, SignSessionId, WireSignTask,
 };
@@ -494,7 +494,7 @@ struct HappyPathTest {
 
 #[derive(Default, Debug)]
 pub struct ProptestEnv {
-    device_keygen_acks: BTreeMap<KeygenId, BTreeMap<DeviceId, KeyGenPhase2>>,
+    device_keygen_acks: BTreeMap<KeygenId, BTreeMap<DeviceId, KeygenPhase2>>,
     sign_reqs: BTreeMap<SignSessionId, BTreeMap<DeviceId, SignPhase1>>,
     coordinator_keygen_acks: BTreeSet<KeygenId>,
     finished_signatures: BTreeSet<SignSessionId>,
@@ -508,10 +508,10 @@ impl Env for ProptestEnv {
         _rng: &mut impl RngCore,
     ) {
         match message {
-            CoordinatorToUserMessage::KeyGen {
+            CoordinatorToUserMessage::Keygen {
                 keygen_id,
                 inner:
-                    CoordinatorToUserKeyGenMessage::KeyGenAck {
+                    CoordinatorToUserKeygenMessage::KeygenAck {
                         all_acks_received: true,
                         ..
                     },
@@ -537,11 +537,11 @@ impl Env for ProptestEnv {
     ) {
         use DeviceToUserMessage::*;
         match message {
-            FinalizeKeyGen => {
+            FinalizeKeygen => {
                 // TODO: Do we need to keep track of keygen-finalized messages received by the user?
                 // TODO: Ignore for now.
             }
-            CheckKeyGen { phase, .. } => {
+            CheckKeygen { phase, .. } => {
                 let pending = self.device_keygen_acks.entry(phase.keygen_id).or_default();
                 pending.insert(from, *phase);
             }
@@ -557,7 +557,7 @@ impl Env for ProptestEnv {
                     DisplayBackupRequest { phase } => {
                         let backup_ack = run
                             .device(from)
-                            .display_backup_ack(*phase, &mut TestDeviceKeyGen)
+                            .display_backup_ack(*phase, &mut TestDeviceKeygen)
                             .unwrap();
                         run.extend_from_device(from, backup_ack);
                     }
@@ -614,7 +614,7 @@ impl StateMachineTest for HappyPathTest {
                 let phase = pending.remove(&device_id).unwrap();
                 let ack = run
                     .device(device_id)
-                    .keygen_ack(phase, &mut TestDeviceKeyGen, rng)
+                    .keygen_ack(phase, &mut TestDeviceKeygen, rng)
                     .unwrap();
                 run.extend_from_device(device_id, ack);
             }
@@ -680,7 +680,7 @@ impl StateMachineTest for HappyPathTest {
                     .unwrap();
                 let sign_ack = run
                     .device(device_id)
-                    .sign_ack(phase, &mut TestDeviceKeyGen)
+                    .sign_ack(phase, &mut TestDeviceKeygen)
                     .unwrap();
                 run.extend_from_device(device_id, sign_ack);
             }

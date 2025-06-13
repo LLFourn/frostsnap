@@ -286,7 +286,7 @@ impl<'a> EfuseHmacKey<'a> {
     }
 }
 
-impl frostsnap_core::device::DeviceSymmetricKeyGen for EfuseHmacKey<'_> {
+impl frostsnap_core::device::DeviceSymmetricKeygen for EfuseHmacKey<'_> {
     fn get_share_encryption_key(
         &mut self,
         access_structure_ref: AccessStructureRef,

@@ -1,5 +1,5 @@
 use bitcoin::Address;
-use common::{TestDeviceKeyGen, TEST_ENCRYPTION_KEY};
+use common::{TestDeviceKeygen, TEST_ENCRYPTION_KEY};
 use frostsnap_core::bitcoin_transaction::{LocalSpk, TransactionTemplate};
 use frostsnap_core::coordinator::restoration::{PhysicalBackupPhase, RecoverShare};
 use frostsnap_core::device::{self, DeviceToUserMessage, KeyPurpose};
@@ -7,7 +7,7 @@ use frostsnap_core::message::EncodedSignature;
 use frostsnap_core::tweak::BitcoinBip32Path;
 use frostsnap_core::{
     coordinator::{
-        CoordinatorToUserKeyGenMessage, CoordinatorToUserMessage, CoordinatorToUserSigningMessage,
+        CoordinatorToUserKeygenMessage, CoordinatorToUserMessage, CoordinatorToUserSigningMessage,
         FrostCoordinator,
     },
     CheckedSignTask, DeviceId, MasterAppkey, SessionHash, WireSignTask,
@@ -57,23 +57,23 @@ impl common::Env for TestEnv {
         rng: &mut impl RngCore,
     ) {
         match message {
-            CoordinatorToUserMessage::KeyGen {
+            CoordinatorToUserMessage::Keygen {
                 keygen_id,
                 inner: keygen_message,
             } => match keygen_message {
-                CoordinatorToUserKeyGenMessage::ReceivedShares { from, .. } => {
+                CoordinatorToUserKeygenMessage::ReceivedShares { from, .. } => {
                     assert!(
                         self.received_keygen_shares.insert(from),
                         "should not have already received"
                     )
                 }
-                CoordinatorToUserKeyGenMessage::CheckKeyGen { session_hash, .. } => {
+                CoordinatorToUserKeygenMessage::CheckKeygen { session_hash, .. } => {
                     assert!(
                         self.coordinator_check.replace(session_hash).is_none(),
                         "should not have already set this"
                     );
                 }
-                CoordinatorToUserKeyGenMessage::KeyGenAck {
+                CoordinatorToUserKeygenMessage::KeygenAck {
                     from,
                     all_acks_received,
                 } => {
@@ -208,12 +208,12 @@ impl common::Env for TestEnv {
         rng: &mut impl RngCore,
     ) {
         match message {
-            DeviceToUserMessage::FinalizeKeyGen => {}
-            DeviceToUserMessage::CheckKeyGen { phase, .. } => {
+            DeviceToUserMessage::FinalizeKeygen => {}
+            DeviceToUserMessage::CheckKeygen { phase, .. } => {
                 self.keygen_checks.insert(from, phase.session_hash());
                 let ack = run
                     .device(from)
-                    .keygen_ack(*phase, &mut TestDeviceKeyGen, rng)
+                    .keygen_ack(*phase, &mut TestDeviceKeygen, rng)
                     .unwrap();
                 run.extend_from_device(from, ack);
             }
@@ -221,7 +221,7 @@ impl common::Env for TestEnv {
                 self.sign_tasks.insert(from, phase.sign_task().clone());
                 let sign_ack = run
                     .device(from)
-                    .sign_ack(*phase, &mut TestDeviceKeyGen)
+                    .sign_ack(*phase, &mut TestDeviceKeygen)
                     .unwrap();
                 run.extend_from_device(from, sign_ack);
             }
@@ -245,13 +245,13 @@ impl common::Env for TestEnv {
                     DisplayBackupRequest { phase } => {
                         let backup_ack = run
                             .device(from)
-                            .display_backup_ack(*phase, &mut TestDeviceKeyGen)
+                            .display_backup_ack(*phase, &mut TestDeviceKeygen)
                             .unwrap();
                         run.extend_from_device(from, backup_ack);
                     }
                     ConsolidateBackup(phase) => {
                         let ack = run.device(from).finish_consolidation(
-                            &mut TestDeviceKeyGen,
+                            &mut TestDeviceKeygen,
                             phase,
                             rng,
                         );

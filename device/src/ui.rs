@@ -10,7 +10,7 @@ use frostsnap_comms::Sha256Digest;
 use frostsnap_core::{
     device::{
         restoration::{BackupDisplayPhase, EnterBackupPhase},
-        KeyGenPhase2, SignPhase1,
+        KeygenPhase2, SignPhase1,
     },
     schnorr_fun::frost::SecretShare,
     SessionHash,
@@ -74,7 +74,7 @@ const LONG_HOLD_TO_CONFIRM_TIME_MS: crate::Duration = crate::Duration::millis(60
 #[derive(Clone, Debug)]
 pub enum WaitingFor {
     /// Waiting for the coord to say "Hey, finalize!"
-    WaitingForKeyGenFinalize {
+    WaitingForKeygenFinalize {
         key_name: String,
         t_of_n: (u16, u16),
         session_hash: SessionHash,
@@ -91,7 +91,7 @@ pub enum WaitingFor {
 
 #[derive(Clone, Debug)]
 pub enum WaitingResponse {
-    KeyGen,
+    Keygen,
 }
 
 #[derive(Debug)]
@@ -158,8 +158,8 @@ impl Default for Workflow {
 
 #[derive(Clone, Debug)]
 pub enum Prompt {
-    KeyGen {
-        phase: Box<KeyGenPhase2>,
+    Keygen {
+        phase: Box<KeygenPhase2>,
     },
     Signing {
         phase: Box<SignPhase1>,
@@ -184,7 +184,7 @@ pub enum Prompt {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BusyTask {
-    KeyGen,
+    Keygen,
     Signing,
     VerifyingShare,
     Loading,
@@ -200,8 +200,8 @@ pub enum FirmwareUpgradeStatus {
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
-    KeyGenConfirm {
-        phase: Box<KeyGenPhase2>,
+    KeygenConfirm {
+        phase: Box<KeygenPhase2>,
     },
     SigningConfirm {
         phase: Box<SignPhase1>,

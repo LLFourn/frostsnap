@@ -34,7 +34,7 @@ pub enum DeviceSend {
 
 #[derive(Clone, Debug, bincode::Encode, bincode::Decode, Kind)]
 pub enum CoordinatorToDeviceMessage {
-    KeyGen(keygen::Keygen),
+    Keygen(keygen::Keygen),
     RequestSign(Box<RequestSign>),
     OpenNonceStreams {
         streams: Vec<CoordNonceStreamState>,
@@ -123,9 +123,9 @@ pub enum DeviceToCoordinatorMessage {
     NonceResponse {
         segments: Vec<NonceStreamSegment>,
     },
-    KeyGenResponse(KeyGenResponse),
-    KeyGenAck(KeyGenAck),
-    // KeyGenFinalized,
+    KeygenResponse(KeygenResponse),
+    KeygenAck(KeygenAck),
+    // KeygenFinalized,
     SignatureShare {
         session_id: SignSessionId,
         signature_shares: Vec<SignatureShare>,
@@ -156,7 +156,7 @@ pub struct HeldShare {
 }
 
 #[derive(Clone, Debug, bincode::Encode, bincode::Decode, PartialEq)]
-pub struct KeyGenResponse {
+pub struct KeygenResponse {
     pub keygen_id: KeygenId,
     pub input: Box<encpedpop::KeygenInput>,
 }
@@ -189,7 +189,7 @@ impl EncodedSignature {
 
 #[derive(Clone, Debug)]
 pub enum TaskKind {
-    KeyGen,
+    Keygen,
     Sign,
     DisplayBackup,
     CheckBackup,
@@ -215,12 +215,12 @@ pub struct DeviceSignReq {
 }
 
 #[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
-pub struct KeyGenAck {
+pub struct KeygenAck {
     pub ack_session_hash: SessionHash,
     pub keygen_id: KeygenId,
 }
 
-impl IntoIterator for KeyGenAck {
+impl IntoIterator for KeygenAck {
     type Item = DeviceSend;
     type IntoIter = core::iter::Once<DeviceSend>;
 
@@ -229,8 +229,8 @@ impl IntoIterator for KeyGenAck {
     }
 }
 
-impl From<KeyGenAck> for DeviceToCoordinatorMessage {
-    fn from(value: KeyGenAck) -> Self {
-        DeviceToCoordinatorMessage::KeyGenAck(value)
+impl From<KeygenAck> for DeviceToCoordinatorMessage {
+    fn from(value: KeygenAck) -> Self {
+        DeviceToCoordinatorMessage::KeygenAck(value)
     }
 }

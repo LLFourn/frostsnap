@@ -236,7 +236,7 @@ impl<S: Debug + NonceStreamSlot> FrostSigner<S> {
     pub fn display_backup_ack(
         &mut self,
         phase: BackupDisplayPhase,
-        symm_keygen: &mut impl DeviceSymmetricKeyGen,
+        symm_keygen: &mut impl DeviceSymmetricKeygen,
     ) -> Result<Vec<DeviceSend>, ActionError> {
         let key_data = self
             .keys
@@ -329,7 +329,7 @@ impl<S: Debug + NonceStreamSlot> FrostSigner<S> {
 
     pub fn finish_consolidation(
         &mut self,
-        symm_keygen: &mut impl DeviceSymmetricKeyGen,
+        symm_keygen: &mut impl DeviceSymmetricKeygen,
         phase: ConsolidatePhase,
         rng: &mut impl rand_core::RngCore,
     ) -> impl IntoIterator<Item = DeviceSend> {
@@ -346,7 +346,7 @@ impl<S: Debug + NonceStreamSlot> FrostSigner<S> {
             symm_keygen,
             rng,
         );
-        self.save_complete_share(KeyGenPhase3 {
+        self.save_complete_share(KeygenPhase3 {
             key_name: phase.complete_share.key_name,
             key_purpose: phase.complete_share.purpose,
             access_structure_ref: phase.complete_share.access_structure_ref,

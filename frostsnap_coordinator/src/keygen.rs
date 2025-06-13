@@ -3,22 +3,22 @@ use std::collections::BTreeSet;
 use crate::{Completion, Sink, UiProtocol};
 use frostsnap_comms::CoordinatorSendMessage;
 use frostsnap_core::{
-    coordinator::{CoordinatorToUserKeyGenMessage, CoordinatorToUserMessage, FrostCoordinator},
+    coordinator::{CoordinatorToUserKeygenMessage, CoordinatorToUserMessage, FrostCoordinator},
     message::keygen,
     AccessStructureRef, DeviceId, KeygenId, SessionHash,
 };
 use tracing::{event, Level};
 
-pub struct KeyGen {
-    sink: Box<dyn Sink<KeyGenState>>,
-    state: KeyGenState,
+pub struct Keygen {
+    sink: Box<dyn Sink<KeygenState>>,
+    state: KeygenState,
     keygen_messages: Vec<CoordinatorSendMessage>,
     send_cancel_to_all: bool,
 }
 
-impl KeyGen {
+impl Keygen {
     pub fn new(
-        keygen_sink: impl Sink<KeyGenState> + 'static,
+        keygen_sink: impl Sink<KeygenState> + 'static,
         coordinator: &mut FrostCoordinator,
         currently_connected: BTreeSet<DeviceId>,
         begin_keygen: keygen::Begin,
@@ -26,7 +26,7 @@ impl KeyGen {
     ) -> Self {
         let mut self_ = Self {
             sink: Box::new(keygen_sink),
-            state: KeyGenState {
+            state: KeygenState {
                 devices: begin_keygen.device_to_share_index.keys().cloned().collect(),
                 threshold: begin_keygen.threshold.into(),
                 keygen_id: begin_keygen.keygen_id,
@@ -74,7 +74,7 @@ impl KeyGen {
     }
 }
 
-impl UiProtocol for KeyGen {
+impl UiProtocol for Keygen {
     fn cancel(&mut self) {
         self.abort("Key generation canceled".into(), true);
     }
@@ -92,19 +92,19 @@ impl UiProtocol for KeyGen {
     }
 
     fn process_to_user_message(&mut self, message: CoordinatorToUserMessage) -> bool {
-        if let CoordinatorToUserMessage::KeyGen { keygen_id, inner } = message {
+        if let CoordinatorToUserMessage::Keygen { keygen_id, inner } = message {
             if keygen_id == self.state.keygen_id {
                 match inner {
-                    CoordinatorToUserKeyGenMessage::ReceivedShares { from } => {
+                    CoordinatorToUserKeygenMessage::ReceivedShares { from } => {
                         self.state.got_shares.push(from);
                         if self.state.got_shares.len() == self.state.devices.len() {
                             self.state.all_shares = true;
                         }
                     }
-                    CoordinatorToUserKeyGenMessage::CheckKeyGen { session_hash } => {
+                    CoordinatorToUserKeygenMessage::CheckKeygen { session_hash } => {
                         self.state.session_hash = Some(session_hash);
                     }
-                    CoordinatorToUserKeyGenMessage::KeyGenAck {
+                    CoordinatorToUserKeygenMessage::KeygenAck {
                         from,
                         all_acks_received,
                     } => {
@@ -153,7 +153,7 @@ impl UiProtocol for KeyGen {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct KeyGenState {
+pub struct KeygenState {
     pub threshold: usize,
     pub devices: Vec<DeviceId>, // not a set for frb compat
     pub got_shares: Vec<DeviceId>,

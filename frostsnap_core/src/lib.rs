@@ -151,7 +151,7 @@ impl Error {
 pub type MessageResult<T> = Result<T, Error>;
 
 #[derive(Debug, Clone)]
-pub enum DoKeyGenError {
+pub enum DoKeygenError {
     WrongState,
 }
 

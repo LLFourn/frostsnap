@@ -41,7 +41,7 @@ pub const MIN_NONCES_BEFORE_REQUEST: u32 = NONCE_BATCH_SIZE / 2;
 pub struct FrostCoordinator {
     keys: BTreeMap<KeyId, CoordFrostKey>,
     key_order: Vec<KeyId>,
-    pending_keygens: HashMap<KeygenId, KeyGenState>,
+    pending_keygens: HashMap<KeygenId, KeygenState>,
     nonce_cache: NonceCache,
     mutations: VecDeque<Mutation>,
     active_signing_sessions: BTreeMap<SignSessionId, ActiveSignSession>,
@@ -414,10 +414,10 @@ impl FrostCoordinator {
 
                 Ok(vec![])
             }
-            DeviceToCoordinatorMessage::KeyGenResponse(response) => {
+            DeviceToCoordinatorMessage::KeygenResponse(response) => {
                 let keygen_id = response.keygen_id;
                 match self.pending_keygens.get_mut(&keygen_id) {
-                    Some(KeyGenState::WaitingForResponses {
+                    Some(KeygenState::WaitingForResponses {
                         input_aggregator,
                         device_to_share_index,
                         pending_key_name,
@@ -443,9 +443,9 @@ impl FrostCoordinator {
                             .map_err(|e| Error::coordinator_invalid_message(message_kind, e))?;
 
                         let mut outgoing =
-                            vec![CoordinatorSend::ToUser(CoordinatorToUserMessage::KeyGen {
+                            vec![CoordinatorSend::ToUser(CoordinatorToUserMessage::Keygen {
                                 keygen_id,
-                                inner: CoordinatorToUserKeyGenMessage::ReceivedShares { from },
+                                inner: CoordinatorToUserKeygenMessage::ReceivedShares { from },
                             })];
 
                         if input_aggregator.is_finished() {
@@ -461,15 +461,15 @@ impl FrostCoordinator {
                             });
 
                             outgoing.push(CoordinatorSend::ToUser(
-                                CoordinatorToUserMessage::KeyGen {
+                                CoordinatorToUserMessage::Keygen {
                                     keygen_id,
-                                    inner: CoordinatorToUserKeyGenMessage::CheckKeyGen {
+                                    inner: CoordinatorToUserKeygenMessage::CheckKeygen {
                                         session_hash,
                                     },
                                 },
                             ));
 
-                            let new_state = KeyGenState::WaitingForAcks {
+                            let new_state = KeygenState::WaitingForAcks {
                                 agg_input: agg_input.clone(),
                                 device_to_share_index: device_to_share_index
                                     .into_iter()
@@ -492,20 +492,20 @@ impl FrostCoordinator {
                     )),
                 }
             }
-            DeviceToCoordinatorMessage::KeyGenAck(self::KeyGenAck {
+            DeviceToCoordinatorMessage::KeygenAck(self::KeygenAck {
                 keygen_id,
                 ack_session_hash,
             }) => {
                 let mut outgoing = vec![];
-                let mut all_acks_received_state = Option::<KeyGenState>::None;
+                let mut all_acks_received_state = Option::<KeygenState>::None;
                 let keygen_state = self.pending_keygens.get_mut(&keygen_id).ok_or(
                     Error::coordinator_invalid_message(
                         message_kind,
-                        "Received KeyGenAck for unknown keygen_id",
+                        "Received KeygenAck for unknown keygen_id",
                     ),
                 )?;
 
-                if let KeyGenState::WaitingForAcks {
+                if let KeygenState::WaitingForAcks {
                     agg_input,
                     device_to_share_index,
                     acks,
@@ -536,15 +536,15 @@ impl FrostCoordinator {
                                 .shared_key()
                                 .non_zero()
                                 .expect("this should have already been checked");
-                            all_acks_received_state = Some(KeyGenState::NeedsFinalize {
+                            all_acks_received_state = Some(KeygenState::NeedsFinalize {
                                 root_shared_key,
                                 device_to_share_index: device_to_share_index.clone(),
                                 pending_key_name: pending_key_name.clone(),
                                 purpose: *purpose,
                             });
                         }
-                        outgoing.push(CoordinatorSend::ToUser(CoordinatorToUserMessage::KeyGen {
-                            inner: CoordinatorToUserKeyGenMessage::KeyGenAck {
+                        outgoing.push(CoordinatorSend::ToUser(CoordinatorToUserMessage::Keygen {
+                            inner: CoordinatorToUserKeygenMessage::KeygenAck {
                                 from,
                                 all_acks_received,
                             },
@@ -702,7 +702,7 @@ impl FrostCoordinator {
 
         self.pending_keygens.insert(
             *keygen_id,
-            KeyGenState::WaitingForResponses {
+            KeygenState::WaitingForResponses {
                 keygen_id: *keygen_id,
                 input_aggregator,
                 device_to_share_index: device_to_share_index.clone(),
@@ -722,7 +722,7 @@ impl FrostCoordinator {
     ) -> Result<SendFinalizeKeygen, ActionError> {
         match self.pending_keygens.remove(&keygen_id) {
             // TODO: We need to send something to devices!
-            Some(KeyGenState::NeedsFinalize {
+            Some(KeygenState::NeedsFinalize {
                 root_shared_key,
                 device_to_share_index,
                 pending_key_name,
@@ -1277,7 +1277,7 @@ pub struct FinishedSignSession {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum KeyGenState {
+pub enum KeygenState {
     WaitingForResponses {
         keygen_id: KeygenId,
         input_aggregator: encpedpop::Coordinator,

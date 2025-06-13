@@ -356,7 +356,7 @@ class _ThresholdPageState extends State<ThresholdPage> {
                       )
                       .toBehaviorSubject();
 
-                  final accessStructureRef = await showCheckKeyGenDialog(
+                  final accessStructureRef = await showCheckKeygenDialog(
                     context: context,
                     stream: stream,
                     network: widget.network,
@@ -519,8 +519,8 @@ Route createRoute(Widget page) {
   );
 }
 
-Future<AccessStructureRef?> showCheckKeyGenDialog({
-  required Stream<KeyGenState> stream,
+Future<AccessStructureRef?> showCheckKeygenDialog({
+  required Stream<KeygenState> stream,
   required BuildContext context,
   required BitcoinNetwork network,
 }) async {

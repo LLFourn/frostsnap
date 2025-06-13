@@ -1,10 +1,10 @@
-use frostsnap_core::device::{DeviceSymmetricKeyGen, DeviceToUserMessage, KeyPurpose};
+use frostsnap_core::device::{DeviceSymmetricKeygen, DeviceToUserMessage, KeyPurpose};
 use frostsnap_core::message::{
     keygen, CoordinatorToDeviceMessage, DeviceSend, DeviceToCoordinatorMessage,
 };
 use frostsnap_core::{
     coordinator::{
-        CoordinatorSend, CoordinatorToUserKeyGenMessage, CoordinatorToUserMessage, FrostCoordinator,
+        CoordinatorSend, CoordinatorToUserKeygenMessage, CoordinatorToUserMessage, FrostCoordinator,
     },
     device::FrostSigner,
     DeviceId, SymmetricKey,
@@ -70,9 +70,9 @@ impl Send {
     }
 }
 
-pub struct TestDeviceKeyGen;
+pub struct TestDeviceKeygen;
 
-impl DeviceSymmetricKeyGen for TestDeviceKeyGen {
+impl DeviceSymmetricKeygen for TestDeviceKeygen {
     fn get_share_encryption_key(
         &mut self,
         _access_structure_ref: AccessStructureRef,
@@ -92,10 +92,10 @@ pub trait Env {
         rng: &mut impl RngCore,
     ) {
         match message {
-            CoordinatorToUserMessage::KeyGen {
+            CoordinatorToUserMessage::Keygen {
                 keygen_id,
                 inner:
-                    CoordinatorToUserKeyGenMessage::KeyGenAck {
+                    CoordinatorToUserKeygenMessage::KeygenAck {
                         all_acks_received: true,
                         ..
                     },
@@ -117,18 +117,18 @@ pub trait Env {
         rng: &mut impl RngCore,
     ) {
         match message {
-            DeviceToUserMessage::FinalizeKeyGen => {}
-            DeviceToUserMessage::CheckKeyGen { phase, .. } => {
+            DeviceToUserMessage::FinalizeKeygen => {}
+            DeviceToUserMessage::CheckKeygen { phase, .. } => {
                 let ack = run
                     .device(from)
-                    .keygen_ack(*phase, &mut TestDeviceKeyGen, rng)
+                    .keygen_ack(*phase, &mut TestDeviceKeygen, rng)
                     .unwrap();
                 run.extend_from_device(from, ack);
             }
             DeviceToUserMessage::SignatureRequest { phase } => {
                 let sign_ack = run
                     .device(from)
-                    .sign_ack(*phase, &mut TestDeviceKeyGen)
+                    .sign_ack(*phase, &mut TestDeviceKeygen)
                     .unwrap();
                 run.extend_from_device(from, sign_ack);
             }
@@ -138,13 +138,13 @@ pub trait Env {
                     DisplayBackupRequest { phase } => {
                         let backup_ack = run
                             .device(from)
-                            .display_backup_ack(*phase, &mut TestDeviceKeyGen)
+                            .display_backup_ack(*phase, &mut TestDeviceKeygen)
                             .unwrap();
                         run.extend_from_device(from, backup_ack);
                     }
                     ConsolidateBackup(phase) => {
                         let ack = run.device(from).finish_consolidation(
-                            &mut TestDeviceKeyGen,
+                            &mut TestDeviceKeygen,
                             phase,
                             rng,
                         );

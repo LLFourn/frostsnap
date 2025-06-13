@@ -2,11 +2,11 @@ use crate::{frb_generated::StreamSink, sink_wrap::SinkWrap};
 use anyhow::Result;
 use bitcoin::Network as BitcoinNetwork;
 use flutter_rust_bridge::frb;
-pub use frostsnap_coordinator::keygen::KeyGenState;
+pub use frostsnap_coordinator::keygen::KeygenState;
 use frostsnap_core::{device::KeyPurpose, AccessStructureRef, DeviceId, KeygenId, SessionHash};
 
-#[frb(mirror(KeyGenState), unignore)]
-pub struct _KeyGenState {
+#[frb(mirror(KeygenState), unignore)]
+pub struct _KeygenState {
     pub threshold: usize,
     pub devices: Vec<DeviceId>, // not a set for frb compat
     pub got_shares: Vec<DeviceId>,
@@ -26,7 +26,7 @@ impl super::coordinator::Coordinator {
         devices: Vec<DeviceId>,
         key_name: String,
         network: BitcoinNetwork,
-        event_stream: StreamSink<KeyGenState>,
+        event_stream: StreamSink<KeygenState>,
     ) -> Result<()> {
         self.0.generate_new_key(
             devices.into_iter().collect(),

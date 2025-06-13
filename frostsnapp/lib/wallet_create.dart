@@ -192,7 +192,7 @@ class WalletCreateController extends ChangeNotifier {
   late final StreamSubscription _deviceListSub;
   late DeviceListState _deviceList;
 
-  KeyGenState? _keygenState;
+  KeygenState? _keygenState;
   late final FullscreenActionDialogController _keygenController;
   AccessStructureRef? _asRef;
 
@@ -316,7 +316,7 @@ class WalletCreateController extends ChangeNotifier {
 
   WalletCreateForm get form => _form;
   WalletCreateStep get step => _step;
-  KeyGenState? get keygenState => _keygenState;
+  KeygenState? get keygenState => _keygenState;
   bool get keygenComplete => _keygenState?.allAcks ?? false;
 
   String get keygenChecksum => toSpacedHex(

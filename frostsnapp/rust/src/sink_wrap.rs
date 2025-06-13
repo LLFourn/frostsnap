@@ -6,7 +6,7 @@ use frostsnap_coordinator::{
     // bitcoin::chain_sync::ChainStatus,
     bitcoin::chain_sync::ChainStatus,
     firmware_upgrade::FirmwareUpgradeConfirmState,
-    keygen::KeyGenState,
+    keygen::KeygenState,
     signing::SigningState,
     verify_address::VerifyAddressProtocolState,
 };
@@ -25,7 +25,7 @@ macro_rules! bridge_sink {
     };
 }
 
-bridge_sink!(KeyGenState);
+bridge_sink!(KeygenState);
 bridge_sink!(FirmwareUpgradeConfirmState);
 bridge_sink!(VerifyAddressProtocolState);
 bridge_sink!(SigningState);

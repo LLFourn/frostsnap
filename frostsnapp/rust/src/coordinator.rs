@@ -357,7 +357,7 @@ impl FfiCoordinator {
         threshold: u16,
         key_name: String,
         purpose: KeyPurpose,
-        sink: impl Sink<frostsnap_coordinator::keygen::KeyGenState>,
+        sink: impl Sink<frostsnap_coordinator::keygen::KeygenState>,
     ) -> anyhow::Result<()> {
         let currently_connected = self
             .device_list
@@ -376,7 +376,7 @@ impl FfiCoordinator {
             &mut rand::thread_rng(),
         );
 
-        let ui_protocol = frostsnap_coordinator::keygen::KeyGen::new(
+        let ui_protocol = frostsnap_coordinator::keygen::Keygen::new(
             sink,
             self.coordinator.lock().unwrap().MUTATE_NO_PERSIST(),
             currently_connected,
@@ -457,7 +457,7 @@ impl FfiCoordinator {
 
         let signing = ui_stack
             .get_mut::<frostsnap_coordinator::signing::SigningDispatcher>()
-            .ok_or(anyhow!("somehow UI was not in KeyGen state"))?;
+            .ok_or(anyhow!("somehow UI was not in Keygen state"))?;
 
         let mut db = self.db.lock().unwrap();
 
@@ -608,8 +608,8 @@ impl FfiCoordinator {
             let mut db = self.db.lock().unwrap();
             let mut ui_stack = self.ui_stack.lock().unwrap();
             let keygen = ui_stack
-                .get_mut::<frostsnap_coordinator::keygen::KeyGen>()
-                .ok_or(anyhow!("somehow UI was not in KeyGen state"))?;
+                .get_mut::<frostsnap_coordinator::keygen::Keygen>()
+                .ok_or(anyhow!("somehow UI was not in Keygen state"))?;
 
             let finalized_keygen = coordinator.staged_mutate(&mut db, |coordinator| {
                 Ok(coordinator.finalize_keygen(
