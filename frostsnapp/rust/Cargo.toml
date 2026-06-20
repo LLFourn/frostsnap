@@ -6,10 +6,19 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
+[features]
+# Debug-only virtual-device simulator (the `load_sim` entrypoint + the `sim` api
+# module). OFF by default so production builds never compile or export the sim
+# surface. Build/codegen the sim with `--features sim` (e.g.
+# `flutter_rust_bridge_codegen generate --rust-features sim`).
+sim = ["dep:frostsnap_virtual_device"]
+
 [dependencies]
 anyhow = "1"
 frostsnap_coordinator = { workspace = true }
 frostsnap_core = { workspace = true }
+# SDL-free virtual device behind the `sim` feature (the debug `load_sim()` entrypoint).
+frostsnap_virtual_device = { path = "../../tools/virtual_device", optional = true }
 lazy_static = "1.4"
 tracing-subscriber = { version = "0.3" }
 tracing = { workspace = true, features = ["std"] }

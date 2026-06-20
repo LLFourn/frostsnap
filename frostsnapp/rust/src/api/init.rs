@@ -94,6 +94,48 @@ impl super::Api {
         }
         load_internal(app_dir, usb_manager)
     }
+
+    /// Build the real `Coordinator` bound to a host virtual device instead of real
+    /// USB serial — for the simulator only (the sim Dart entrypoint, sim-5). The
+    /// returned [`DevicePool`] owns the device thread; drop it to stop the device.
+    ///
+    /// No firmware bin and no genuine cert key are wired in, so the manager never
+    /// offers a firmware upgrade and genuine-check is off (consistent with the sim
+    /// guard). Production `load()`/`main.dart` never reach this.
+    /// Debug-only: bind the app to a host virtual device. Behind the `sim` feature so
+    /// production builds never compile or export it. See `api::sim`.
+    #[cfg(feature = "sim")]
+    pub fn load_sim(
+        &self,
+        app_dir: String,
+        seed: u64,
+    ) -> Result<(Coordinator, AppCtx, super::sim::DevicePool)> {
+        use super::sim::{DevicePool, SimDevice, SimFrame};
+        use frostsnap_virtual_device::{VirtualDevice, VirtualSerial};
+
+        let app_dir = PathBuf::from_str(&app_dir)?;
+
+        let frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>> = Arc::new(Mutex::new(None));
+        let on_frame_sink = frames_sink.clone();
+        let spawned = VirtualDevice::spawn(seed, move |width, height, data| {
+            if let Some(sink) = &*on_frame_sink.lock().unwrap() {
+                let _ = sink.add(SimFrame {
+                    width,
+                    height,
+                    data,
+                });
+            }
+        });
+
+        let virtual_serial = VirtualSerial::single("sim-device-0", spawned.host.clone());
+        let usb_manager = UsbSerialManager::new(Box::new(virtual_serial));
+        let (coord, app_state) = load_internal(app_dir, usb_manager)?;
+
+        let device = SimDevice::new(spawned.device_id, spawned.touch.clone(), frames_sink);
+        let pool = DevicePool::new(vec![spawned], vec![device]);
+
+        Ok((coord, app_state, pool))
+    }
 }
 
 #[cfg(genuine_cert_key)]

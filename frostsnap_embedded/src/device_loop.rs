@@ -737,6 +737,12 @@ impl<'a, H: DeviceHal, U: UserInteraction> DeviceLoop<'a, H, U> {
     pub fn holds_key(&self, key_id: KeyId) -> bool {
         self.signer.wallet_network(key_id).is_some()
     }
+
+    /// This device's id (read-only, for sim/host harnesses to reconcile a device
+    /// with the coordinator-side `DeviceChange`s by id).
+    pub fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
 }
 
 #[cfg(test)]

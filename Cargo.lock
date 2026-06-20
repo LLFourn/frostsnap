@@ -3910,6 +3910,7 @@ dependencies = [
  "frostsnap_core",
  "frostsnap_desktop_camera",
  "frostsnap_secure_boot",
+ "frostsnap_virtual_device",
  "futures",
  "image",
  "lazy_static",

@@ -15,6 +15,7 @@ mod hal;
 mod secrets;
 mod serial;
 mod sim_coordinator;
+mod thread;
 mod touch;
 mod virtual_serial;
 
@@ -27,7 +28,13 @@ pub use hal::{SimDownstream, SimHal, SimUpstream};
 pub use secrets::SimKeyedHash;
 pub use serial::{pipe, ByteChannel, HostEnd, PipeByteIo};
 pub use sim_coordinator::{SimCoordinator, StateCell, StepOutcome};
+pub use thread::{DeviceThread, SpawnedDevice};
 pub use touch::TouchQueue;
+
+/// The touch-injection types, re-exported so callers (the FRB `SimDevice`) can push
+/// touches without depending on `frostsnap_embedded`/`embedded-graphics` directly.
+pub use embedded_graphics::geometry::Point;
+pub use frostsnap_embedded::device_hal::{TouchEvent, TouchGesture};
 pub use virtual_serial::{VirtualPort, VirtualSerial, FROSTSNAP_PID, FROSTSNAP_VID};
 
 use frostsnap_coordinator::{DeviceChange, UsbSerialManager};
@@ -58,8 +65,6 @@ pub fn lockstep_step(
         device_reset: matches!(poll, Poll::ResetRequested),
     }
 }
-
-use frostsnap_embedded::device_hal::{TouchEvent, TouchGesture};
 
 /// Drive the device's hold-to-confirm control by pushing **one** touch-down at
 /// `point` (never a release) into `touch`.
@@ -353,6 +358,59 @@ mod tests {
             0,
             "a genuine-off sim device must never be offered a firmware upgrade"
         );
+    }
+
+    // sim-4: the per-device thread runtime registers through a *real* UsbSerialManager
+    // across two real threads (not lockstep) — this exercises sim-2's Condvar blocking
+    // read at runtime: the manager's read thread blocks on the pipe while the device
+    // thread renders and replies concurrently. Also asserts a frame is observable.
+    #[test]
+    fn spawned_device_registers_through_the_coordinator_across_threads() {
+        use frostsnap_coordinator::{DeviceChange, UsbSerialManager};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let frames = Arc::new(AtomicUsize::new(0));
+        let frame_counter = frames.clone();
+        let spawned = VirtualDevice::spawn(7, move |_, _, _| {
+            frame_counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let mut manager = UsbSerialManager::new(Box::new(VirtualSerial::single(
+            "sim-0",
+            spawned.host.clone(),
+        )));
+
+        // Generous wall-clock deadline: the coordinator's ~100ms magic-byte cadence is
+        // real-time and the device runs on its own thread, so this must not be tight.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut registered = None;
+        while Instant::now() < deadline && registered.is_none() {
+            for change in manager.poll_ports() {
+                match change {
+                    DeviceChange::NeedsName { id } => {
+                        manager.accept_device_name(id, "Sim".to_string());
+                    }
+                    DeviceChange::Registered { id, .. } => registered = Some(id),
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let id = registered.expect("device should register within the deadline");
+        assert_eq!(
+            id, spawned.device_id,
+            "the registered id matches the device thread's announced id"
+        );
+        assert!(
+            frames.load(Ordering::Relaxed) > 0,
+            "the device thread should have rendered and pushed at least one frame"
+        );
+
+        // Dropping the handle stops + joins the device thread; this must not hang.
+        drop(spawned);
     }
 
     // Slice 1: a complete 1-of-1 keygen, driven by a *scripted device touch through

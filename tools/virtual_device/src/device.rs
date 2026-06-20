@@ -144,4 +144,10 @@ impl VirtualDeviceSession<'_> {
     pub fn holds_key(&self, key_id: frostsnap_core::KeyId) -> bool {
         self.loop_.holds_key(key_id)
     }
+
+    /// This device's id, used to reconcile it with the coordinator-side
+    /// `DeviceChange`s (the two surfaces never talk directly; they share an id).
+    pub fn device_id(&self) -> frostsnap_core::DeviceId {
+        self.loop_.device_id()
+    }
 }
