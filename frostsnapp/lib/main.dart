@@ -18,6 +18,7 @@ import 'package:frostsnap/secure_key_provider.dart';
 import 'package:frostsnap/serialport.dart';
 import 'package:frostsnap/snackbar.dart';
 import 'package:frostsnap/settings.dart';
+import 'package:frostsnap/sim_device_tray.dart';
 import 'package:frostsnap/stream_ext.dart';
 import 'package:frostsnap/theme.dart';
 import 'package:frostsnap/wallet.dart';
@@ -60,7 +61,16 @@ Future<void> main() async {
   try {
     final appDir = await getApplicationSupportDirectory();
     final appDirPath = appDir.path;
-    if (Platform.isAndroid) {
+    if (kSim) {
+      final (coord_, appCtx_, pool_) = await api.loadSim(
+        appDir: appDirPath,
+        seed: 1,
+      );
+      coord = coord_;
+      appCtx = appCtx_;
+      simDevicePool = pool_;
+      globalHostPortHandler = null;
+    } else if (Platform.isAndroid) {
       final (coord_, appCtx_, ffiserial) = await api.loadHostHandlesSerial(
         appDir: appDirPath,
       );
@@ -256,23 +266,33 @@ class _MyHomePageState extends State<MyHomePage> {
 
   @override
   Widget build(BuildContext context) {
+    final Widget body = Stack(
+      alignment: AlignmentDirectional.center,
+      children: [
+        const WalletHome(),
+        Center(
+          child: ConfettiWidget(
+            confettiController: confettiController,
+            blastDirectionality: BlastDirectionality.explosive,
+            numberOfParticles: 101,
+          ),
+        ),
+      ],
+    );
+
+    final pool = simDevicePool;
     return HomeContext(
       scaffoldKey: scaffoldKey,
       walletListController: walletListController,
       confettiController: confettiController,
-      child: Stack(
-        alignment: AlignmentDirectional.center,
-        children: [
-          const WalletHome(),
-          Center(
-            child: ConfettiWidget(
-              confettiController: confettiController,
-              blastDirectionality: BlastDirectionality.explosive,
-              numberOfParticles: 101,
-            ),
-          ),
-        ],
-      ),
+      child: kSim && pool != null
+          ? Row(
+              children: [
+                Expanded(child: body),
+                SimDeviceTray(pool: pool),
+              ],
+            )
+          : body,
     );
   }
 }

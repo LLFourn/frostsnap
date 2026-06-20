@@ -3,12 +3,21 @@ import 'package:flutter/services.dart';
 import 'package:frostsnap/src/rust/api.dart';
 import 'package:frostsnap/src/rust/api/coordinator.dart';
 import 'package:frostsnap/src/rust/api/device_list.dart';
+import 'package:frostsnap/src/rust/api/sim.dart';
 import 'package:frostsnap/stream_ext.dart';
 import 'serialport.dart';
+
+/// Compile-time flag selecting the sim entrypoint (`api.loadSim`). Off by
+/// default; enable with `--dart-define=SIM=true`.
+const bool kSim = bool.fromEnvironment('SIM');
 
 late Coordinator coord;
 late Api api;
 late HostPortHandler? globalHostPortHandler;
+
+/// Set only on the SIM entrypoint; owns the virtual device thread and feeds the
+/// debug device tray. Null on a normal build.
+DevicePool? simDevicePool;
 
 final nameInputFormatter = TextInputFormatter.withFunction((
   oldValue,

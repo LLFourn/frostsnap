@@ -16,7 +16,6 @@ pub mod qr;
 pub mod recovery;
 pub mod settings;
 pub mod signing;
-#[cfg(feature = "sim")]
 pub mod sim;
 pub mod super_wallet;
 pub mod transaction;

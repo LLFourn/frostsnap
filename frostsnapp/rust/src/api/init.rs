@@ -102,9 +102,9 @@ impl super::Api {
     /// No firmware bin and no genuine cert key are wired in, so the manager never
     /// offers a firmware upgrade and genuine-check is off (consistent with the sim
     /// guard). Production `load()`/`main.dart` never reach this.
-    /// Debug-only: bind the app to a host virtual device. Behind the `sim` feature so
-    /// production builds never compile or export it. See `api::sim`.
-    #[cfg(feature = "sim")]
+    /// Debug/sim-only: bind the app to a host virtual device. Compiled
+    /// unconditionally; only the `--dart-define=SIM` entrypoint calls it, so a normal
+    /// build dead-code-eliminates the Dart branch and never reaches it. See `api::sim`.
     pub fn load_sim(
         &self,
         app_dir: String,
@@ -131,7 +131,12 @@ impl super::Api {
         let usb_manager = UsbSerialManager::new(Box::new(virtual_serial));
         let (coord, app_state) = load_internal(app_dir, usb_manager)?;
 
-        let device = SimDevice::new(spawned.device_id, spawned.touch.clone(), frames_sink);
+        let device = SimDevice::new(
+            spawned.device_id,
+            spawned.touch.clone(),
+            spawned.framebuffer.clone(),
+            frames_sink,
+        );
         let pool = DevicePool::new(vec![spawned], vec![device]);
 
         Ok((coord, app_state, pool))

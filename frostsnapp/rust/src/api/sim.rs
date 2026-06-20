@@ -7,7 +7,9 @@
 use crate::frb_generated::StreamSink;
 use flutter_rust_bridge::frb;
 use frostsnap_core::DeviceId;
-use frostsnap_virtual_device::{Point, SpawnedDevice, TouchEvent, TouchGesture, TouchQueue};
+use frostsnap_virtual_device::{
+    Point, SharedFramebuffer, SpawnedDevice, TouchEvent, TouchGesture, TouchQueue,
+};
 use std::sync::{Arc, Mutex};
 
 /// One rendered device frame, RGBA8888, for streaming to the Flutter tray.
@@ -24,6 +26,7 @@ pub struct SimFrame {
 pub struct SimDevice {
     device_id: DeviceId,
     touch: TouchQueue,
+    framebuffer: SharedFramebuffer,
     frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>>,
 }
 
@@ -33,9 +36,18 @@ impl SimDevice {
         self.device_id.to_string()
     }
 
-    /// Register the sink the device thread pushes [`SimFrame`]s into. The thread's
-    /// `on_frame` closure (set up in `load_sim`) writes into this same `Arc`.
+    /// Register the sink the device thread pushes [`SimFrame`]s into (its `on_frame`
+    /// closure, set up in `load_sim`, writes into this same `Arc`). Immediately replays
+    /// the *current* framebuffer so the tray paints at once — the device may have
+    /// cleared its initial dirty flag before Dart subscribed, so waiting for the next
+    /// redraw would otherwise leave the cell blank.
     pub fn frames(&self, sink: StreamSink<SimFrame>) {
+        let (width, height, data) = self.framebuffer.export_rgba();
+        let _ = sink.add(SimFrame {
+            width,
+            height,
+            data,
+        });
         *self.frames_sink.lock().unwrap() = Some(sink);
     }
 
@@ -77,11 +89,13 @@ impl SimDevice {
     pub(crate) fn new(
         device_id: DeviceId,
         touch: TouchQueue,
+        framebuffer: SharedFramebuffer,
         frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>>,
     ) -> Self {
         Self {
             device_id,
             touch,
+            framebuffer,
             frames_sink,
         }
     }
