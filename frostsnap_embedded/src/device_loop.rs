@@ -27,7 +27,7 @@ use frostsnap_core::{
     device::{DeviceToUserMessage, FrostSigner},
     device_nonces::NonceJobBatch,
     message::{self, DeviceSend},
-    DeviceId,
+    DeviceId, KeyId,
 };
 #[cfg(feature = "debug_log")]
 use frostsnap_core::{Gist, Kind};
@@ -730,6 +730,12 @@ impl<'a, H: DeviceHal, U: UserInteraction> DeviceLoop<'a, H, U> {
         }
 
         Poll::Continue
+    }
+
+    /// Whether the device holds a finalized key for `key_id` (read-only, for
+    /// sim/host harnesses to confirm a keygen actually persisted on the device).
+    pub fn holds_key(&self, key_id: KeyId) -> bool {
+        self.signer.wallet_network(key_id).is_some()
     }
 }
 

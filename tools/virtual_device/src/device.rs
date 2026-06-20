@@ -138,4 +138,10 @@ impl VirtualDeviceSession<'_> {
     pub fn poll_once(&mut self, downstream_present: bool) -> Poll {
         self.loop_.poll(downstream_present)
     }
+
+    /// Whether the device has persisted a finalized key for `key_id` — the
+    /// device-side proof that a keygen's `FinishKeygen` was delivered and processed.
+    pub fn holds_key(&self, key_id: frostsnap_core::KeyId) -> bool {
+        self.loop_.holds_key(key_id)
+    }
 }

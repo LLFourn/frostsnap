@@ -14,6 +14,7 @@ mod flash;
 mod hal;
 mod secrets;
 mod serial;
+mod sim_coordinator;
 mod touch;
 mod virtual_serial;
 
@@ -25,6 +26,7 @@ pub use flash::{RamFlash, SECTORS};
 pub use hal::{SimDownstream, SimHal, SimUpstream};
 pub use secrets::SimKeyedHash;
 pub use serial::{pipe, ByteChannel, HostEnd, PipeByteIo};
+pub use sim_coordinator::{SimCoordinator, StateCell, StepOutcome};
 pub use touch::TouchQueue;
 pub use virtual_serial::{VirtualPort, VirtualSerial, FROSTSNAP_PID, FROSTSNAP_VID};
 
@@ -55,6 +57,42 @@ pub fn lockstep_step(
         changes: manager.poll_ports(),
         device_reset: matches!(poll, Poll::ResetRequested),
     }
+}
+
+use frostsnap_embedded::device_hal::{TouchEvent, TouchGesture};
+
+/// Drive the device's hold-to-confirm control by pushing **one** touch-down at
+/// `point` (never a release) into `touch`.
+///
+/// # Calibration (reused verbatim by sim-7)
+/// The confirm control is the `HoldToConfirm` widget's `CircleButton`. Its
+/// `handle_touch` latches `CircleButtonState::Pressed` on a touch-down inside the
+/// button and only returns to `Idle` on a **release** (`lift_up = true`)
+/// (`frostsnap_widgets/src/circle_button.rs`). The Pressed model is therefore
+/// **latching**: one `lift_up = false` event keeps the button `Pressed` across every
+/// subsequent `FrostyUi::poll` — a release is never re-sent, so the button never
+/// un-presses on its own.
+///
+/// Confirmation is a **time-integral**, not a poll-tick count and not a sleep value:
+/// while the button is `Pressed`, `HoldToConfirm::draw` accumulates the wall-clock
+/// delta between successive draws into its progress
+/// (`frostsnap_widgets/src/hold_to_confirm.rs`), and `FrostyUi::poll` redraws at most
+/// once per `DISPLAY_REFRESH_MS` (25 ms). Once ≥ `HOLD_TO_CONFIRM_TIME_MS` (2000 ms)
+/// of clock-advance has elapsed *while Pressed*, the button shows its checkmark and
+/// `KeygenCheck::is_confirmed()` becomes true, firing `UiEvent::KeyGenConfirm`.
+///
+/// So the caller must keep polling the device with ≥ 2000 ms of real clock-advance
+/// accruing between draws (the sim clock is `Instant`-backed). One touch-down
+/// suffices once the button is shown and latched; re-asserting the press each poll
+/// (as the keygen test does) only adds robustness to the startup race where the
+/// coordinator's CheckKeyGen lands a few ticks before the device renders the button.
+/// This helper only injects the press; the caller owns the pump.
+pub fn hold_to_confirm(touch: &TouchQueue, point: embedded_graphics::geometry::Point) {
+    touch.push(TouchEvent {
+        point,
+        lift_up: false,
+        gesture: TouchGesture::None,
+    });
 }
 
 #[cfg(test)]
@@ -315,5 +353,196 @@ mod tests {
             0,
             "a genuine-off sim device must never be offered a firmware upgrade"
         );
+    }
+
+    // Slice 1: a complete 1-of-1 keygen, driven by a *scripted device touch through
+    // the real FrostyUi* (no injected UiEvent) plus the Rust-level coordinator bridge.
+    // The device confirms the security code via a held hold-to-confirm; the
+    // coordinator advances to all-acks and finalizes an AccessStructureRef.
+    #[test]
+    fn one_device_keygen_completes() {
+        use embedded_graphics::geometry::Point;
+        use frostsnap_core::coordinator::BeginKeygen;
+        use frostsnap_core::device::KeyPurpose;
+        use frostsnap_core::SymmetricKey;
+        use std::collections::BTreeSet;
+        use std::time::{Duration, Instant};
+
+        // The KeygenCheck screen lays its hold-to-confirm CircleButton low-center,
+        // below the security code. Verified against the rendered framebuffer.
+        const KEYGEN_CONFIRM_POINT: Point = Point::new(120, 215);
+        // Generous wall-clock margin: the coordinator's ~100ms magic-byte cadence and
+        // the 2000ms hold are both real-time (the sim clock is Instant-backed).
+        let deadline = || Instant::now() + Duration::from_secs(40);
+
+        let mut device = VirtualDevice::new(1);
+        let fb = device.framebuffer();
+        let touch = device.touch();
+        let host = device.host_serial();
+        let manager = UsbSerialManager::new(Box::new(VirtualSerial::single("sim-device-0", host)));
+        let mut coordinator = SimCoordinator::new(manager, "Sim Device");
+
+        let mut session = match device.session() {
+            InitOutcome::Ready(session) => session,
+            InitOutcome::ResetRequested => panic!("a fresh device should boot, not reset"),
+        };
+
+        // Phase 1: handshake + REAL device naming. The bridge previews the device's
+        // name (update_name_preview, mirroring the app's wallet-create flow); the
+        // device stages it as its pending name — which keygen finalize requires (an
+        // unnamed device panics on FinalizeKeyGen) — and persists it at finalize,
+        // when the resulting SetName drives the device to Registered.
+        let named_id = {
+            let until = deadline();
+            let mut named = None;
+            while Instant::now() < until && named.is_none() {
+                assert!(
+                    !lockstep_step_device(&mut session),
+                    "device unexpectedly reset during the handshake"
+                );
+                if let Some(id) = coordinator.step().named.first().copied() {
+                    named = Some(id);
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            named.expect("device should announce and be named within the deadline")
+        };
+
+        // Phase 2: begin a 1-of-1 keygen for the named device.
+        let state = StateCell::new();
+        let mut rng = ChaCha20Rng::seed_from_u64(99);
+        // Bitcoin purpose so the device-side `holds_key` (wallet_network) can confirm
+        // the finalized key actually persisted on the device.
+        let begin_keygen = BeginKeygen::new(
+            vec![named_id],
+            1,
+            "sim wallet".to_string(),
+            KeyPurpose::Bitcoin(bitcoin::Network::Bitcoin),
+            &mut rng,
+        );
+        let keygen = frostsnap_coordinator::keygen::KeyGen::new(
+            state.clone(),
+            coordinator.coordinator_mut(),
+            BTreeSet::from([named_id]),
+            begin_keygen,
+            &mut rng,
+        );
+        coordinator.set_keygen(keygen);
+
+        // Phase 3: pump until the device shows the security-code check (CheckKeyGen).
+        {
+            let until = deadline();
+            while Instant::now() < until && state.get().and_then(|s| s.session_hash).is_none() {
+                assert!(
+                    !lockstep_step_device(&mut session),
+                    "device reset during keygen"
+                );
+                coordinator.step();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let security_state = state.get().expect("keygen state emitted");
+        assert!(
+            security_state.session_hash.is_some(),
+            "device should reach the security-code check"
+        );
+        assert!(
+            security_state.aborted.is_none(),
+            "keygen must not abort: {:?}",
+            security_state.aborted
+        );
+
+        // The coordinator's session_hash can land a few ticks before the *device*
+        // renders the KeygenCheck widget, so pump a little more (no touch yet) to let
+        // the security-code screen draw before capturing it as a debug artifact.
+        {
+            let until = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < until {
+                lockstep_step_device(&mut session);
+                coordinator.step();
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+        save_phase_png(&fb, "frostsnap_keygen_security_code.png");
+
+        // Phase 4: confirm via a held touch on the confirm control. The button latches
+        // Pressed on a touch-down and HoldToConfirm integrates the clock delta on each
+        // redraw. We re-assert the touch-down each poll because the coordinator's
+        // CheckKeyGen (session_hash) can land a few ticks before the *device* renders
+        // the KeygenCheck widget — re-asserting guarantees a press is queued once the
+        // button actually exists. (A single touch-down also suffices once the button is
+        // latched; re-asserting is just robust to that startup race.)
+        {
+            let until = deadline();
+            while Instant::now() < until && !state.get().map(|s| s.all_acks).unwrap_or(false) {
+                hold_to_confirm(&touch, KEYGEN_CONFIRM_POINT);
+                assert!(
+                    !lockstep_step_device(&mut session),
+                    "device reset during confirm"
+                );
+                coordinator.step();
+                // Let real wall-clock advance between draws so the hold integral grows.
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+        let acked = state.get().expect("state");
+        assert!(
+            acked.all_acks,
+            "the held touch should have confirmed keygen (all acks). state: {acked:?}"
+        );
+        save_phase_png(&fb, "frostsnap_keygen_confirmed.png");
+
+        // Phase 5: finalize. `finalize_keygen` sets the coordinator-side
+        // KeyGenState.finished synchronously AND queues `FinishKeygen` for the device,
+        // so we must pump a phase that is NOT gated on `finished` (it is already set)
+        // to actually flush `FinishKeygen` to the device and let it persist its share.
+        let asr = coordinator.finalize_keygen(SymmetricKey([7u8; 32]), &mut rng);
+        assert!(
+            !session.holds_key(asr.key_id),
+            "device must not hold the key until finalize is delivered"
+        );
+        {
+            let until = deadline();
+            while Instant::now() < until && !session.holds_key(asr.key_id) {
+                assert!(
+                    !lockstep_step_device(&mut session),
+                    "device reset after finalize"
+                );
+                coordinator.step();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(
+            session.holds_key(asr.key_id),
+            "device should persist the finalized key (FinishKeygen delivered + processed)"
+        );
+        assert_eq!(
+            state.get().and_then(|s| s.finished),
+            Some(asr),
+            "coordinator-side keygen state should also reflect the finalized key"
+        );
+        save_phase_png(&fb, "frostsnap_keygen_finished.png");
+
+        drop(session);
+        assert_eq!(
+            device.upgrades_offered(),
+            0,
+            "a genuine-off sim device must never be offered a firmware upgrade"
+        );
+    }
+
+    /// Advance the device one tick; returns whether it asked to reset. Keeps the
+    /// keygen test's pump loops terse (the SimCoordinator owns the manager, so the
+    /// crate-level `lockstep_step` — which borrows both — isn't usable here).
+    fn lockstep_step_device(session: &mut VirtualDeviceSession<'_>) -> bool {
+        matches!(
+            session.poll_once(false),
+            frostsnap_embedded::device_hal::Poll::ResetRequested
+        )
+    }
+
+    fn save_phase_png(fb: &SharedFramebuffer, name: &str) {
+        let path = std::env::temp_dir().join(name);
+        fb.save_png(&path).expect("save png");
     }
 }
