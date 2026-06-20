@@ -7,6 +7,7 @@ import 'package:frostsnap/device_action_fullscreen_dialog.dart';
 import 'package:frostsnap/device_action_upgrade.dart';
 import 'package:frostsnap/hex.dart';
 import 'package:frostsnap/id_ext.dart';
+import 'package:frostsnap/keygen_keys.dart';
 import 'package:frostsnap/secure_key_provider.dart';
 import 'package:frostsnap/settings.dart';
 import 'package:frostsnap/snackbar.dart';
@@ -211,7 +212,11 @@ class WalletCreateController extends ChangeNotifier {
         },
       ),
       actionButtons: [
-        OutlinedButton(onPressed: _onCancel, child: Text('Cancel')),
+        OutlinedButton(
+          key: KeygenKeys.dialogCancel,
+          onPressed: _onCancel,
+          child: Text('Cancel'),
+        ),
         ListenableBuilder(
           listenable: this,
           builder: (context, _) {
@@ -840,6 +845,7 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
     );
     final isDuplicate = _controller.duplicateNamedDeviceIds.contains(device.id);
     return TextField(
+      key: KeygenKeys.deviceNameField,
       controller: textController,
       focusNode: _nameFocusNodes.putIfAbsent(device.id, () => FocusNode()),
       style: monospaceTextStyle,
@@ -868,6 +874,7 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
     return SliverList.list(
       children: [
         ThresholdSelector(
+          key: KeygenKeys.thresholdSelector,
           threshold: form.threshold!,
           totalDevices: totalCount,
           recommendedThreshold: recommendedThresholdFor(totalCount),
@@ -1038,10 +1045,12 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
                       actionsAlignment: MainAxisAlignment.spaceBetween,
                       actions: [
                         TextButton(
+                          key: KeygenKeys.confirmNo,
                           onPressed: () => Navigator.pop(context, false),
                           child: Text('No'),
                         ),
                         TextButton(
+                          key: KeygenKeys.confirmYes,
                           onPressed: () => Navigator.pop(context, true),
                           child: Text('Yes'),
                         ),
@@ -1274,6 +1283,9 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
                   child: Align(
                     alignment: Alignment.centerRight,
                     child: FilledButton(
+                      key: KeygenKeys.primaryButtonForStep(
+                        _controller.step.name,
+                      ),
                       onPressed:
                           !_controller.canGoNext ||
                               (_controller.step == WalletCreateStep.threshold &&
