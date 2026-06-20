@@ -507,6 +507,12 @@ impl<'a> EfuseHmacKey<'a> {
     }
 }
 
+impl frostsnap_embedded::KeyedHash for EfuseHmacKey<'_> {
+    fn keyed_hash(&mut self, domain: &str, input: &[u8]) -> [u8; 32] {
+        self.hash(domain, input).expect("efuse hmac")
+    }
+}
+
 impl frostsnap_core::device::DeviceSecretDerivation for EfuseHmacKey<'_> {
     fn get_share_encryption_key(
         &mut self,

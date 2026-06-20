@@ -1875,9 +1875,16 @@ name = "frostsnap_embedded"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "bitcoin",
+ "embedded-graphics",
+ "embedded-io",
  "embedded-storage",
+ "frost_backup",
  "frostsnap_comms",
  "frostsnap_core",
+ "frostsnap_macros",
+ "frostsnap_widgets",
+ "fugit",
  "proptest",
  "rand_core 0.6.4",
 ]
