@@ -35,7 +35,7 @@ pub use touch::TouchQueue;
 /// touches without depending on `frostsnap_embedded`/`embedded-graphics` directly.
 pub use embedded_graphics::geometry::Point;
 pub use frostsnap_embedded::device_hal::{TouchEvent, TouchGesture};
-pub use virtual_serial::{VirtualPort, VirtualSerial, FROSTSNAP_PID, FROSTSNAP_VID};
+pub use virtual_serial::{PortConnection, VirtualPort, VirtualSerial, FROSTSNAP_PID, FROSTSNAP_VID};
 
 use frostsnap_coordinator::{DeviceChange, UsbSerialManager};
 use frostsnap_embedded::device_hal::Poll;
@@ -373,9 +373,13 @@ mod tests {
 
         let frames = Arc::new(AtomicUsize::new(0));
         let frame_counter = frames.clone();
-        let spawned = VirtualDevice::spawn(7, move |_, _, _| {
-            frame_counter.fetch_add(1, Ordering::Relaxed);
-        });
+        let spawned = VirtualDevice::spawn(
+            7,
+            crate::firmware::SimFirmware::PLACEHOLDER_DIGEST,
+            move |_, _, _| {
+                frame_counter.fetch_add(1, Ordering::Relaxed);
+            },
+        );
 
         let mut manager = UsbSerialManager::new(Box::new(VirtualSerial::single(
             "sim-0",
@@ -404,12 +408,98 @@ mod tests {
             id, spawned.device_id,
             "the registered id matches the device thread's announced id"
         );
+
+        // The device renders on its own thread and `FrostyUi` only redraws once
+        // `DISPLAY_REFRESH_MS` of its wall-clock has elapsed, so the first frame
+        // lands shortly *after* registration. Wait for it rather than racing the
+        // assert (the in-memory handshake can complete in under a refresh period).
+        while Instant::now() < deadline && frames.load(Ordering::Relaxed) == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(
             frames.load(Ordering::Relaxed) > 0,
             "the device thread should have rendered and pushed at least one frame"
         );
 
         // Dropping the handle stops + joins the device thread; this must not hang.
+        drop(spawned);
+    }
+
+    // Connect/disconnect (sim-7): unplugging flips the coordinator-side port
+    // presence only — the device thread keeps running — and the coordinator
+    // observes a real disconnect. Replugging makes the port reappear and the
+    // portable `DeviceLoop` re-announces (magic-bytes-while-established ->
+    // soft_reset), so the device registers again with no embedded change.
+    #[test]
+    fn unplug_and_replug_round_trips_through_the_coordinator() {
+        use frostsnap_coordinator::{DeviceChange, UsbSerialManager};
+        use std::time::{Duration, Instant};
+
+        let spawned = VirtualDevice::spawn(
+            9,
+            crate::firmware::SimFirmware::PLACEHOLDER_DIGEST,
+            |_, _, _| {},
+        );
+
+        let serial = VirtualSerial::single("sim-0", spawned.host.clone());
+        let connection = serial.connection();
+        let mut manager = UsbSerialManager::new(Box::new(serial));
+
+        // Pump the manager (real wall-clock; magic cadence is ~100ms) until `f`
+        // observes the change it wants in a poll round, or the deadline passes.
+        let pump_until = |manager: &mut UsbSerialManager,
+                          mut f: Box<dyn FnMut(&mut UsbSerialManager, DeviceChange) -> bool>|
+         -> bool {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                for change in manager.poll_ports() {
+                    if f(manager, change) {
+                        return true;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
+        };
+
+        // 1. Initial registration.
+        let registered = pump_until(
+            &mut manager,
+            Box::new(|m, change| match change {
+                DeviceChange::NeedsName { id } => {
+                    m.accept_device_name(id, "Sim".to_string());
+                    false
+                }
+                DeviceChange::Registered { .. } => true,
+                _ => false,
+            }),
+        );
+        assert!(registered, "device registers initially");
+        let id = spawned.device_id;
+
+        // 2. Unplug -> the port vanishes -> the coordinator sees a disconnect.
+        connection.set_connected(false);
+        let saw_disconnect = pump_until(
+            &mut manager,
+            Box::new(move |_, change| matches!(change, DeviceChange::Disconnected { id: gone } if gone == id)),
+        );
+        assert!(saw_disconnect, "coordinator sees the device unplug");
+
+        // 3. Replug -> the port reappears -> the device re-handshakes and re-registers.
+        connection.set_connected(true);
+        let reregistered = pump_until(
+            &mut manager,
+            Box::new(|m, change| match change {
+                DeviceChange::NeedsName { id } => {
+                    m.accept_device_name(id, "Sim".to_string());
+                    false
+                }
+                DeviceChange::Registered { .. } => true,
+                _ => false,
+            }),
+        );
+        assert!(reregistered, "device re-registers after replug");
+
         drop(spawned);
     }
 

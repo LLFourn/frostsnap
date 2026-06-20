@@ -225,6 +225,23 @@ class _MyAppState extends State<MyApp> {
             colorScheme: colorScheme,
             textTheme: textTheme,
           ),
+          // The sim device tray docks BESIDE the app's Navigator (not inside it),
+          // so the app's fullscreen dialogs/overlays — which render in the
+          // Navigator's own Overlay (the `child`) — stay confined to the app pane
+          // and never cover the tray. The tray must always be interactable so the
+          // device can be driven while a dialog (e.g. the keygen Security Check) is up.
+          builder: (context, child) {
+            final app = child ?? const SizedBox.shrink();
+            final pool = simDevicePool;
+            if (!kSim || pool == null) return app;
+            return Row(
+              textDirection: TextDirection.ltr,
+              children: [
+                Expanded(child: app),
+                SimDeviceTray(pool: pool),
+              ],
+            );
+          },
           home: widget.startupError == null
               ? const MyHomePage()
               : StartupErrorWidget(error: widget.startupError!),
@@ -266,33 +283,25 @@ class _MyHomePageState extends State<MyHomePage> {
 
   @override
   Widget build(BuildContext context) {
-    final Widget body = Stack(
-      alignment: AlignmentDirectional.center,
-      children: [
-        const WalletHome(),
-        Center(
-          child: ConfettiWidget(
-            confettiController: confettiController,
-            blastDirectionality: BlastDirectionality.explosive,
-            numberOfParticles: 101,
-          ),
-        ),
-      ],
-    );
-
-    final pool = simDevicePool;
+    // The sim device tray is hoisted to MaterialApp.builder (above the app's
+    // dialog/overlay layer), so the home body here is unchanged from production.
     return HomeContext(
       scaffoldKey: scaffoldKey,
       walletListController: walletListController,
       confettiController: confettiController,
-      child: kSim && pool != null
-          ? Row(
-              children: [
-                Expanded(child: body),
-                SimDeviceTray(pool: pool),
-              ],
-            )
-          : body,
+      child: Stack(
+        alignment: AlignmentDirectional.center,
+        children: [
+          const WalletHome(),
+          Center(
+            child: ConfettiWidget(
+              confettiController: confettiController,
+              blastDirectionality: BlastDirectionality.explosive,
+              numberOfParticles: 101,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

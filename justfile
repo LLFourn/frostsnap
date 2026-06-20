@@ -202,6 +202,12 @@ legacy-run +ARGS="": maybe-gen
     cd frostsnapp && BUNDLE_FIRMWARE=../../target/riscv32imc-unknown-none-elf/release/legacy.bin \
       flutter run $FLAVOR_FLAG --dart-define=BUILD_COMMIT="$BUILD_COMMIT" --dart-define=BUILD_VERSION="$BUILD_VERSION" {{ARGS}}
 
+# Run the sim keygen integration-test driver (1-of-1 keygen via app buttons +
+# device touch). Needs a display; on Linux CI wrap in Xvfb. Pass a device with
+# e.g. `just sim-keygen-test -d macos`. The sim is self-contained (no BUNDLE_FIRMWARE).
+sim-keygen-test +ARGS="": maybe-gen
+    cd frostsnapp && flutter test integration_test/keygen_test.dart --dart-define=SIM=true {{ARGS}}
+
 build-appimage +ARGS="":
     #!/bin/sh
     if [ ! -d "frostsnapp/build/linux/x64/release/bundle" ]; then
@@ -289,13 +295,13 @@ lint-device +ARGS="":
     cargo clippy {{device_crates}} --target riscv32imc-unknown-none-elf  {{ARGS}} --all-features -- -Dwarnings
 
 dart-format-check-app:
-    ( cd frostsnapp; dart format --set-exit-if-changed --output=none  $(find ./lib -type f -name "*.dart" -not -path "./lib/src/rust/*" -not -name "*.freezed.dart") )
+    ( cd frostsnapp; dart format --set-exit-if-changed --output=none  $(find ./lib ./integration_test -type f -name "*.dart" -not -path "./lib/src/rust/*" -not -name "*.freezed.dart") )
 
 lint-app +ARGS="": maybe-gen dart-format-check-app
     ( cd frostsnapp; flutter analyze {{ARGS}} )
 
 fix-dart: maybe-gen
-    ( cd frostsnapp && dart format $(find ./lib -type f -name "*.dart" -not -path "./lib/src/rust/*" -not -name "*.freezed.dart") && dart fix --apply && flutter analyze )
+    ( cd frostsnapp && dart format $(find ./lib ./integration_test -type f -name "*.dart" -not -path "./lib/src/rust/*" -not -name "*.freezed.dart") && dart fix --apply && flutter analyze )
 
 fix: fix-dart fix-rust
 

@@ -28,30 +28,41 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Container(
+    // The tray docks BESIDE the app's Navigator (so dialogs can't cover it), which
+    // puts it outside the Navigator's Overlay/Material. Give it its own Overlay +
+    // Material so Material widgets (IconButton ink) and Tooltips work in here.
+    return SizedBox(
       width: _trayWidth,
-      color: theme.colorScheme.surfaceContainerHighest,
-      child: FutureBuilder<List<SimDevice>>(
-        future: _devices,
-        builder: (context, snapshot) {
-          final devices = snapshot.data;
-          if (devices == null) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          return ListView(
-            padding: const EdgeInsets.symmetric(vertical: 12),
-            children: [
-              for (final device in devices)
-                Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 8,
-                  ),
-                  child: _SimDeviceCell(device: device),
-                ),
-            ],
-          );
-        },
+      child: Overlay(
+        initialEntries: [
+          OverlayEntry(
+            builder: (context) => Material(
+              color: theme.colorScheme.surfaceContainerHighest,
+              child: FutureBuilder<List<SimDevice>>(
+                future: _devices,
+                builder: (context, snapshot) {
+                  final devices = snapshot.data;
+                  if (devices == null) {
+                    return const Center(child: CircularProgressIndicator());
+                  }
+                  return ListView(
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    children: [
+                      for (final device in devices)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 8,
+                          ),
+                          child: _SimDeviceCell(device: device),
+                        ),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -69,11 +80,20 @@ class _SimDeviceCell extends StatefulWidget {
 class _SimDeviceCellState extends State<_SimDeviceCell> {
   StreamSubscription<SimFrame>? _subscription;
   ui.Image? _image;
+  late bool _connected = widget.device.isConnected();
 
   @override
   void initState() {
     super.initState();
     _subscription = widget.device.frames().listen(_onFrame);
+  }
+
+  // Simulate plug/unplug: flips the coordinator-side port presence. The device
+  // thread keeps running, so its screen keeps rendering while "unplugged".
+  void _toggleConnected() {
+    final next = !_connected;
+    widget.device.setConnected(connected: next);
+    setState(() => _connected = next);
   }
 
   void _onFrame(SimFrame frame) {
@@ -124,7 +144,26 @@ class _SimDeviceCellState extends State<_SimDeviceCell> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(widget.device.id(), style: theme.textTheme.labelSmall),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                widget.device.id(),
+                style: theme.textTheme.labelSmall,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            IconButton(
+              iconSize: 18,
+              visualDensity: VisualDensity.compact,
+              tooltip: _connected ? 'Disconnect (unplug)' : 'Connect (plug in)',
+              icon: Icon(
+                _connected ? Icons.usb_rounded : Icons.usb_off_rounded,
+              ),
+              onPressed: _toggleConnected,
+            ),
+          ],
+        ),
         const SizedBox(height: 4),
         LayoutBuilder(
           builder: (context, constraints) {

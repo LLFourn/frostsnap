@@ -19,18 +19,24 @@ pub struct SimFirmware {
 }
 
 impl SimFirmware {
-    pub fn new() -> Self {
-        // A fixed, arbitrary-but-stable digest. The coordinator compares it against
-        // the latest known firmware to decide whether to offer an upgrade; a fixed
-        // value with no matching "latest" means no upgrade is ever staged.
+    /// A placeholder digest for harnesses that don't care about app-side firmware
+    /// compatibility (the pure-Rust sims). The app path (`load_sim`) instead passes
+    /// the digest of the firmware bin it also seeds into the coordinator, so the
+    /// device announces a digest the coordinator considers up-to-date — otherwise
+    /// the app gates the device as "incompatible firmware".
+    pub const PLACEHOLDER_DIGEST: Sha256Digest = Sha256Digest([0x5a; 32]);
+
+    /// The device announces `digest` in its `Announce`. To be seen as compatible by
+    /// the app, this must equal the coordinator's latest firmware digest.
+    pub fn new(digest: Sha256Digest) -> Self {
         Self {
-            digest: Sha256Digest([0x5a; 32]),
+            digest,
             upgrades_offered: Arc::new(AtomicU32::new(0)),
         }
     }
 
-    /// Counts coordinator upgrade messages seen — should stay 0 (the sim never
-    /// advertises an upgradeable digest). The Slice-0 test asserts on this.
+    /// Counts coordinator upgrade messages seen — should stay 0 (the device
+    /// announces the coordinator's latest digest, so no upgrade is ever offered).
     pub fn upgrades_offered(&self) -> Arc<AtomicU32> {
         self.upgrades_offered.clone()
     }
@@ -38,7 +44,7 @@ impl SimFirmware {
 
 impl Default for SimFirmware {
     fn default() -> Self {
-        Self::new()
+        Self::new(Self::PLACEHOLDER_DIGEST)
     }
 }
 

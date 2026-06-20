@@ -618,6 +618,7 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
   Widget buildWalletNameBody(BuildContext context) {
     return SliverToBoxAdapter(
       child: TextField(
+        key: KeygenKeys.walletNameField,
         autofocus: true,
         controller: _controller.nameController,
         decoration: InputDecoration(

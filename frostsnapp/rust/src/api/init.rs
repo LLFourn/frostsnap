@@ -99,9 +99,11 @@ impl super::Api {
     /// USB serial — for the simulator only (the sim Dart entrypoint, sim-5). The
     /// returned [`DevicePool`] owns the device thread; drop it to stop the device.
     ///
-    /// No firmware bin and no genuine cert key are wired in, so the manager never
-    /// offers a firmware upgrade and genuine-check is off (consistent with the sim
-    /// guard). Production `load()`/`main.dart` never reach this.
+    /// Sim firmware is self-contained ([`super::sim::sim_firmware_bin`]): the manager's
+    /// latest firmware and the device's announced digest both come from it, so the device
+    /// reads as up-to-date/compatible (no upgrade is ever offered). No genuine cert key is
+    /// wired in, so genuine-check is off (consistent with the sim guard). Production
+    /// `load()`/`main.dart` never reach this.
     /// Debug/sim-only: bind the app to a host virtual device. Compiled
     /// unconditionally; only the `--dart-define=SIM` entrypoint calls it, so a normal
     /// build dead-code-eliminates the Dart branch and never reaches it. See `api::sim`.
@@ -110,14 +112,16 @@ impl super::Api {
         app_dir: String,
         seed: u64,
     ) -> Result<(Coordinator, AppCtx, super::sim::DevicePool)> {
-        use super::sim::{DevicePool, SimDevice, SimFrame};
+        use super::sim::{sim_firmware_bin, DevicePool, SimDevice, SimFrame};
         use frostsnap_virtual_device::{VirtualDevice, VirtualSerial};
 
         let app_dir = PathBuf::from_str(&app_dir)?;
 
+        let firmware = sim_firmware_bin();
+
         let frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>> = Arc::new(Mutex::new(None));
         let on_frame_sink = frames_sink.clone();
-        let spawned = VirtualDevice::spawn(seed, move |width, height, data| {
+        let spawned = VirtualDevice::spawn(seed, firmware.digest(), move |width, height, data| {
             if let Some(sink) = &*on_frame_sink.lock().unwrap() {
                 let _ = sink.add(SimFrame {
                     width,
@@ -128,7 +132,9 @@ impl super::Api {
         });
 
         let virtual_serial = VirtualSerial::single("sim-device-0", spawned.host.clone());
-        let usb_manager = UsbSerialManager::new(Box::new(virtual_serial));
+        let connection = virtual_serial.connection();
+        let usb_manager =
+            UsbSerialManager::new(Box::new(virtual_serial)).with_firmware_bin(firmware);
         let (coord, app_state) = load_internal(app_dir, usb_manager)?;
 
         let device = SimDevice::new(
@@ -136,6 +142,7 @@ impl super::Api {
             spawned.touch.clone(),
             spawned.framebuffer.clone(),
             frames_sink,
+            connection,
         );
         let pool = DevicePool::new(vec![spawned], vec![device]);
 

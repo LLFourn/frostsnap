@@ -16,6 +16,7 @@ use crate::device::VirtualDevice;
 use crate::display::SharedFramebuffer;
 use crate::serial::HostEnd;
 use crate::touch::TouchQueue;
+use frostsnap_comms::Sha256Digest;
 use frostsnap_core::DeviceId;
 use frostsnap_embedded::device_hal::{InitOutcome, Poll};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,15 +55,18 @@ pub struct SpawnedDevice {
 }
 
 impl VirtualDevice {
-    /// Spawn the device on its own thread, built in-thread from `seed`. `on_frame` is
-    /// called with `(width, height, rgba8888)` whenever the framebuffer changes — it's
-    /// generic so this module needn't depend on any UI/FRB sink type.
+    /// Spawn the device on its own thread, built in-thread from `seed`. The device
+    /// announces `firmware_digest` — pass the digest of the firmware bin also seeded
+    /// into the coordinator so the app sees compatible firmware. `on_frame` is called
+    /// with `(width, height, rgba8888)` whenever the framebuffer changes — it's generic
+    /// so this module needn't depend on any UI/FRB sink type.
     ///
     /// Returns once the device has booted and announced its id (the `Send` handles
     /// arrive over an internal channel). Panics if the device reset before booting (a
     /// fresh sim device never should).
     pub fn spawn(
         seed: u64,
+        firmware_digest: Sha256Digest,
         mut on_frame: impl FnMut(u32, u32, Vec<u8>) + Send + 'static,
     ) -> SpawnedDevice {
         let stop = Arc::new(AtomicBool::new(false));
@@ -71,7 +75,7 @@ impl VirtualDevice {
         let thread_stop = stop.clone();
         let join = thread::spawn(move || {
             // Built here so nothing `!Send` (FrostyUi/the session) ever escapes.
-            let mut device = VirtualDevice::new(seed);
+            let mut device = VirtualDevice::with_firmware_digest(seed, firmware_digest);
             let framebuffer = device.framebuffer();
             let touch = device.touch();
             let host = device.host_serial();

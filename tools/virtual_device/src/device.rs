@@ -27,6 +27,7 @@ use frostsnap_embedded::{
     frosty_ui::FrostyUi,
     FlashPartition, ShareEncryptionSecrets,
 };
+use frostsnap_comms::Sha256Digest;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -52,6 +53,13 @@ impl VirtualDevice {
     /// coordinator end is [`VirtualDevice::host_serial`], driven in sim-2); the
     /// downstream link has no peer (single-device star topology).
     pub fn new(seed: u64) -> Self {
+        Self::with_firmware_digest(seed, SimFirmware::PLACEHOLDER_DIGEST)
+    }
+
+    /// Like [`VirtualDevice::new`], but the device announces `firmware_digest`. The
+    /// app path passes the digest of the firmware bin it also seeds into the
+    /// coordinator so the device is seen as having up-to-date (compatible) firmware.
+    pub fn with_firmware_digest(seed: u64, firmware_digest: Sha256Digest) -> Self {
         let clock = SimClock::new();
         let framebuffer = SharedFramebuffer::new();
         let touch = TouchQueue::new();
@@ -59,7 +67,7 @@ impl VirtualDevice {
         let (upstream_io, host) = pipe();
         let downstream_io = PipeByteIo::disconnected();
 
-        let firmware = SimFirmware::new();
+        let firmware = SimFirmware::new(firmware_digest);
         let upgrades_offered = firmware.upgrades_offered();
         let hal = SimHal {
             upstream: FramedSerial::new(upstream_io, clock),

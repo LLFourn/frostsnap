@@ -13,6 +13,8 @@ use crate::serial::HostEnd;
 use frostsnap_coordinator::{PortDesc, PortOpenError, Serial};
 use serialport::{ClearBuffer, DataBits, FlowControl, Parity, SerialPort, StopBits};
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The USB VID/PID the real `UsbSerialManager` filters connected ports on
@@ -160,6 +162,28 @@ impl SerialPort for VirtualPort {
     }
 }
 
+/// A toggle for one virtual port's presence on the bus. Flipping it to disconnected
+/// makes the port vanish from [`VirtualSerial::available_ports`], which the coordinator
+/// observes exactly as a USB unplug; reconnecting it makes the port reappear and the
+/// coordinator re-runs the magic-byte handshake (the device re-announces on its own).
+/// Cheap to clone — clones share one flag — so the UI/FRB layer can hold a copy.
+#[derive(Clone)]
+pub struct PortConnection(Arc<AtomicBool>);
+
+impl PortConnection {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+
+    pub fn set_connected(&self, connected: bool) {
+        self.0.store(connected, Ordering::Relaxed);
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// The `Serial` impl seeded into `UsbSerialManager`: one in-memory port per plugged
 /// device. The coordinator is otherwise unchanged.
 pub struct VirtualSerial {
@@ -169,18 +193,29 @@ pub struct VirtualSerial {
 struct PortEntry {
     id: String,
     host: HostEnd,
+    connection: PortConnection,
 }
 
 impl VirtualSerial {
-    /// A single always-connected device (sim-2 scope). Pass the device's
+    /// A single device, connected by default (sim-2 scope). Pass the device's
     /// `host_serial()` handle.
     pub fn single(id: impl Into<String>, host: HostEnd) -> Self {
         Self {
             ports: vec![PortEntry {
                 id: id.into(),
                 host,
+                connection: PortConnection::new(),
             }],
         }
+    }
+
+    /// The [`PortConnection`] toggle for the single port — flip it to simulate
+    /// plug/unplug. Panics if there isn't exactly one port.
+    pub fn connection(&self) -> PortConnection {
+        let [entry] = &self.ports[..] else {
+            panic!("connection() is only valid for a single-port VirtualSerial");
+        };
+        entry.connection.clone()
     }
 }
 
@@ -188,6 +223,7 @@ impl Serial for VirtualSerial {
     fn available_ports(&self) -> Vec<PortDesc> {
         self.ports
             .iter()
+            .filter(|entry| entry.connection.is_connected())
             .map(|entry| PortDesc {
                 id: entry.id.clone(),
                 vid: FROSTSNAP_VID,

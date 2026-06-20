@@ -12,6 +12,9 @@ abstract final class KeygenKeys {
     'keygen.createMultisigEntry',
   );
 
+  /// The wallet-name text field (the name step).
+  static const walletNameField = ValueKey<String>('keygen.walletNameField');
+
   /// The single step-advance button whose label/action vary by step, keyed PER
   /// STEP (`keygen.next.<step>`, e.g. `keygen.next.name`/`.devices`/`.threshold`)
   /// so the sim-7 driver can both target it and assert which step it is on. The
