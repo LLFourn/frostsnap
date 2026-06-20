@@ -18,6 +18,8 @@ mod nonce_slots;
 pub use nonce_slots::*;
 pub mod flash_header;
 pub use flash_header::*;
+mod secrets;
+pub use secrets::*;
 pub mod flash_log;
 pub use flash_log::*;
 

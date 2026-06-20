@@ -1,0 +1,16 @@
+[package]
+name = "frostsnap_virtual_device"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+frostsnap_embedded = { workspace = true, features = ["ui", "std"] }
+frostsnap_core = { workspace = true }
+frostsnap_comms = { workspace = true }
+frostsnap_widgets = { workspace = true, features = ["std"] }
+embedded-graphics = { workspace = true }
+embedded-storage = { workspace = true }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
+bitcoin = { workspace = true }
+image = { workspace = true, features = ["png"] }

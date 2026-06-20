@@ -1938,6 +1938,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "frostsnap_virtual_device"
+version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "embedded-graphics",
+ "embedded-storage",
+ "frostsnap_comms",
+ "frostsnap_core",
+ "frostsnap_embedded",
+ "frostsnap_widgets",
+ "image",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+]
+
+[[package]]
 name = "frostsnap_widgets"
 version = "0.1.0"
 dependencies = [

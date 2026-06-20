@@ -14,6 +14,7 @@ members = [
     "frostsnap_widgets",
     "tools/widget_simulator",
     "tools/stack_check",
+    "tools/virtual_device",
     "cst816s",
     "frostsnapp/desktop_camera",
     "macros",
@@ -35,6 +36,7 @@ default-members = [
     "frostsnapp/desktop_camera",
     "macros",
     "tools/stack_check",
+    "tools/virtual_device",
 ]
 resolver = "2"
 

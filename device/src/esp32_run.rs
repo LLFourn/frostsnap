@@ -43,7 +43,7 @@ impl<'a> DeviceHal for EspHal<'a> {
     type Upstream = EspSerial<'a, Upstream>;
     type Downstream = EspSerial<'a, Downstream>;
     type Rng = ChaCha20Rng;
-    type Secrets = EfuseHmacKey<'a>;
+    type Secrets = frostsnap_embedded::ShareEncryptionSecrets<EfuseHmacKey<'a>>;
     type Firmware = EspFirmware<'a>;
 
     fn parts(&mut self) -> HalParts<'_, Self> {
