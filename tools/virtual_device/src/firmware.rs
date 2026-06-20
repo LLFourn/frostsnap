@@ -10,9 +10,12 @@ use frostsnap_embedded::{
     framed_serial::SerialPort,
     ui::UserInteraction,
 };
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 pub struct SimFirmware {
     digest: Sha256Digest,
+    upgrades_offered: Arc<AtomicU32>,
 }
 
 impl SimFirmware {
@@ -22,7 +25,14 @@ impl SimFirmware {
         // value with no matching "latest" means no upgrade is ever staged.
         Self {
             digest: Sha256Digest([0x5a; 32]),
+            upgrades_offered: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// Counts coordinator upgrade messages seen — should stay 0 (the sim never
+    /// advertises an upgradeable digest). The Slice-0 test asserts on this.
+    pub fn upgrades_offered(&self) -> Arc<AtomicU32> {
+        self.upgrades_offered.clone()
     }
 }
 
@@ -52,10 +62,13 @@ impl FirmwareServices for SimFirmware {
             // Genuine-check is off for dev devices: no certificate, so nothing to
             // sign. The coordinator gates the challenge on its own flag.
             CoordinatorSendBody::Challenge(_) => FirmwareAction::None,
-            // No upgrade is ever staged (see `firmware_digest`), so an upgrade
-            // takeover should be unreachable in the sim.
+            // The sim never advertises an upgradeable digest, so a coordinator should
+            // never offer one. If a (mis)driven coordinator does, ignore it rather
+            // than panic — a real coordinator must not be able to crash the device.
+            // Counted so the Slice-0 test can assert it never happens.
             CoordinatorSendBody::Upgrade(_) => {
-                unreachable!("the sim is never offered a firmware upgrade")
+                self.upgrades_offered.fetch_add(1, Ordering::Relaxed);
+                FirmwareAction::None
             }
             _ => FirmwareAction::None,
         }

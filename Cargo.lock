@@ -1945,12 +1945,14 @@ dependencies = [
  "embedded-graphics",
  "embedded-storage",
  "frostsnap_comms",
+ "frostsnap_coordinator",
  "frostsnap_core",
  "frostsnap_embedded",
  "frostsnap_widgets",
  "image",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
+ "serialport",
 ]
 
 [[package]]

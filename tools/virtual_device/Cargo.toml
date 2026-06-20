@@ -14,3 +14,7 @@ rand_chacha = { workspace = true }
 rand_core = { workspace = true }
 bitcoin = { workspace = true }
 image = { workspace = true, features = ["png"] }
+# The coordinator-end transport: VirtualPort impls serialport::SerialPort and
+# VirtualSerial impls frostsnap_coordinator::Serial (the injection seam).
+frostsnap_coordinator = { workspace = true }
+serialport = { version = "4.9", default-features = false }

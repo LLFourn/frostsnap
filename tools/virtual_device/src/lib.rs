@@ -15,6 +15,7 @@ mod hal;
 mod secrets;
 mod serial;
 mod touch;
+mod virtual_serial;
 
 pub use clock::SimClock;
 pub use device::{SimUi, VirtualDevice, VirtualDeviceSession};
@@ -25,6 +26,36 @@ pub use hal::{SimDownstream, SimHal, SimUpstream};
 pub use secrets::SimKeyedHash;
 pub use serial::{pipe, ByteChannel, HostEnd, PipeByteIo};
 pub use touch::TouchQueue;
+pub use virtual_serial::{VirtualPort, VirtualSerial, FROSTSNAP_PID, FROSTSNAP_VID};
+
+use frostsnap_coordinator::{DeviceChange, UsbSerialManager};
+use frostsnap_embedded::device_hal::Poll;
+
+/// The result of one [`lockstep_step`]: the coordinator's `DeviceChange`s this tick,
+/// plus whether the device asked the shell to reset (`Poll::ResetRequested`, e.g. a
+/// confirmed data-erase). Once `device_reset` is set the session's loop has torn
+/// itself down, so the caller must stop polling it.
+pub struct LockstepOutcome {
+    pub changes: Vec<DeviceChange>,
+    pub device_reset: bool,
+}
+
+/// One lockstep step: advance the device one tick, then poll the coordinator. The
+/// caller owns the loop, the deadline, and any `accept_device_name` calls between
+/// steps, and must stop on `device_reset`. Give the deadline generous margin — the
+/// coordinator's ~100 ms magic-byte cadence is real-time and lives in the unchanged
+/// manager. (sim-2 drives one device this way because `FrostyUi` is `!Send`; the
+/// per-device thread is sim-4 — see [`VirtualDevice`].)
+pub fn lockstep_step(
+    session: &mut VirtualDeviceSession<'_>,
+    manager: &mut UsbSerialManager,
+) -> LockstepOutcome {
+    let poll = session.poll_once(false);
+    LockstepOutcome {
+        changes: manager.poll_ports(),
+        device_reset: matches!(poll, Poll::ResetRequested),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -222,6 +253,67 @@ mod tests {
             host.tx.len(),
             0,
             "the device drained its upstream input while the session polled"
+        );
+    }
+
+    // Slice 0: one virtual device handshakes through the *real, unchanged*
+    // UsbSerialManager over the in-memory pipe — magic-bytes → Announce → NeedName →
+    // coordinator-side accept_device_name → Registered — driven by the lockstep pump.
+    #[test]
+    fn one_virtual_device_registers_through_the_coordinator() {
+        use frostsnap_coordinator::{DeviceChange, UsbSerialManager};
+        use std::time::{Duration, Instant};
+
+        let mut device = VirtualDevice::new(1);
+        let host = device.host_serial();
+        let mut manager =
+            UsbSerialManager::new(Box::new(VirtualSerial::single("sim-device-0", host)));
+
+        let mut session = match device.session() {
+            InitOutcome::Ready(session) => session,
+            InitOutcome::ResetRequested => panic!("a fresh device should boot, not reset"),
+        };
+
+        // Generous deadline: the coordinator's ~100ms magic-byte cadence is real-time
+        // and lives in the unchanged manager, so this must not be wall-clock tight.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut connected_id = None;
+        let mut registered = None;
+        while Instant::now() < deadline && registered.is_none() {
+            let outcome = lockstep_step(&mut session, &mut manager);
+            assert!(
+                !outcome.device_reset,
+                "device unexpectedly reset during the handshake"
+            );
+            for change in outcome.changes {
+                match change {
+                    DeviceChange::Connected { id, .. } => connected_id = Some(id),
+                    DeviceChange::NeedsName { id } => {
+                        connected_id = Some(id);
+                        manager.accept_device_name(id, "Sim Device".to_string());
+                    }
+                    DeviceChange::Registered { id, name } => registered = Some((id, name)),
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let (id, name) = registered.expect("device should register within the deadline");
+        assert_eq!(
+            Some(id),
+            connected_id,
+            "the registered id matches the announced one"
+        );
+        assert_eq!(name, "Sim Device");
+
+        // Release the &mut device borrow held by the session, then check the guard:
+        // the sim must never have been offered a firmware upgrade.
+        drop(session);
+        assert_eq!(
+            device.upgrades_offered(),
+            0,
+            "a genuine-off sim device must never be offered a firmware upgrade"
         );
     }
 }

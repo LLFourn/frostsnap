@@ -29,6 +29,8 @@ use frostsnap_embedded::{
 };
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 /// The device's `UserInteraction` — the real `FrostyUi` over the sim peripherals.
 pub type SimUi = FrostyUi<FramebufferDisplay, SimClock, TouchQueue>;
@@ -41,6 +43,7 @@ pub struct VirtualDevice {
     framebuffer: SharedFramebuffer,
     touch: TouchQueue,
     host: HostEnd,
+    upgrades_offered: Arc<AtomicU32>,
 }
 
 impl VirtualDevice {
@@ -56,6 +59,8 @@ impl VirtualDevice {
         let (upstream_io, host) = pipe();
         let downstream_io = PipeByteIo::disconnected();
 
+        let firmware = SimFirmware::new();
+        let upgrades_offered = firmware.upgrades_offered();
         let hal = SimHal {
             upstream: FramedSerial::new(upstream_io, clock),
             downstream: FramedSerial::new(downstream_io, clock),
@@ -65,7 +70,7 @@ impl VirtualDevice {
                 "share-encryption-key",
             )),
             fixed_entropy: SimKeyedHash::from_seed(seed, "fixed-entropy-key"),
-            firmware: SimFirmware::new(),
+            firmware,
         };
 
         let ui = FrostyUi::new(
@@ -82,7 +87,14 @@ impl VirtualDevice {
             framebuffer,
             touch,
             host,
+            upgrades_offered,
         }
+    }
+
+    /// How many firmware-upgrade messages the coordinator has offered this device —
+    /// should always be 0 (the sim never advertises an upgradeable digest).
+    pub fn upgrades_offered(&self) -> u32 {
+        self.upgrades_offered.load(Ordering::Relaxed)
     }
 
     /// A handle to the device screen, for frame export / PNG dumps.
