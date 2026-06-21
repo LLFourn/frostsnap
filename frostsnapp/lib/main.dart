@@ -66,9 +66,14 @@ Future<void> main() async {
       // channel's socket lives here too) via `--dart-define=SIM_APP_DIR=/tmp/...`;
       // defaults to the app-support dir.
       const simAppDir = String.fromEnvironment('SIM_APP_DIR');
+      const simDeviceCount = int.fromEnvironment(
+        'SIM_DEVICE_COUNT',
+        defaultValue: 1,
+      );
       final (coord_, appCtx_, pool_) = await api.loadSim(
         appDir: simAppDir.isEmpty ? appDirPath : simAppDir,
         seed: 1,
+        deviceCount: simDeviceCount,
       );
       coord = coord_;
       appCtx = appCtx_;

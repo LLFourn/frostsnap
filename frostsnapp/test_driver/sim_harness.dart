@@ -125,7 +125,10 @@ class SimHarness {
   final Process _appProcess;
   final Directory appDir;
   final FlutterDriver driver;
-  final SimDeviceChannel device;
+
+  /// One device-input channel per virtual device, in 1-based order; index with
+  /// [device]. A single-device session has just `devices[0]` (i.e. `device(1)`).
+  final List<SimDeviceChannel> devices;
   final List<String> _appLog;
   int _shotSeq = 0;
 
@@ -133,9 +136,12 @@ class SimHarness {
     this._appProcess,
     this.appDir,
     this.driver,
-    this.device,
+    this.devices,
     this._appLog,
   );
+
+  /// The device-input channel for device [number] (1-based; defaults to device 1).
+  SimDeviceChannel device([int number = 1]) => devices[number - 1];
 
   /// Run [body] against a fresh harness; on ANY failure capture diagnostics — a
   /// whole-app screenshot, the device framebuffer, the error+stack, and recent app
@@ -148,9 +154,13 @@ class SimHarness {
   static Future<void> runScenario(
     String name,
     Future<void> Function(SimHarness h) body, {
-    String device = 'macos',
+    int deviceCount = 1,
+    String flutterDevice = 'macos',
   }) async {
-    final h = await SimHarness.launch(device: device);
+    final h = await SimHarness.launch(
+      deviceCount: deviceCount,
+      flutterDevice: flutterDevice,
+    );
     try {
       await body(h);
     } catch (error, stack) {
@@ -167,7 +177,10 @@ class SimHarness {
 
   /// Launch the instrumented sim app on a fresh disposable app dir, then connect the
   /// app channel (flutter_driver) and the device channel (socket).
-  static Future<SimHarness> launch({String device = 'macos'}) async {
+  static Future<SimHarness> launch({
+    int deviceCount = 1,
+    String flutterDevice = 'macos',
+  }) async {
     final appDir = await simTmpRoot().createTemp('app-');
     // Ring buffer of recent app stdout/stderr, dumped into the failure artifacts.
     final appLog = <String>[];
@@ -180,7 +193,7 @@ class SimHarness {
     // (otherwise a timed-out connect would leak the flutter process + the app dir).
     Process? proc;
     FlutterDriver? driver;
-    SimDeviceChannel? channel;
+    final channels = <SimDeviceChannel>[];
     try {
       await Directory('${appDir.path}/screenshots').create();
 
@@ -189,9 +202,10 @@ class SimHarness {
         '-t',
         'test_driver/sim_app.dart',
         '-d',
-        device,
+        flutterDevice,
         '--dart-define=SIM=true',
         '--dart-define=SIM_APP_DIR=${appDir.path}',
+        '--dart-define=SIM_DEVICE_COUNT=$deviceCount',
       ]);
 
       // Capture the VM service URL from the run output (surface logs on stderr).
@@ -222,22 +236,25 @@ class SimHarness {
       // without an a11y client otherwise).
       await driver.setSemantics(true);
 
-      // load_sim creates the socket during startup; wait for it before connecting.
-      final socketPath = '${appDir.path}/device-0.sock';
-      final deadline = DateTime.now().add(const Duration(seconds: 30));
-      while (!await File(socketPath).exists()) {
-        if (DateTime.now().isAfter(deadline)) {
-          throw StateError('device socket never appeared at $socketPath');
+      // load_sim creates device-<n>.sock (1-based) during startup; wait for each
+      // before connecting.
+      for (var n = 1; n <= deviceCount; n++) {
+        final socketPath = '${appDir.path}/device-$n.sock';
+        final deadline = DateTime.now().add(const Duration(seconds: 30));
+        while (!await File(socketPath).exists()) {
+          if (DateTime.now().isAfter(deadline)) {
+            throw StateError('device socket never appeared at $socketPath');
+          }
+          await Future.delayed(const Duration(milliseconds: 100));
         }
-        await Future.delayed(const Duration(milliseconds: 100));
+        channels.add(await SimDeviceChannel.connect(socketPath));
       }
-      channel = await SimDeviceChannel.connect(socketPath);
 
-      return SimHarness._(proc, appDir, driver, channel, appLog);
+      return SimHarness._(proc, appDir, driver, channels, appLog);
     } catch (_) {
       // Tear down whatever got created, then rethrow the original setup error.
       await _cleanup(
-        channel: channel,
+        channels: channels,
         driver: driver,
         proc: proc,
         appDir: appDir,
@@ -249,7 +266,7 @@ class SimHarness {
   /// Guarded best-effort teardown of any subset of the harness resources. Every step
   /// runs even if an earlier one throws; returns the first error seen (or null).
   static Future<Object?> _cleanup({
-    SimDeviceChannel? channel,
+    List<SimDeviceChannel>? channels,
     FlutterDriver? driver,
     Process? proc,
     Directory? appDir,
@@ -263,7 +280,11 @@ class SimHarness {
       }
     }
 
-    if (channel != null) await guard(channel.close);
+    if (channels != null) {
+      for (final channel in channels) {
+        await guard(channel.close);
+      }
+    }
     if (driver != null) await guard(driver.close);
     if (proc != null) {
       final p = proc;
@@ -384,8 +405,8 @@ class SimHarness {
 
   // ---- device channel convenience over [device] ----
 
-  Future<void> unplug() => device.setConnected(false);
-  Future<void> plug() => device.setConnected(true);
+  Future<void> unplug([int number = 1]) => device(number).setConnected(false);
+  Future<void> plug([int number = 1]) => device(number).setConnected(true);
 
   // ---- whole-app screenshot (incl. the tray) ----
 
@@ -417,9 +438,11 @@ class SimHarness {
       try {
         await screenshot('app', keep: '${dir.path}/app.png');
       } catch (_) {}
-      try {
-        await device.screen('${dir.path}/device.png');
-      } catch (_) {}
+      for (var n = 1; n <= devices.length; n++) {
+        try {
+          await device(n).screen('${dir.path}/device-$n.png');
+        } catch (_) {}
+      }
       await File('${dir.path}/error.txt').writeAsString(
         '$error\n\n$stack\n\n--- recent app log ---\n${_appLog.join('\n')}\n',
       );
@@ -435,7 +458,7 @@ class SimHarness {
   /// cleanup error (if any) is rethrown once everything has been torn down.
   Future<void> tearDown() async {
     final err = await _cleanup(
-      channel: device,
+      channels: devices,
       driver: driver,
       proc: _appProcess,
       appDir: appDir,

@@ -45,7 +45,7 @@ Future<void> main() async {
     //    app shows the Final-check dialog (guards the device-render race).
     var confirmed = false;
     for (var i = 0; i < 6 && !confirmed; i++) {
-      await h.device.holdConfirm(_confirmX, _confirmY);
+      await h.device(1).holdConfirm(_confirmX, _confirmY);
       confirmed = await h.exists('Yes');
     }
     if (!confirmed) {

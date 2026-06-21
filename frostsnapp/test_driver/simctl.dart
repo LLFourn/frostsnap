@@ -4,11 +4,13 @@ import 'dart:io';
 
 import 'sim_harness.dart';
 
-// simctl: interactively drive the running sim app + device through the SAME SimHarness
+// simctl: interactively drive the running sim app + devices through the SAME SimHarness
 // methods the keygen test uses — no second implementation that can drift.
 //
-//   simctl serve [--device <d>]   launch the app + device ONCE, listen for commands
+//   simctl serve [--count N]      launch the app + N devices ONCE, listen for commands
 //   simctl <cmd> ...              run ONE command against the running daemon, exit
+//
+// Device commands take `--device N` (1-based, default 1) to pick which virtual device.
 //
 // `serve` holds a SimHarness and forwards each command to its methods over a control
 // socket, so the app stays alive across commands: send one, see the result, try the
@@ -18,21 +20,23 @@ import 'sim_harness.dart';
 String get _socketPath => '${simTmpRoot().path}/control.sock';
 
 const _usage = '''
-simctl — drive the running sim app/device through SimHarness.
-  simctl serve [--device <d>]                 launch app+device, listen for commands
+simctl — drive the running sim app/devices through SimHarness.
+  simctl serve [--count N] [--platform <d>]   launch app + N devices, listen
   simctl tap <label> [--regex]                tap a control by semantic label
   simctl tap-until <label> <expect> [--regex] [--regex-expect]
   simctl enter <label> <text> [--regex]       focus a field + type
   simctl wait <label> [--regex]               wait for a label to appear
   simctl exists <label> [--regex]             report whether a label is present
-  simctl hold <x> <y> [ms]                    device hold-to-confirm at a point
-  simctl swipe <x1> <y1> <x2> <y2> [ms]       device swipe
-  simctl touch <x> <y> <down|up>              device raw touch
-  simctl set-connected <true|false>           plug/unplug the device
-  simctl screen <path>                        write the device framebuffer PNG
+  simctl devices                              list each device (number/id/connected)
+  simctl hold <x> <y> [ms] [--device N]       device hold-to-confirm at a point
+  simctl swipe <x1> <y1> <x2> <y2> [ms] [--device N]   device swipe
+  simctl touch <x> <y> <down|up> [--device N]          device raw touch
+  simctl set-connected <true|false> [--device N]       plug/unplug a device
+  simctl screen <path> [--device N]           write the device framebuffer PNG
   simctl shot [path]                          whole-app screenshot (incl. tray)
   simctl down                                 tear down (quit app, clean up)
-(--regex matches the label as a substring; default is exact.)''';
+(--regex matches the label as a substring; default is exact. --device selects the
+ virtual device, 1-based, default 1.)''';
 
 Future<void> main(List<String> args) async {
   if (args.isEmpty) {
@@ -49,12 +53,17 @@ Future<void> main(List<String> args) async {
 // ---- daemon: holds one SimHarness, forwards commands to it ----
 
 Future<void> _serve(List<String> args) async {
-  var device = 'macos';
+  var platform = 'macos';
+  var count = 1;
   for (var i = 0; i < args.length - 1; i++) {
-    if (args[i] == '--device') device = args[i + 1];
+    if (args[i] == '--platform') platform = args[i + 1];
+    if (args[i] == '--count') count = int.parse(args[i + 1]);
   }
 
-  final harness = await SimHarness.launch(device: device);
+  final harness = await SimHarness.launch(
+    deviceCount: count,
+    flutterDevice: platform,
+  );
 
   try {
     File(_socketPath).deleteSync();
@@ -114,6 +123,8 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
   }
   Pattern pat(String key, String flag) =>
       req[flag] == true ? RegExp(req[key] as String) : req[key] as String;
+  // Which virtual device a device-command targets (1-based, default 1).
+  final dn = (req['device'] as int?) ?? 1;
 
   try {
     switch (req['cmd']) {
@@ -134,37 +145,53 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
           {'ok': true, 'exists': await h.exists(pat('label', 'regex'))},
           false,
         );
+      case 'devices':
+        final list = <Map<String, dynamic>>[];
+        for (var n = 1; n <= h.devices.length; n++) {
+          list.add({
+            'number': n,
+            'id': await h.device(n).deviceId(),
+            'connected': await h.device(n).isConnected(),
+          });
+        }
+        return ({'ok': true, 'devices': list}, false);
       case 'hold':
         final ms = req['ms'] as int?;
-        await h.device.holdConfirm(
-          req['x'] as int,
-          req['y'] as int,
-          ms != null
-              ? Duration(milliseconds: ms)
-              : const Duration(milliseconds: 2600),
-        );
+        await h
+            .device(dn)
+            .holdConfirm(
+              req['x'] as int,
+              req['y'] as int,
+              ms != null
+                  ? Duration(milliseconds: ms)
+                  : const Duration(milliseconds: 2600),
+            );
         return ({'ok': true}, false);
       case 'swipe':
-        await h.device.swipe(
-          req['x1'] as int,
-          req['y1'] as int,
-          req['x2'] as int,
-          req['y2'] as int,
-          Duration(milliseconds: (req['ms'] as int?) ?? 300),
-        );
+        await h
+            .device(dn)
+            .swipe(
+              req['x1'] as int,
+              req['y1'] as int,
+              req['x2'] as int,
+              req['y2'] as int,
+              Duration(milliseconds: (req['ms'] as int?) ?? 300),
+            );
         return ({'ok': true}, false);
       case 'touch':
-        await h.device.touch(
-          req['x'] as int,
-          req['y'] as int,
-          liftUp: req['liftUp'] as bool,
-        );
+        await h
+            .device(dn)
+            .touch(
+              req['x'] as int,
+              req['y'] as int,
+              liftUp: req['liftUp'] as bool,
+            );
         return ({'ok': true}, false);
       case 'setConnected':
-        await h.device.setConnected(req['connected'] as bool);
+        await h.device(dn).setConnected(req['connected'] as bool);
         return ({'ok': true}, false);
       case 'screen':
-        await h.device.screen(req['path'] as String);
+        await h.device(dn).screen(req['path'] as String);
         return ({'ok': true, 'path': req['path']}, false);
       case 'shot':
         final path =
@@ -215,8 +242,20 @@ Future<void> _client(List<String> args) async {
 
 /// Translate `simctl <cmd> ...` argv into the wire command, or null if unrecognized.
 Map<String, dynamic>? _argsToCommand(List<String> args) {
-  bool flag(String f) => args.contains(f);
-  final pos = args.where((a) => !a.startsWith('--')).toList();
+  // Pull the valued option `--device <n>` (the virtual-device selector) out before
+  // positional parsing, so its value isn't mistaken for a positional argument.
+  var device = 1;
+  final rest = <String>[];
+  for (var i = 0; i < args.length; i++) {
+    if (args[i] == '--device' && i + 1 < args.length) {
+      device = int.parse(args[i + 1]);
+      i++;
+    } else {
+      rest.add(args[i]);
+    }
+  }
+  bool flag(String f) => rest.contains(f);
+  final pos = rest.where((a) => !a.startsWith('--')).toList();
   if (pos.isEmpty) return null;
   switch (pos.first) {
     case 'tap':
@@ -240,12 +279,15 @@ Map<String, dynamic>? _argsToCommand(List<String> args) {
       return {'cmd': 'wait', 'label': pos[1], 'regex': flag('--regex')};
     case 'exists':
       return {'cmd': 'exists', 'label': pos[1], 'regex': flag('--regex')};
+    case 'devices':
+      return {'cmd': 'devices'};
     case 'hold':
       return {
         'cmd': 'hold',
         'x': int.parse(pos[1]),
         'y': int.parse(pos[2]),
         if (pos.length > 3) 'ms': int.parse(pos[3]),
+        'device': device,
       };
     case 'swipe':
       return {
@@ -255,6 +297,7 @@ Map<String, dynamic>? _argsToCommand(List<String> args) {
         'x2': int.parse(pos[3]),
         'y2': int.parse(pos[4]),
         if (pos.length > 5) 'ms': int.parse(pos[5]),
+        'device': device,
       };
     case 'touch':
       return {
@@ -262,11 +305,16 @@ Map<String, dynamic>? _argsToCommand(List<String> args) {
         'x': int.parse(pos[1]),
         'y': int.parse(pos[2]),
         'liftUp': pos[3] == 'up',
+        'device': device,
       };
     case 'set-connected':
-      return {'cmd': 'setConnected', 'connected': pos[1] == 'true'};
+      return {
+        'cmd': 'setConnected',
+        'connected': pos[1] == 'true',
+        'device': device,
+      };
     case 'screen':
-      return {'cmd': 'screen', 'path': pos[1]};
+      return {'cmd': 'screen', 'path': pos[1], 'device': device};
     case 'shot':
       return {'cmd': 'shot', if (pos.length > 1) 'path': pos[1]};
     case 'down':

@@ -111,52 +111,75 @@ impl super::Api {
         &self,
         app_dir: String,
         seed: u64,
+        device_count: u32,
     ) -> Result<(Coordinator, AppCtx, super::sim::DevicePool)> {
         use super::sim::{sim_firmware_bin, DevicePool, SimDevice, SimFrame};
         use frostsnap_virtual_device::{DeviceChannel, VirtualDevice, VirtualSerial};
 
         let app_dir = PathBuf::from_str(&app_dir)?;
-        let device_socket = app_dir.join("device-0.sock");
-
         let firmware = sim_firmware_bin();
+        let count = device_count.max(1);
 
-        let frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>> = Arc::new(Mutex::new(None));
-        let on_frame_sink = frames_sink.clone();
-        let spawned = VirtualDevice::spawn(seed, firmware.digest(), move |width, height, data| {
-            if let Some(sink) = &*on_frame_sink.lock().unwrap() {
-                let _ = sink.add(SimFrame {
-                    width,
-                    height,
-                    data,
-                });
-            }
-        });
+        // Spawn each device thread (distinct deterministic seed -> distinct id), keeping
+        // a per-device frame sink and the coordinator-side `(port_id, host)` entry.
+        let mut spawned = Vec::with_capacity(count as usize);
+        let mut frame_sinks = Vec::with_capacity(count as usize);
+        let mut entries = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>> = Arc::new(Mutex::new(None));
+            let on_frame_sink = frames_sink.clone();
+            let dev = VirtualDevice::spawn(
+                seed.wrapping_add(i as u64),
+                firmware.digest(),
+                move |width, height, data| {
+                    if let Some(sink) = &*on_frame_sink.lock().unwrap() {
+                        let _ = sink.add(SimFrame {
+                            width,
+                            height,
+                            data,
+                        });
+                    }
+                },
+            );
+            entries.push((format!("sim-device-{i}"), dev.host.clone()));
+            frame_sinks.push(frames_sink);
+            spawned.push(dev);
+        }
 
-        let virtual_serial = VirtualSerial::single("sim-device-0", spawned.host.clone());
-        let connection = virtual_serial.connection();
+        let (virtual_serial, connections) = VirtualSerial::new(entries);
         let usb_manager =
             UsbSerialManager::new(Box::new(virtual_serial)).with_firmware_bin(firmware);
-        let (coord, app_state) = load_internal(app_dir, usb_manager)?;
+        let (coord, app_state) = load_internal(app_dir.clone(), usb_manager)?;
 
-        // The device-input channel: drive the device by hardware semantics over a
-        // unix socket, independent of Flutter. Dropping the pool stops it + removes
-        // the socket file.
-        let channel = DeviceChannel::serve(
-            device_socket,
-            spawned.touch.clone(),
-            spawned.framebuffer.clone(),
-            connection.clone(),
-            spawned.device_id,
-        )?;
+        // One device-input channel + Dart handle per device. Each is numbered 1-based;
+        // the channel binds `device-<number>.sock` and the handle carries its own
+        // `PortConnection` so each device plugs/unplugs independently. Dropping the pool
+        // stops every channel + removes every socket file.
+        let mut channels = Vec::with_capacity(count as usize);
+        let mut devices = Vec::with_capacity(count as usize);
+        for (i, ((dev, frames_sink), connection)) in
+            spawned.iter().zip(frame_sinks).zip(connections).enumerate()
+        {
+            let number = (i + 1) as u32;
+            let socket = app_dir.join(format!("device-{number}.sock"));
+            channels.push(DeviceChannel::serve(
+                socket,
+                dev.touch.clone(),
+                dev.framebuffer.clone(),
+                connection.clone(),
+                dev.device_id,
+            )?);
+            devices.push(SimDevice::new(
+                number,
+                dev.device_id,
+                dev.touch.clone(),
+                dev.framebuffer.clone(),
+                frames_sink,
+                connection,
+            ));
+        }
 
-        let device = SimDevice::new(
-            spawned.device_id,
-            spawned.touch.clone(),
-            spawned.framebuffer.clone(),
-            frames_sink,
-            connection,
-        );
-        let pool = DevicePool::new(vec![spawned], vec![channel], vec![device]);
+        let pool = DevicePool::new(spawned, channels, devices);
 
         Ok((coord, app_state, pool))
     }

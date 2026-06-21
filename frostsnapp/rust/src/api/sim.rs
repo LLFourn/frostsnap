@@ -51,6 +51,7 @@ pub struct SimFrame {
 #[derive(Clone)]
 #[frb(opaque)]
 pub struct SimDevice {
+    number: u32,
     device_id: DeviceId,
     touch: TouchQueue,
     framebuffer: SharedFramebuffer,
@@ -59,6 +60,13 @@ pub struct SimDevice {
 }
 
 impl SimDevice {
+    /// This device's 1-based position in the pool — a short, stable label for the tray
+    /// and the device-channel selector, in place of the opaque [`SimDevice::id`].
+    #[frb(sync)]
+    pub fn number(&self) -> u32 {
+        self.number
+    }
+
     #[frb(sync)]
     pub fn id(&self) -> String {
         self.device_id.to_string()
@@ -123,6 +131,7 @@ impl DevicePool {
 
 impl SimDevice {
     pub(crate) fn new(
+        number: u32,
         device_id: DeviceId,
         touch: TouchQueue,
         framebuffer: SharedFramebuffer,
@@ -130,6 +139,7 @@ impl SimDevice {
         connection: PortConnection,
     ) -> Self {
         Self {
+            number,
             device_id,
             touch,
             framebuffer,

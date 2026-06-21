@@ -197,16 +197,26 @@ struct PortEntry {
 }
 
 impl VirtualSerial {
+    /// A multi-port serial — one in-memory port per `(id, host)` entry, each with its
+    /// own fresh [`PortConnection`]. The connections are returned in entry order so the
+    /// caller can hand each to the matching device for independent plug/unplug.
+    pub fn new(entries: Vec<(String, HostEnd)>) -> (Self, Vec<PortConnection>) {
+        let ports: Vec<PortEntry> = entries
+            .into_iter()
+            .map(|(id, host)| PortEntry {
+                id,
+                host,
+                connection: PortConnection::new(),
+            })
+            .collect();
+        let connections = ports.iter().map(|p| p.connection.clone()).collect();
+        (Self { ports }, connections)
+    }
+
     /// A single device, connected by default (sim-2 scope). Pass the device's
     /// `host_serial()` handle.
     pub fn single(id: impl Into<String>, host: HostEnd) -> Self {
-        Self {
-            ports: vec![PortEntry {
-                id: id.into(),
-                host,
-                connection: PortConnection::new(),
-            }],
-        }
+        Self::new(vec![(id.into(), host)]).0
     }
 
     /// The [`PortConnection`] toggle for the single port — flip it to simulate
@@ -261,5 +271,24 @@ mod tests {
         let mut empty: [u8; 0] = [];
         // Must be Ok(0) per the Read contract, even though no bytes are buffered.
         assert_eq!(port.read(&mut empty).unwrap(), 0);
+    }
+
+    #[test]
+    fn multi_port_serial_unplugs_independently() {
+        let (_d0, h0) = pipe();
+        let (_d1, h1) = pipe();
+        let (serial, conns) =
+            VirtualSerial::new(vec![("sim-0".to_string(), h0), ("sim-1".to_string(), h1)]);
+        assert_eq!(serial.available_ports().len(), 2);
+
+        // Unplugging one port removes only that port from the bus.
+        conns[0].set_connected(false);
+        let ports = serial.available_ports();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].id, "sim-1");
+
+        // Replugging restores it.
+        conns[0].set_connected(true);
+        assert_eq!(serial.available_ports().len(), 2);
     }
 }

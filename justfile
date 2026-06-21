@@ -208,15 +208,20 @@ legacy-run +ARGS="": maybe-gen
 sim-keygen-drive: maybe-gen
     cd frostsnapp && dart run test_driver/keygen_drive.dart
 
-# Start the interactive sim session: launches the app + device ONCE and keeps them
-# alive, listening for `just sim ...` commands. Run in the background; stop with
-# `just sim down`. Drives the SAME SimHarness calls the keygen test uses.
+# sim-9 acceptance: bring up a 3-device fleet and assert independent plug/unplug +
+# distinct ids through the SimHarness, then tear down with no residue. Needs a display.
+sim-multi-drive: maybe-gen
+    cd frostsnapp && dart run test_driver/multi_device_drive.dart
+
+# Start the interactive sim session: launches the app + N devices ONCE (`--count N`,
+# default 1) and keeps them alive, listening for `just sim ...` commands. Run in the
+# background; stop with `just sim down`. Drives the SAME SimHarness calls the tests use.
 sim-serve +ARGS="": maybe-gen
     cd frostsnapp && dart run test_driver/simctl.dart serve {{ARGS}}
 
 # Send ONE command to the running sim session (app stays alive between commands), e.g.
-# `just sim tap "Create a multi-sig wallet"`, `just sim hold 120 215 3000`,
-# `just sim shot /tmp/x.png`, `just sim down`. See simctl.dart for the full command set.
+# `just sim tap "Create a multi-sig wallet"`, `just sim hold 120 215 3000 --device 2`,
+# `just sim devices`, `just sim shot /tmp/x.png`, `just sim down`. See simctl.dart.
 sim +ARGS="":
     cd frostsnapp && dart run test_driver/simctl.dart {{ARGS}}
 
