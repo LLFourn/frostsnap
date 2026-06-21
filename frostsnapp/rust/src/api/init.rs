@@ -114,23 +114,54 @@ impl super::Api {
         device_count: u32,
     ) -> Result<(Coordinator, AppCtx, super::sim::DevicePool)> {
         use super::sim::{sim_firmware_bin, DevicePool, SimDevice, SimFrame};
-        use frostsnap_virtual_device::{DeviceChannel, VirtualDevice, VirtualSerial};
+        use frostsnap_virtual_device::{
+            device_link, pipe, DeviceChannel, LinkGate, ParentLink, PipeByteIo, VirtualDevice,
+            VirtualSerial,
+        };
 
         let app_dir = PathBuf::from_str(&app_dir)?;
         let firmware = sim_firmware_bin();
-        let count = device_count.max(1);
+        let count = device_count.max(1) as usize;
 
-        // Spawn each device thread (distinct deterministic seed -> distinct id), keeping
-        // a per-device frame sink and the coordinator-side `(port_id, host)` entry.
-        let mut spawned = Vec::with_capacity(count as usize);
-        let mut frame_sinks = Vec::with_capacity(count as usize);
-        let mut entries = Vec::with_capacity(count as usize);
+        // Wire the devices as a daisy chain (real hardware's topology): device 0 hangs off
+        // the single coordinator USB port; every device below it hangs off the previous
+        // device's downstream port. Each inter-device link shares one gate that is BOTH
+        // device i's downstream-detect AND device i+1's plug control, so cutting a link
+        // makes the real firmware tear the subtree off the bus (no sim disconnect logic).
+        let mut upstream_ios: Vec<Option<PipeByteIo>> = (0..count).map(|_| None).collect();
+        let mut downstream_ios: Vec<Option<PipeByteIo>> = (0..count).map(|_| None).collect();
+        let mut downstream_gates: Vec<Option<LinkGate>> = (0..count).map(|_| None).collect();
+        let mut parent_links: Vec<Option<ParentLink>> = (0..count).map(|_| None).collect();
+
+        // device 0's upstream is the coordinator port; keep the host end for the serial.
+        let (up0_io, host0) = pipe();
+        upstream_ios[0] = Some(up0_io);
+        for i in 0..count - 1 {
+            let (parent_io, child_io, gate) = device_link();
+            downstream_ios[i] = Some(parent_io); // device i's downstream
+            upstream_ios[i + 1] = Some(child_io); // device i+1's upstream
+            downstream_gates[i] = Some(gate.clone()); // device i's downstream-detect
+            parent_links[i + 1] = Some(ParentLink::Cable(gate)); // device i+1's plug control
+        }
+
+        // Spawn each device thread on its wired links (distinct seed -> distinct id),
+        // keeping a per-device frame sink. The tail device has a peerless downstream.
+        let mut spawned = Vec::with_capacity(count);
+        let mut frame_sinks = Vec::with_capacity(count);
         for i in 0..count {
             let frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>> = Arc::new(Mutex::new(None));
             let on_frame_sink = frames_sink.clone();
-            let dev = VirtualDevice::spawn(
+            let upstream_io = upstream_ios[i].take().expect("each device has an upstream");
+            let downstream_io = downstream_ios[i]
+                .take()
+                .unwrap_or_else(PipeByteIo::disconnected);
+            let downstream_present = downstream_gates[i].take();
+            let dev = VirtualDevice::spawn_chained(
                 seed.wrapping_add(i as u64),
                 firmware.digest(),
+                upstream_io,
+                downstream_io,
+                downstream_present,
                 move |width, height, data| {
                     if let Some(sink) = &*on_frame_sink.lock().unwrap() {
                         let _ = sink.add(SimFrame {
@@ -141,32 +172,34 @@ impl super::Api {
                     }
                 },
             );
-            entries.push((format!("sim-device-{i}"), dev.host.clone()));
             frame_sinks.push(frames_sink);
             spawned.push(dev);
         }
 
-        let (virtual_serial, connections) = VirtualSerial::new(entries);
+        // The coordinator sees exactly ONE port (device 0); it learns devices 1..N from
+        // the Announce messages the chain relays upstream.
+        let virtual_serial = VirtualSerial::single("sim-device-0", host0);
+        parent_links[0] = Some(ParentLink::Usb(virtual_serial.connection()));
         let usb_manager =
             UsbSerialManager::new(Box::new(virtual_serial)).with_firmware_bin(firmware);
         let (coord, app_state) = load_internal(app_dir.clone(), usb_manager)?;
 
         // One device-input channel + Dart handle per device. Each is numbered 1-based;
-        // the channel binds `device-<number>.sock` and the handle carries its own
-        // `PortConnection` so each device plugs/unplugs independently. Dropping the pool
-        // stops every channel + removes every socket file.
-        let mut channels = Vec::with_capacity(count as usize);
-        let mut devices = Vec::with_capacity(count as usize);
-        for (i, ((dev, frames_sink), connection)) in
-            spawned.iter().zip(frame_sinks).zip(connections).enumerate()
-        {
+        // the channel binds `device-<number>.sock` and the handle carries its parent-link
+        // plug control. Dropping the pool stops every channel + removes every socket file.
+        let mut channels = Vec::with_capacity(count);
+        let mut devices = Vec::with_capacity(count);
+        for (i, (dev, frames_sink)) in spawned.iter().zip(frame_sinks).enumerate() {
             let number = (i + 1) as u32;
+            let parent = parent_links[i]
+                .take()
+                .expect("every device has a parent link");
             let socket = app_dir.join(format!("device-{number}.sock"));
             channels.push(DeviceChannel::serve(
                 socket,
                 dev.touch.clone(),
                 dev.framebuffer.clone(),
-                connection.clone(),
+                parent.clone(),
                 dev.device_id,
             )?);
             devices.push(SimDevice::new(
@@ -175,7 +208,7 @@ impl super::Api {
                 dev.touch.clone(),
                 dev.framebuffer.clone(),
                 frames_sink,
-                connection,
+                parent,
             ));
         }
 

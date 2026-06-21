@@ -9,8 +9,8 @@ use flutter_rust_bridge::frb;
 use frostsnap_coordinator::{FirmwareBin, ValidatedFirmwareBin};
 use frostsnap_core::DeviceId;
 use frostsnap_virtual_device::{
-    DeviceChannel, Point, PortConnection, SharedFramebuffer, SpawnedDevice, TouchEvent,
-    TouchGesture, TouchQueue,
+    DeviceChannel, ParentLink, Point, SharedFramebuffer, SpawnedDevice, TouchEvent, TouchGesture,
+    TouchQueue,
 };
 use std::sync::{Arc, Mutex};
 
@@ -56,7 +56,7 @@ pub struct SimDevice {
     touch: TouchQueue,
     framebuffer: SharedFramebuffer,
     frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>>,
-    connection: PortConnection,
+    connection: ParentLink,
 }
 
 impl SimDevice {
@@ -136,7 +136,7 @@ impl SimDevice {
         touch: TouchQueue,
         framebuffer: SharedFramebuffer,
         frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>>,
-        connection: PortConnection,
+        connection: ParentLink,
     ) -> Self {
         Self {
             number,
@@ -148,9 +148,11 @@ impl SimDevice {
         }
     }
 
-    /// Simulate plugging/unplugging the device's USB. When disconnected the port
-    /// vanishes from the coordinator's view (it sees an unplug); reconnecting makes
-    /// it reappear and re-announce. Drives the sim tray's connect/disconnect toggle.
+    /// Plug/unplug this device at the link to its parent (device 1: the coordinator USB
+    /// port; lower devices: the cable up to their parent). Unplugging drops this device
+    /// AND everything downstream of it, since power and data flow down the chain — the
+    /// firmware tears the connections down and the coordinator stops seeing the subtree.
+    /// Drives the sim tray's connect/disconnect toggle.
     #[frb(sync)]
     pub fn set_connected(&self, connected: bool) {
         self.connection.set_connected(connected);

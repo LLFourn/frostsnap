@@ -405,6 +405,10 @@ class SimHarness {
 
   // ---- device channel convenience over [device] ----
 
+  // Plug/unplug device [number] at the link to its PARENT (device 1 = the coordinator
+  // USB port; lower devices = the cable up the chain). On the daisy chain, unplugging a
+  // device therefore drops it AND everything downstream of it; re-plugging restores the
+  // subtree.
   Future<void> unplug([int number = 1]) => device(number).setConnected(false);
   Future<void> plug([int number = 1]) => device(number).setConnected(true);
 

@@ -24,7 +24,7 @@
 use crate::display::SharedFramebuffer;
 use crate::input::DeviceInput;
 use crate::touch::TouchQueue;
-use crate::virtual_serial::PortConnection;
+use crate::virtual_serial::ParentLink;
 use frostsnap_core::DeviceId;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -44,7 +44,7 @@ const ACCEPT_POLL: Duration = Duration::from_millis(20);
 struct Handles {
     touch: TouchQueue,
     framebuffer: SharedFramebuffer,
-    connection: PortConnection,
+    connection: ParentLink,
     device_id: DeviceId,
 }
 
@@ -58,13 +58,13 @@ pub struct DeviceChannel {
 
 impl DeviceChannel {
     /// Serve the protocol on a unix socket at `socket_path`. The handles are clones of
-    /// the running device's `TouchQueue` / `SharedFramebuffer` / `PortConnection` plus
-    /// its id. A stale socket file at the path is removed first.
+    /// the running device's `TouchQueue` / `SharedFramebuffer` / `ParentLink` (its
+    /// plug control) plus its id. A stale socket file at the path is removed first.
     pub fn serve(
         socket_path: PathBuf,
         touch: TouchQueue,
         framebuffer: SharedFramebuffer,
-        connection: PortConnection,
+        connection: ParentLink,
         device_id: DeviceId,
     ) -> std::io::Result<Self> {
         let _ = std::fs::remove_file(&socket_path);
@@ -249,8 +249,8 @@ mod tests {
     #[test]
     fn device_channel_round_trips_over_the_socket() {
         let spawned = VirtualDevice::spawn(11, SimFirmware::PLACEHOLDER_DIGEST, |_, _, _| {});
-        let serial = VirtualSerial::single("sim-0", spawned.host.clone());
-        let connection = serial.connection();
+        let serial = VirtualSerial::single("sim-0", spawned.host.clone().unwrap());
+        let connection = ParentLink::Usb(serial.connection());
 
         // A dedicated temp dir so the socket + screen PNG are cleaned up together.
         let dir = std::env::temp_dir().join("frostsnap-devchan-roundtrip");

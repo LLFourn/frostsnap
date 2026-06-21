@@ -43,7 +43,10 @@ pub struct VirtualDevice {
     clock: SimClock,
     framebuffer: SharedFramebuffer,
     touch: TouchQueue,
-    host: HostEnd,
+    // Only set when the device owns its upstream pipe ([`with_firmware_digest`]); a
+    // chained device built with [`from_io`] is wired to a peer's link, so it has no
+    // host of its own (the caller holds the coordinator end).
+    host: Option<HostEnd>,
     upgrades_offered: Arc<AtomicU32>,
 }
 
@@ -51,7 +54,7 @@ impl VirtualDevice {
     /// Build a device. `seed` fixes both the RNG and the dev keys, so a given seed
     /// is a reproducible device. The upstream link is a connected pipe (its
     /// coordinator end is [`VirtualDevice::host_serial`], driven in sim-2); the
-    /// downstream link has no peer (single-device star topology).
+    /// downstream link has no peer.
     pub fn new(seed: u64) -> Self {
         Self::with_firmware_digest(seed, SimFirmware::PLACEHOLDER_DIGEST)
     }
@@ -59,13 +62,28 @@ impl VirtualDevice {
     /// Like [`VirtualDevice::new`], but the device announces `firmware_digest`. The
     /// app path passes the digest of the firmware bin it also seeds into the
     /// coordinator so the device is seen as having up-to-date (compatible) firmware.
+    /// Owns its upstream pipe (`host_serial` hands out the coordinator end) and has a
+    /// peerless downstream.
     pub fn with_firmware_digest(seed: u64, firmware_digest: Sha256Digest) -> Self {
+        let (upstream_io, host) = pipe();
+        let downstream_io = PipeByteIo::disconnected();
+        let mut device = Self::from_io(seed, firmware_digest, upstream_io, downstream_io);
+        device.host = Some(host);
+        device
+    }
+
+    /// Build a device wired to externally-supplied upstream and downstream byte links —
+    /// the chained construction (sim-10): the caller owns the link ends, so neighbours
+    /// can be connected device-to-device. Has no `host` of its own.
+    pub fn from_io(
+        seed: u64,
+        firmware_digest: Sha256Digest,
+        upstream_io: PipeByteIo,
+        downstream_io: PipeByteIo,
+    ) -> Self {
         let clock = SimClock::new();
         let framebuffer = SharedFramebuffer::new();
         let touch = TouchQueue::new();
-
-        let (upstream_io, host) = pipe();
-        let downstream_io = PipeByteIo::disconnected();
 
         let firmware = SimFirmware::new(firmware_digest);
         let upgrades_offered = firmware.upgrades_offered();
@@ -94,7 +112,7 @@ impl VirtualDevice {
             clock,
             framebuffer,
             touch,
-            host,
+            host: None,
             upgrades_offered,
         }
     }
@@ -121,7 +139,9 @@ impl VirtualDevice {
     /// [`touch`](Self::touch), the clone shares the same `Arc`-backed wire and stays
     /// usable while the borrowed session runs.
     pub fn host_serial(&self) -> HostEnd {
-        self.host.clone()
+        self.host
+            .clone()
+            .expect("host_serial is only valid on a device that owns its upstream pipe")
     }
 
     /// Start a session: construct the one persistent `DeviceLoop` over the owned

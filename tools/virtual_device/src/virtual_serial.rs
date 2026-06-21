@@ -184,6 +184,36 @@ impl PortConnection {
     }
 }
 
+/// What a device's connect/disconnect toggles. Device 1 sits on the coordinator USB
+/// port ([`PortConnection`]); every device below it hangs off its parent's downstream
+/// port via a cable ([`LinkGate`]). Either way `set_connected` flips the one flag that
+/// gates that link — and because power and data both flow down the chain, cutting a
+/// node's parent link drops that node AND its whole subtree (the firmware tears the
+/// downstream connections down; the coordinator stops seeing the orphaned devices).
+#[derive(Clone)]
+pub enum ParentLink {
+    /// The coordinator-facing USB port (device 1).
+    Usb(PortConnection),
+    /// The cable from this device up to its parent device (device 2..N).
+    Cable(crate::serial::LinkGate),
+}
+
+impl ParentLink {
+    pub fn set_connected(&self, connected: bool) {
+        match self {
+            Self::Usb(p) => p.set_connected(connected),
+            Self::Cable(g) => g.set_connected(connected),
+        }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        match self {
+            Self::Usb(p) => p.is_connected(),
+            Self::Cable(g) => g.is_connected(),
+        }
+    }
+}
+
 /// The `Serial` impl seeded into `UsbSerialManager`: one in-memory port per plugged
 /// device. The coordinator is otherwise unchanged.
 pub struct VirtualSerial {

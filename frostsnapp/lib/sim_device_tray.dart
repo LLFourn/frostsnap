@@ -88,6 +88,16 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
                     return const Center(child: CircularProgressIndicator());
                   }
                   final allConnected = devices.every((d) => d.isConnected());
+                  // Power flows down the chain: a device is lit only if every link from
+                  // the coordinator (device 1) down to it is connected, so cutting a link
+                  // darkens that node AND its whole subtree. `connected` (a device's own
+                  // parent link) still drives its plug icon; `powered` drives its screen.
+                  final powered = <bool>[];
+                  var reachable = true;
+                  for (final device in devices) {
+                    reachable = reachable && device.isConnected();
+                    powered.add(reachable);
+                  }
                   return Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
@@ -102,16 +112,17 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
                         child: ListView(
                           padding: const EdgeInsets.symmetric(vertical: 8),
                           children: [
-                            for (final device in devices)
+                            for (var i = 0; i < devices.length; i++)
                               Padding(
                                 padding: const EdgeInsets.symmetric(
                                   horizontal: 8,
                                   vertical: 8,
                                 ),
                                 child: _SimDeviceCell(
-                                  device: device,
-                                  connected: device.isConnected(),
-                                  onToggle: () => _toggle(device),
+                                  device: devices[i],
+                                  connected: devices[i].isConnected(),
+                                  powered: powered[i],
+                                  onToggle: () => _toggle(devices[i]),
                                 ),
                               ),
                           ],
@@ -169,12 +180,17 @@ class _TrayHeader extends StatelessWidget {
 
 class _SimDeviceCell extends StatefulWidget {
   final SimDevice device;
+  // This device's own parent link (drives the plug icon/toggle).
   final bool connected;
+  // Whether the device has power — reachable from the coordinator through all links
+  // above it (drives the screen: a node whose ancestor link is cut goes dark too).
+  final bool powered;
   final VoidCallback onToggle;
 
   const _SimDeviceCell({
     required this.device,
     required this.connected,
+    required this.powered,
     required this.onToggle,
   });
 
@@ -261,21 +277,21 @@ class _SimDeviceCellState extends State<_SimDeviceCell> {
           ],
         ),
         const SizedBox(height: 4),
-        Center(child: _screen(theme, connected)),
+        Center(child: _screen(theme, widget.powered)),
       ],
     );
   }
 
-  // The device render box, fixed at [_deviceRenderWidth]. When unplugged the screen is
-  // OFF — a dark panel, NOT the live framebuffer — and it accepts no touches; this is
-  // driven by [connected] alone, independent of whether the device thread keeps
-  // emitting frames in the background.
-  Widget _screen(ThemeData theme, bool connected) {
+  // The device render box, fixed at [_deviceRenderWidth]. When the device is not powered
+  // (its parent link, or any link above it, is cut) the screen is OFF — a dark panel, NOT
+  // the live framebuffer — and it accepts no touches. Driven by [powered] alone,
+  // independent of whether the device thread keeps emitting frames in the background.
+  Widget _screen(ThemeData theme, bool powered) {
     final width = _deviceRenderWidth;
     final height = _deviceRenderWidth * _deviceHeight / _deviceWidth;
     final image = _image;
 
-    if (!connected) {
+    if (!powered) {
       return SizedBox(
         width: width,
         height: height,
