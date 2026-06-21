@@ -177,9 +177,14 @@ class SimHarness {
 
   /// Launch the instrumented sim app on a fresh disposable app dir, then connect the
   /// app channel (flutter_driver) and the device channel (socket).
+  /// [agentOwnsKeyboard] true (the default, for tests) routes text through the driver's
+  /// mock input so [driver.enterText] works but the real keyboard is blocked; pass false
+  /// to hand the keyboard to a human (then `enterText` is unavailable). One mode per
+  /// session — see `sim_app.dart`.
   static Future<SimHarness> launch({
     int deviceCount = 1,
     String flutterDevice = 'macos',
+    bool agentOwnsKeyboard = true,
   }) async {
     final appDir = await simTmpRoot().createTemp('app-');
     // Ring buffer of recent app stdout/stderr, dumped into the failure artifacts.
@@ -206,6 +211,7 @@ class SimHarness {
         '--dart-define=SIM=true',
         '--dart-define=SIM_APP_DIR=${appDir.path}',
         '--dart-define=SIM_DEVICE_COUNT=$deviceCount',
+        '--dart-define=SIM_AGENT_OWNS_KEYBOARD=$agentOwnsKeyboard',
       ]);
 
       // Capture the VM service URL from the run output (surface logs on stderr).

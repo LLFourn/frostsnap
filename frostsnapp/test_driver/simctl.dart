@@ -11,6 +11,9 @@ import 'sim_harness.dart';
 //   simctl <cmd> ...              run ONE command against the running daemon, exit
 //
 // Device commands take `--device N` (1-based, default 1) to pick which virtual device.
+// By default `serve` hands the keyboard to a human (real typing works; `enter` does not);
+// pass `--agent-owns-keyboard` to let the driver own text input instead (enables `enter`,
+// blocks the physical keyboard). One mode for the session — no hybrid.
 //
 // `serve` holds a SimHarness and forwards each command to its methods over a control
 // socket, so the app stays alive across commands: send one, see the result, try the
@@ -21,10 +24,10 @@ String get _socketPath => '${simTmpRoot().path}/control.sock';
 
 const _usage = '''
 simctl — drive the running sim app/devices through SimHarness.
-  simctl serve [--count N] [--platform <d>]   launch app + N devices, listen
+  simctl serve [--count N] [--platform <d>] [--agent-owns-keyboard]   launch app + listen
   simctl tap <label> [--regex]                tap a control by semantic label
   simctl tap-until <label> <expect> [--regex] [--regex-expect]
-  simctl enter <label> <text> [--regex]       focus a field + type
+  simctl enter <label> <text> [--regex]       focus a field + type (agent-owns-keyboard only)
   simctl wait <label> [--regex]               wait for a label to appear
   simctl exists <label> [--regex]             report whether a label is present
   simctl devices                              list each device (number/id/connected)
@@ -36,7 +39,8 @@ simctl — drive the running sim app/devices through SimHarness.
   simctl shot [path]                          whole-app screenshot (incl. tray)
   simctl down                                 tear down (quit app, clean up)
 (--regex matches the label as a substring; default is exact. --device selects the
- virtual device, 1-based, default 1.)''';
+ virtual device, 1-based, default 1. `serve` gives the keyboard to a human unless
+ --agent-owns-keyboard is passed, which the driver needs for `enter`.)''';
 
 Future<void> main(List<String> args) async {
   if (args.isEmpty) {
@@ -55,6 +59,10 @@ Future<void> main(List<String> args) async {
 Future<void> _serve(List<String> args) async {
   var platform = 'macos';
   var count = 1;
+  // Default: a human owns the keyboard (real typing works, `enter` is rejected). Pass
+  // --agent-owns-keyboard for the driver to own text input instead (enables `enter`,
+  // blocks the physical keyboard). One mode for the session — no hybrid.
+  final agentOwnsKeyboard = args.contains('--agent-owns-keyboard');
   for (var i = 0; i < args.length - 1; i++) {
     if (args[i] == '--platform') platform = args[i + 1];
     if (args[i] == '--count') count = int.parse(args[i + 1]);
@@ -63,6 +71,7 @@ Future<void> _serve(List<String> args) async {
   final harness = await SimHarness.launch(
     deviceCount: count,
     flutterDevice: platform,
+    agentOwnsKeyboard: agentOwnsKeyboard,
   );
 
   try {
@@ -96,7 +105,7 @@ Future<void> _serve(List<String> args) async {
         .transform(const LineSplitter());
     await for (final line in lines) {
       if (line.trim().isEmpty) continue;
-      final (reply, down) = await _dispatch(line, harness);
+      final (reply, down) = await _dispatch(line, harness, agentOwnsKeyboard);
       conn.write('${jsonEncode(reply)}\n');
       await conn.flush();
       if (down) {
@@ -114,6 +123,7 @@ Future<void> _serve(List<String> args) async {
 Future<(Map<String, dynamic>, bool)> _dispatch(
   String line,
   SimHarness h,
+  bool agentOwnsKeyboard,
 ) async {
   final Map<String, dynamic> req;
   try {
@@ -135,6 +145,17 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
         await h.tapUntil(pat('label', 'regex'), pat('expect', 'regexExpect'));
         return ({'ok': true}, false);
       case 'enter':
+        if (!agentOwnsKeyboard) {
+          return (
+            {
+              'ok': false,
+              'error':
+                  'enter is unavailable when a human owns the keyboard; type into the '
+                  'app directly, or relaunch with `just sim-serve --agent-owns-keyboard`',
+            },
+            false,
+          );
+        }
         await h.enterText(pat('label', 'regex'), req['text'] as String);
         return ({'ok': true}, false);
       case 'wait':
