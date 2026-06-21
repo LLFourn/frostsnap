@@ -640,7 +640,7 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
     return MultiSliver(
       children: [
         SliverDeviceList(
-          deviceBuilder: (context, device) {
+          deviceBuilder: (context, device, index) {
             final cs = Theme.of(context).colorScheme;
 
             if (device.name != null) {
@@ -666,7 +666,7 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
             return device.firmwareUpgradeEligibility().when(
               upToDate: () => _deviceRow(
                 context: context,
-                title: _inlineNameField(context, device),
+                title: _inlineNameField(context, device, index),
                 trailing: IconButton(
                   icon: Icon(
                     Icons.edit_rounded,
@@ -836,7 +836,11 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
   final Map<DeviceId, TextEditingController> _nameControllers = deviceIdMap();
   final Map<DeviceId, FocusNode> _nameFocusNodes = deviceIdMap();
 
-  Widget _inlineNameField(BuildContext context, ConnectedDevice device) {
+  Widget _inlineNameField(
+    BuildContext context,
+    ConnectedDevice device,
+    int index,
+  ) {
     final cs = Theme.of(context).colorScheme;
     final currentName = _controller.form.deviceNames[device.id] ?? '';
     final textController = _nameControllers.putIfAbsent(
@@ -844,9 +848,10 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
       () => TextEditingController(text: currentName),
     );
     final isDuplicate = _controller.duplicateNamedDeviceIds.contains(device.id);
-    // Accessible name for the field (screen readers + the sim-8 driver target it).
+    // Accessible name for the field, numbered by position so screen readers and the
+    // sim driver can target each device's field unambiguously when several are listed.
     return Semantics(
-      label: 'Device name',
+      label: 'Device name ${index + 1}',
       textField: true,
       child: TextField(
         controller: textController,

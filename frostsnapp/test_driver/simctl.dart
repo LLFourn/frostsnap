@@ -31,6 +31,11 @@ simctl — drive the running sim app/devices through SimHarness.
   simctl wait <label> [--regex]               wait for a label to appear
   simctl exists <label> [--regex]             report whether a label is present
   simctl devices                              list each device (number/id/connected)
+  simctl chain                                print the connected chain order
+  simctl set-chain <n>...                     re-cable to exactly these devices, in order
+  simctl connect <n>                          append device n to the chain
+  simctl disconnect <n>                       remove device n (chain re-closes)
+  simctl move-up <n> / move-down <n>          reorder device n within the chain
   simctl hold <x> <y> [ms] [--device N]       device hold-to-confirm at a point
   simctl swipe <x1> <y1> <x2> <y2> [ms] [--device N]   device swipe
   simctl touch <x> <y> <down|up> [--device N]          device raw touch
@@ -176,6 +181,23 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
           });
         }
         return ({'ok': true, 'devices': list}, false);
+      case 'chain':
+        return ({'ok': true, 'chain': await h.chain()}, false);
+      case 'setChain':
+        await h.setChain((req['order'] as List).cast<int>());
+        return ({'ok': true}, false);
+      case 'connect':
+        await h.connect(req['device'] as int);
+        return ({'ok': true}, false);
+      case 'disconnect':
+        await h.disconnect(req['device'] as int);
+        return ({'ok': true}, false);
+      case 'moveUp':
+        await h.moveUp(req['device'] as int);
+        return ({'ok': true}, false);
+      case 'moveDown':
+        await h.moveDown(req['device'] as int);
+        return ({'ok': true}, false);
       case 'hold':
         final ms = req['ms'] as int?;
         await h
@@ -302,6 +324,18 @@ Map<String, dynamic>? _argsToCommand(List<String> args) {
       return {'cmd': 'exists', 'label': pos[1], 'regex': flag('--regex')};
     case 'devices':
       return {'cmd': 'devices'};
+    case 'chain':
+      return {'cmd': 'chain'};
+    case 'set-chain':
+      return {'cmd': 'setChain', 'order': pos.skip(1).map(int.parse).toList()};
+    case 'connect':
+      return {'cmd': 'connect', 'device': int.parse(pos[1])};
+    case 'disconnect':
+      return {'cmd': 'disconnect', 'device': int.parse(pos[1])};
+    case 'move-up':
+      return {'cmd': 'moveUp', 'device': int.parse(pos[1])};
+    case 'move-down':
+      return {'cmd': 'moveDown', 'device': int.parse(pos[1])};
     case 'hold':
       return {
         'cmd': 'hold',

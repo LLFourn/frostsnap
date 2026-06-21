@@ -4,25 +4,21 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:frostsnap/src/rust/api/sim.dart';
 
-const double _trayWidth = 260;
+const double _trayWidth = 320;
 
 /// Device dimensions of the virtual device framebuffer (sim-1). Pointer coords
 /// are scaled back to this range before being injected via [SimDevice.touch].
 const int _deviceWidth = 240;
 const int _deviceHeight = 280;
 
-/// Rendered width of a device in the tray — ~30% smaller than filling the tray, so
-/// several devices fit without scrolling (sim-9). Touches map back through the actual
-/// rendered box, so any render size stays accurate.
-const double _deviceRenderWidth = 170;
+/// Rendered width of a connected device's live screen in the chain column.
+const double _chainRenderWidth = 132;
 
-/// Docked debug column rendering every [SimDevice] in [pool] live and routing
-/// taps back as device touches. Only built on the SIM entrypoint (`kSim`).
-///
-/// Connection state is single-source: the authoritative `PortConnection` lives in
-/// Rust and is read via [SimDevice.isConnected]. The tray owns every toggle (per
-/// device and "plug all") and rebuilds on each, so all cells re-read that one source
-/// — no per-cell mirror that bulk actions could leave stale.
+/// Docked debug column for the SIM entrypoint (`kSim`). Two columns: the LEFT is the
+/// connected daisy chain in order (top = the device on the coordinator USB port), the
+/// RIGHT is the disconnected devices. Moving a device between columns connects/disconnects
+/// it and the up/down arrows reorder it within the chain — every action recomputes the
+/// ordered list and calls [DevicePool.setChain], the single source of truth.
 class SimDeviceTray extends StatefulWidget {
   final DevicePool pool;
 
@@ -35,44 +31,36 @@ class SimDeviceTray extends StatefulWidget {
 class _SimDeviceTrayState extends State<SimDeviceTray> {
   late final Future<List<SimDevice>> _devices = widget.pool.devices();
 
-  // The authoritative connection state (Rust PortConnection) can change from OUTSIDE
-  // the tray — the device channel / simctl `set-connected` — and there is no change
-  // stream to push those. Poll it so the header and every cell re-read isConnected()
-  // and stay in sync however the state was changed, not just on the tray's own toggles.
-  Timer? _connectionPoll;
+  // The chain config can change from OUTSIDE the tray (simctl / the device channel), and
+  // there is no change stream, so poll it: every cell re-reads chain() and converges
+  // however it was changed (tray actions, plug-all, or an external set-chain).
+  Timer? _poll;
 
   @override
   void initState() {
     super.initState();
-    _connectionPoll = Timer.periodic(const Duration(milliseconds: 250), (_) {
+    _poll = Timer.periodic(const Duration(milliseconds: 250), (_) {
       if (mounted) setState(() {});
     });
   }
 
   @override
   void dispose() {
-    _connectionPoll?.cancel();
+    _poll?.cancel();
     super.dispose();
   }
 
-  void _toggle(SimDevice device) {
-    device.setConnected(connected: !device.isConnected());
-    setState(() {});
-  }
-
-  void _setAll(List<SimDevice> devices, bool connected) {
-    for (final device in devices) {
-      device.setConnected(connected: connected);
-    }
+  void _apply(List<int> order) {
+    widget.pool.setChain(order: order);
     setState(() {});
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    // The tray docks BESIDE the app's Navigator (so dialogs can't cover it), which
-    // puts it outside the Navigator's Overlay/Material. Give it its own Overlay +
-    // Material so Material widgets (IconButton ink) and Tooltips work in here.
+    // The tray docks BESIDE the app's Navigator (so dialogs can't cover it), which puts
+    // it outside the Navigator's Overlay/Material. Give it its own Overlay + Material so
+    // Material widgets (IconButton ink) and Tooltips work in here.
     return SizedBox(
       width: _trayWidth,
       child: Overlay(
@@ -87,44 +75,54 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
                   if (devices == null) {
                     return const Center(child: CircularProgressIndicator());
                   }
-                  final allConnected = devices.every((d) => d.isConnected());
-                  // Power flows down the chain: a device is lit only if every link from
-                  // the coordinator (device 1) down to it is connected, so cutting a link
-                  // darkens that node AND its whole subtree. `connected` (a device's own
-                  // parent link) still drives its plug icon; `powered` drives its screen.
-                  final powered = <bool>[];
-                  var reachable = true;
-                  for (final device in devices) {
-                    reachable = reachable && device.isConnected();
-                    powered.add(reachable);
-                  }
+                  final chain = widget.pool.chain();
+                  final byNumber = {for (final d in devices) d.number(): d};
+                  // LEFT: connected devices in chain order (skip any number the pool no
+                  // longer knows, defensively).
+                  final connected = [
+                    for (final n in chain)
+                      if (byNumber[n] != null) byNumber[n]!,
+                  ];
+                  // RIGHT: everything not in the chain, in number order.
+                  final disconnected = [
+                    for (final d in devices)
+                      if (!chain.contains(d.number())) d,
+                  ];
+                  final allConnected = disconnected.isEmpty;
+
                   return Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      // Pinned header: stays put while the device list scrolls.
                       _TrayHeader(
                         deviceCount: devices.length,
                         allConnected: allConnected,
-                        onToggleAll: () => _setAll(devices, !allConnected),
+                        onToggleAll: () => _apply(
+                          allConnected
+                              ? const []
+                              : [for (final d in devices) d.number()],
+                        ),
                       ),
                       const Divider(height: 1),
                       Expanded(
-                        child: ListView(
-                          padding: const EdgeInsets.symmetric(vertical: 8),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            for (var i = 0; i < devices.length; i++)
-                              Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 8,
-                                ),
-                                child: _SimDeviceCell(
-                                  device: devices[i],
-                                  connected: devices[i].isConnected(),
-                                  powered: powered[i],
-                                  onToggle: () => _toggle(devices[i]),
-                                ),
+                            Expanded(
+                              child: _ChainColumn(
+                                connected: connected,
+                                onMoveUp: (n) => _apply(_moved(chain, n, -1)),
+                                onMoveDown: (n) => _apply(_moved(chain, n, 1)),
+                                onDisconnect: (n) =>
+                                    _apply([...chain]..remove(n)),
                               ),
+                            ),
+                            const VerticalDivider(width: 1),
+                            Expanded(
+                              child: _OffColumn(
+                                disconnected: disconnected,
+                                onConnect: (n) => _apply([...chain, n]),
+                              ),
+                            ),
                           ],
                         ),
                       ),
@@ -137,6 +135,18 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
         ],
       ),
     );
+  }
+
+  // The chain with [number] shifted by [delta] positions (clamped to the ends).
+  List<int> _moved(List<int> chain, int number, int delta) {
+    final order = [...chain];
+    final i = order.indexOf(number);
+    final j = i + delta;
+    if (i < 0 || j < 0 || j >= order.length) return order;
+    order
+      ..removeAt(i)
+      ..insert(j, number);
+    return order;
   }
 }
 
@@ -178,27 +188,162 @@ class _TrayHeader extends StatelessWidget {
   }
 }
 
-class _SimDeviceCell extends StatefulWidget {
-  final SimDevice device;
-  // This device's own parent link (drives the plug icon/toggle).
-  final bool connected;
-  // Whether the device has power — reachable from the coordinator through all links
-  // above it (drives the screen: a node whose ancestor link is cut goes dark too).
-  final bool powered;
-  final VoidCallback onToggle;
+/// LEFT column: the connected chain, top = the coordinator (USB) end.
+class _ChainColumn extends StatelessWidget {
+  final List<SimDevice> connected;
+  final void Function(int number) onMoveUp;
+  final void Function(int number) onMoveDown;
+  final void Function(int number) onDisconnect;
 
-  const _SimDeviceCell({
-    required this.device,
+  const _ChainColumn({
     required this.connected,
-    required this.powered,
-    required this.onToggle,
+    required this.onMoveUp,
+    required this.onMoveDown,
+    required this.onDisconnect,
   });
 
   @override
-  State<_SimDeviceCell> createState() => _SimDeviceCellState();
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(8, 6, 8, 4),
+          child: Text('Chain', style: theme.textTheme.labelSmall),
+        ),
+        Expanded(
+          child: connected.isEmpty
+              ? Center(
+                  child: Text(
+                    'No devices\nconnected',
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.bodySmall,
+                  ),
+                )
+              : ListView(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  children: [
+                    for (var i = 0; i < connected.length; i++)
+                      Padding(
+                        key: ValueKey(connected[i].number()),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 6,
+                        ),
+                        child: _ChainCell(
+                          device: connected[i],
+                          isHead: i == 0,
+                          isTail: i == connected.length - 1,
+                          onMoveUp: () => onMoveUp(connected[i].number()),
+                          onMoveDown: () => onMoveDown(connected[i].number()),
+                          onDisconnect: () =>
+                              onDisconnect(connected[i].number()),
+                        ),
+                      ),
+                  ],
+                ),
+        ),
+      ],
+    );
+  }
 }
 
-class _SimDeviceCellState extends State<_SimDeviceCell> {
+/// RIGHT column: disconnected devices (screen off), each with a connect action.
+class _OffColumn extends StatelessWidget {
+  final List<SimDevice> disconnected;
+  final void Function(int number) onConnect;
+
+  const _OffColumn({required this.disconnected, required this.onConnect});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(8, 6, 8, 4),
+          child: Text('Disconnected', style: theme.textTheme.labelSmall),
+        ),
+        Expanded(
+          child: disconnected.isEmpty
+              ? Center(
+                  child: Text(
+                    'All\nconnected',
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.bodySmall,
+                  ),
+                )
+              : ListView(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  children: [
+                    for (final device in disconnected)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        child: Card(
+                          margin: EdgeInsets.zero,
+                          color: theme.colorScheme.surfaceContainerHigh,
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(10, 2, 2, 2),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: Tooltip(
+                                    message: device.id(),
+                                    child: Text(
+                                      'Device ${device.number()}',
+                                      style: theme.textTheme.labelMedium,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ),
+                                IconButton(
+                                  iconSize: 18,
+                                  visualDensity: VisualDensity.compact,
+                                  tooltip: 'Connect (add to chain)',
+                                  icon: const Icon(Icons.add_link_rounded),
+                                  onPressed: () => onConnect(device.number()),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+        ),
+      ],
+    );
+  }
+}
+
+/// One connected device in the chain: live screen + reorder/disconnect controls.
+class _ChainCell extends StatefulWidget {
+  final SimDevice device;
+  final bool isHead;
+  final bool isTail;
+  final VoidCallback onMoveUp;
+  final VoidCallback onMoveDown;
+  final VoidCallback onDisconnect;
+
+  const _ChainCell({
+    required this.device,
+    required this.isHead,
+    required this.isTail,
+    required this.onMoveUp,
+    required this.onMoveDown,
+    required this.onDisconnect,
+  });
+
+  @override
+  State<_ChainCell> createState() => _ChainCellState();
+}
+
+class _ChainCellState extends State<_ChainCell> {
   StreamSubscription<SimFrame>? _subscription;
   ui.Image? _image;
 
@@ -227,9 +372,6 @@ class _SimDeviceCellState extends State<_SimDeviceCell> {
     );
   }
 
-  // Map a pointer position within the rendered widget back to device pixels,
-  // using the actual rendered box size (not a fixed scale) so the full 0..239 /
-  // 0..279 range is reachable whatever size the tray gives the viewport.
   void _touchAt(Offset local, Size rendered, {required bool liftUp}) {
     final x = (local.dx / rendered.width * _deviceWidth).round().clamp(
       0,
@@ -252,7 +394,10 @@ class _SimDeviceCellState extends State<_SimDeviceCell> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final connected = widget.connected;
+    final image = _image;
+    final width = _chainRenderWidth;
+    final height = _chainRenderWidth * _deviceHeight / _deviceWidth;
+    final rendered = Size(width, height);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -264,68 +409,64 @@ class _SimDeviceCellState extends State<_SimDeviceCell> {
                 child: Text(
                   'Device ${widget.device.number()}',
                   style: theme.textTheme.labelMedium,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
             ),
-            IconButton(
-              iconSize: 18,
-              visualDensity: VisualDensity.compact,
-              tooltip: connected ? 'Disconnect (unplug)' : 'Connect (plug in)',
-              icon: Icon(connected ? Icons.usb_rounded : Icons.usb_off_rounded),
-              onPressed: widget.onToggle,
+            _denseIcon(
+              Icons.keyboard_arrow_up_rounded,
+              'Move up',
+              widget.isHead ? null : widget.onMoveUp,
+            ),
+            _denseIcon(
+              Icons.keyboard_arrow_down_rounded,
+              'Move down',
+              widget.isTail ? null : widget.onMoveDown,
+            ),
+            _denseIcon(
+              Icons.link_off_rounded,
+              'Disconnect',
+              widget.onDisconnect,
             ),
           ],
         ),
-        const SizedBox(height: 4),
-        Center(child: _screen(theme, widget.powered)),
+        const SizedBox(height: 2),
+        Center(
+          child: Listener(
+            onPointerDown: (e) =>
+                _touchAt(e.localPosition, rendered, liftUp: false),
+            onPointerUp: (e) =>
+                _touchAt(e.localPosition, rendered, liftUp: true),
+            onPointerCancel: (e) =>
+                _touchAt(e.localPosition, rendered, liftUp: true),
+            child: SizedBox(
+              width: width,
+              height: height,
+              child: image == null
+                  ? const Center(child: CircularProgressIndicator())
+                  : RawImage(
+                      image: image,
+                      width: width,
+                      height: height,
+                      fit: BoxFit.fill,
+                      filterQuality: FilterQuality.none,
+                    ),
+            ),
+          ),
+        ),
       ],
     );
   }
 
-  // The device render box, fixed at [_deviceRenderWidth]. When the device is not powered
-  // (its parent link, or any link above it, is cut) the screen is OFF — a dark panel, NOT
-  // the live framebuffer — and it accepts no touches. Driven by [powered] alone,
-  // independent of whether the device thread keeps emitting frames in the background.
-  Widget _screen(ThemeData theme, bool powered) {
-    final width = _deviceRenderWidth;
-    final height = _deviceRenderWidth * _deviceHeight / _deviceWidth;
-    final image = _image;
-
-    if (!powered) {
-      return SizedBox(
-        width: width,
-        height: height,
-        child: ColoredBox(
-          color: Colors.black,
-          child: Center(
-            child: Icon(
-              Icons.usb_off_rounded,
-              color: theme.colorScheme.outline,
-              size: 28,
-            ),
-          ),
-        ),
-      );
-    }
-
-    final rendered = Size(width, height);
-    return Listener(
-      onPointerDown: (e) => _touchAt(e.localPosition, rendered, liftUp: false),
-      onPointerUp: (e) => _touchAt(e.localPosition, rendered, liftUp: true),
-      onPointerCancel: (e) => _touchAt(e.localPosition, rendered, liftUp: true),
-      child: SizedBox(
-        width: width,
-        height: height,
-        child: image == null
-            ? const Center(child: CircularProgressIndicator())
-            : RawImage(
-                image: image,
-                width: width,
-                height: height,
-                fit: BoxFit.fill,
-                filterQuality: FilterQuality.none,
-              ),
-      ),
+  Widget _denseIcon(IconData icon, String tooltip, VoidCallback? onPressed) {
+    return IconButton(
+      iconSize: 16,
+      visualDensity: VisualDensity.compact,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+      tooltip: tooltip,
+      icon: Icon(icon),
+      onPressed: onPressed,
     );
   }
 }

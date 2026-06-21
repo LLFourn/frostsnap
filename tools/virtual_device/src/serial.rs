@@ -85,10 +85,11 @@ impl ByteChannel {
     }
 }
 
-/// A togglable "cable connected" flag shared by both ends of a [`device_link`]. While
-/// disconnected the link carries nothing and reads as absent (the downstream-detect),
-/// so unplugging it lets the real firmware tear the connection down rather than the sim
-/// faking a disconnect. Cheap to clone — clones share one flag.
+/// A shared boolean flag. Used as a device's downstream-detect: the [`ChainRouter`]
+/// drives it (true iff the device has a successor in the current chain) and the device
+/// thread reads it each tick. Cheap to clone — clones share one flag.
+///
+/// [`ChainRouter`]: crate::ChainRouter
 #[derive(Clone)]
 pub struct LinkGate(Arc<AtomicBool>);
 
@@ -106,14 +107,12 @@ impl LinkGate {
     }
 }
 
-/// The device-side byte transport.
+/// The device-side byte transport. Byte flow is governed externally (by the
+/// [`ChainRouter`](crate::ChainRouter), which drains/feeds the host ends), so the device
+/// end itself just reads its `rx` and writes its `tx`.
 pub struct PipeByteIo {
     rx: ByteChannel,
     tx: ByteChannel,
-    // Present only for a device-to-device link; `None` means an always-connected end
-    // (the host `pipe()` end and the peerless `disconnected()` stub). When the gate is
-    // off the link carries nothing in either direction.
-    gate: Option<LinkGate>,
 }
 
 impl PipeByteIo {
@@ -123,39 +122,23 @@ impl PipeByteIo {
         Self {
             rx: ByteChannel::new(),
             tx: ByteChannel::new(),
-            gate: None,
         }
-    }
-
-    fn link_up(&self) -> bool {
-        self.gate.as_ref().is_none_or(LinkGate::is_connected)
     }
 }
 
 impl ByteIo for PipeByteIo {
     fn read_byte(&mut self) -> Option<u8> {
-        if !self.link_up() {
-            // A cut cable drops bytes in transit, so reconnection starts clean.
-            self.rx.clear();
-            return None;
-        }
         self.rx.pop()
     }
 
     fn has_data(&mut self) -> bool {
-        if !self.link_up() {
-            self.rx.clear();
-            return false;
-        }
         !self.rx.is_empty()
     }
 
     fn fill(&mut self) {}
 
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), ()> {
-        if self.link_up() {
-            self.tx.push(bytes);
-        }
+        self.tx.push(bytes);
         Ok(())
     }
 
@@ -184,35 +167,12 @@ pub fn pipe() -> (PipeByteIo, HostEnd) {
         PipeByteIo {
             rx: host_to_dev.clone(),
             tx: dev_to_host.clone(),
-            gate: None,
         },
         HostEnd {
             rx: dev_to_host,
             tx: host_to_dev,
         },
     )
-}
-
-/// Create a device-to-device link: two crossed `PipeByteIo` ends (one device's
-/// downstream, the next device's upstream) sharing one [`LinkGate`], connected to start.
-/// While the gate is disconnected the link carries nothing in either direction and reads
-/// as absent — the sim's model of an unplugged cable, from which the firmware's own
-/// downstream/upstream teardown follows.
-pub fn device_link() -> (PipeByteIo, PipeByteIo, LinkGate) {
-    let a_to_b = ByteChannel::new();
-    let b_to_a = ByteChannel::new();
-    let gate = LinkGate::new(true);
-    let a = PipeByteIo {
-        rx: b_to_a.clone(),
-        tx: a_to_b.clone(),
-        gate: Some(gate.clone()),
-    };
-    let b = PipeByteIo {
-        rx: a_to_b,
-        tx: b_to_a,
-        gate: Some(gate.clone()),
-    };
-    (a, b, gate)
 }
 
 #[cfg(test)]
@@ -261,33 +221,5 @@ mod tests {
         let mut buf = [0u8; 8];
         assert_eq!(ch.read(&mut buf, Duration::from_secs(5)), 2);
         assert_eq!(&buf[..2], &[1, 2]);
-    }
-
-    #[test]
-    fn device_link_carries_bytes_only_while_connected() {
-        let (mut a, mut b, gate) = device_link();
-        assert!(gate.is_connected());
-
-        // Connected: bytes cross both directions.
-        a.write_bytes(&[1, 2, 3]).unwrap();
-        assert!(b.has_data());
-        assert_eq!(b.read_byte(), Some(1));
-        assert_eq!(b.read_byte(), Some(2));
-        assert_eq!(b.read_byte(), Some(3));
-        b.write_bytes(&[9]).unwrap();
-        assert_eq!(a.read_byte(), Some(9));
-
-        // Disconnected: nothing crosses, and the link reads as absent (detect pin).
-        gate.set_connected(false);
-        assert!(!gate.is_connected());
-        a.write_bytes(&[4, 5]).unwrap();
-        assert!(!b.has_data());
-        assert_eq!(b.read_byte(), None);
-
-        // Reconnected: flow resumes; bytes dropped while cut do not resurface.
-        gate.set_connected(true);
-        assert!(!b.has_data(), "pre-reconnect bytes were dropped");
-        a.write_bytes(&[7]).unwrap();
-        assert_eq!(b.read_byte(), Some(7));
     }
 }

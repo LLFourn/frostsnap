@@ -115,53 +115,34 @@ impl super::Api {
     ) -> Result<(Coordinator, AppCtx, super::sim::DevicePool)> {
         use super::sim::{sim_firmware_bin, DevicePool, SimDevice, SimFrame};
         use frostsnap_virtual_device::{
-            device_link, pipe, DeviceChannel, LinkGate, ParentLink, PipeByteIo, VirtualDevice,
-            VirtualSerial,
+            pipe, ByteChannel, ChainRouter, DeviceChannel, DeviceLink, HostEnd, LinkGate,
+            VirtualDevice, VirtualSerial,
         };
 
         let app_dir = PathBuf::from_str(&app_dir)?;
         let firmware = sim_firmware_bin();
         let count = device_count.max(1) as usize;
 
-        // Wire the devices as a daisy chain (real hardware's topology): device 0 hangs off
-        // the single coordinator USB port; every device below it hangs off the previous
-        // device's downstream port. Each inter-device link shares one gate that is BOTH
-        // device i's downstream-detect AND device i+1's plug control, so cutting a link
-        // makes the real firmware tear the subtree off the bus (no sim disconnect logic).
-        let mut upstream_ios: Vec<Option<PipeByteIo>> = (0..count).map(|_| None).collect();
-        let mut downstream_ios: Vec<Option<PipeByteIo>> = (0..count).map(|_| None).collect();
-        let mut downstream_gates: Vec<Option<LinkGate>> = (0..count).map(|_| None).collect();
-        let mut parent_links: Vec<Option<ParentLink>> = (0..count).map(|_| None).collect();
-
-        // device 0's upstream is the coordinator port; keep the host end for the serial.
-        let (up0_io, host0) = pipe();
-        upstream_ios[0] = Some(up0_io);
-        for i in 0..count - 1 {
-            let (parent_io, child_io, gate) = device_link();
-            downstream_ios[i] = Some(parent_io); // device i's downstream
-            upstream_ios[i + 1] = Some(child_io); // device i+1's upstream
-            downstream_gates[i] = Some(gate.clone()); // device i's downstream-detect
-            parent_links[i + 1] = Some(ParentLink::Cable(gate)); // device i+1's plug control
-        }
-
-        // Spawn each device thread on its wired links (distinct seed -> distinct id),
-        // keeping a per-device frame sink. The tail device has a peerless downstream.
+        // Each device is wired to the router via an upstream and a downstream pipe (the
+        // device holds the `PipeByteIo`s; the router holds the host ends + a
+        // downstream-detect flag it drives from the current chain order). The router — not
+        // a fixed cabling — decides which devices form the chain and in what order, so any
+        // device can connect independently and the order is reconfigurable at runtime.
         let mut spawned = Vec::with_capacity(count);
         let mut frame_sinks = Vec::with_capacity(count);
+        let mut links = Vec::with_capacity(count);
         for i in 0..count {
             let frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>> = Arc::new(Mutex::new(None));
             let on_frame_sink = frames_sink.clone();
-            let upstream_io = upstream_ios[i].take().expect("each device has an upstream");
-            let downstream_io = downstream_ios[i]
-                .take()
-                .unwrap_or_else(PipeByteIo::disconnected);
-            let downstream_present = downstream_gates[i].take();
+            let (up_io, up_host) = pipe();
+            let (down_io, down_host) = pipe();
+            let downstream_present = LinkGate::new(false);
             let dev = VirtualDevice::spawn_chained(
                 seed.wrapping_add(i as u64),
                 firmware.digest(),
-                upstream_io,
-                downstream_io,
-                downstream_present,
+                up_io,
+                down_io,
+                Some(downstream_present.clone()),
                 move |width, height, data| {
                     if let Some(sink) = &*on_frame_sink.lock().unwrap() {
                         let _ = sink.add(SimFrame {
@@ -172,34 +153,48 @@ impl super::Api {
                     }
                 },
             );
+            links.push(DeviceLink {
+                up: up_host,
+                down: down_host,
+                downstream_present,
+            });
             frame_sinks.push(frames_sink);
             spawned.push(dev);
         }
 
-        // The coordinator sees exactly ONE port (device 0); it learns devices 1..N from
-        // the Announce messages the chain relays upstream.
-        let virtual_serial = VirtualSerial::single("sim-device-0", host0);
-        parent_links[0] = Some(ParentLink::Usb(virtual_serial.connection()));
+        // One coordinator port; the router splices it to the head and relays the chain, so
+        // the coordinator sees exactly ONE port and learns the rest via the firmware relay.
+        let coord_host = HostEnd {
+            rx: ByteChannel::new(),
+            tx: ByteChannel::new(),
+        };
+        let virtual_serial = VirtualSerial::single("sim-device-0", coord_host.clone());
+        let port = virtual_serial.connection();
         let usb_manager =
             UsbSerialManager::new(Box::new(virtual_serial)).with_firmware_bin(firmware);
-        let (coord, app_state) = load_internal(app_dir.clone(), usb_manager)?;
+        let (coordinator, app_state) = load_internal(app_dir.clone(), usb_manager)?;
 
-        // One device-input channel + Dart handle per device. Each is numbered 1-based;
-        // the channel binds `device-<number>.sock` and the handle carries its parent-link
-        // plug control. Dropping the pool stops every channel + removes every socket file.
+        // Initial chain = all devices in number order.
+        let router = Arc::new(ChainRouter::new(
+            coord_host,
+            port,
+            links,
+            (0..count).collect(),
+        ));
+
+        // One device-input channel + Dart handle per device (numbered 1-based), each
+        // holding the shared router so its connect/disconnect edits the one chain config.
         let mut channels = Vec::with_capacity(count);
         let mut devices = Vec::with_capacity(count);
         for (i, (dev, frames_sink)) in spawned.iter().zip(frame_sinks).enumerate() {
             let number = (i + 1) as u32;
-            let parent = parent_links[i]
-                .take()
-                .expect("every device has a parent link");
             let socket = app_dir.join(format!("device-{number}.sock"));
             channels.push(DeviceChannel::serve(
                 socket,
                 dev.touch.clone(),
                 dev.framebuffer.clone(),
-                parent.clone(),
+                router.clone(),
+                i,
                 dev.device_id,
             )?);
             devices.push(SimDevice::new(
@@ -208,13 +203,13 @@ impl super::Api {
                 dev.touch.clone(),
                 dev.framebuffer.clone(),
                 frames_sink,
-                parent,
+                router.clone(),
             ));
         }
 
-        let pool = DevicePool::new(spawned, channels, devices);
+        let pool = DevicePool::new(spawned, channels, devices, router);
 
-        Ok((coord, app_state, pool))
+        Ok((coordinator, app_state, pool))
     }
 }
 

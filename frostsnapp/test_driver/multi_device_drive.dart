@@ -2,19 +2,24 @@ import 'dart:io';
 
 import 'sim_harness.dart';
 
-// sim-10 acceptance: bring up a 3-device DAISY CHAIN and prove chain semantics
-// end-to-end through the real app. The coordinator sees ONE port yet registers all
-// three (hop-by-hop relay), and unplugging a MID-CHAIN device drops it AND its
-// downstream subtree — not just itself, as the old star would. We observe the
-// coordinator's live connected-device count via the wallet-create "Continue with N
-// devices" button: cutting device 2's link takes it 3 -> 1 (a star would show 2), and
-// re-plugging restores the whole subtree to 3. runScenario asserts no residue.
-//
-// Run: `just sim-multi-drive`. Needs a display (Xvfb on Linux CI).
+// sim-12 acceptance: the chain is a runtime config driven through chain()/setChain(). We
+// exercise the dynamic API directly and verify both the config (chain()) and the
+// coordinator's live connected count (the wallet-create "Continue with N devices" button):
+//   - initial full chain [1,2,3] -> "Continue with 3 devices" (all register over one port);
+//   - setChain([2]) -> only device 2 (connected independently of device 1) -> 1 device;
+//   - setChain([3,1]) -> a head-changing reorder (device 3 is now the head) -> 2 devices;
+//   - disconnect(2) re-closes the chain (the others stay) rather than dropping a subtree.
+// runScenario asserts no residue. Run: `just sim-multi-drive`. Needs a display.
 
-// Chain registration/teardown rides the coordinator's real ~100ms cadence hop by hop,
-// so give the count changes a generous settle window.
+// Each re-cable pulses the coordinator port and re-enumerates hop-by-hop over the real
+// ~100ms cadence, so give the count changes a generous settle window.
 const _settle = Duration(seconds: 90);
+
+void _expectChain(List<int> actual, List<int> want) {
+  if (actual.join(',') != want.join(',')) {
+    throw StateError('expected chain $want, got $actual');
+  }
+}
 
 Future<void> main() async {
   await SimHarness.runScenario('multi-device', (h) async {
@@ -32,29 +37,40 @@ Future<void> main() async {
     if (ids.length != 3) {
       throw StateError('device ids not distinct: $ids');
     }
+    // Initial config: the full chain in number order.
+    _expectChain(await h.chain(), [1, 2, 3]);
 
-    // Open the wallet-create device step, whose button text reflects the coordinator's
-    // live connected count.
+    // Open the wallet-create device step, whose button reflects the coordinator's live
+    // connected count. All three register over the one port (relay ran).
     await h.tapUntil(RegExp('Create a multi-sig wallet'), 'Wallet name');
     await h.enterText('Wallet name', 'ChainTest');
     await h.tapUntil('Next', RegExp('Continue with'));
-
-    // All three chained devices register over the single coordinator port (relay ran).
     await h.waitFor('Continue with 3 devices', timeout: _settle);
 
-    // Cut the MID-CHAIN link (device 2): on a chain this drops device 2 AND device 3,
-    // leaving only device 1. (A star would leave two devices: "Continue with 2 devices".)
-    await h.unplug(2);
+    // Explicit setChain to a single device: device 2 alone on the coordinator port,
+    // connected independently of device 1.
+    await h.setChain([2]);
+    _expectChain(await h.chain(), [2]);
     await h.waitFor('Continue with 1 device', timeout: _settle);
-    await h.waitForAbsent('Continue with 3 devices', timeout: _settle);
 
-    // Re-plug device 2: device 3's own link was never cut, so restoring device 2 brings
-    // the whole subtree back.
-    await h.plug(2);
+    // Explicit head-changing reorder: device 3 becomes the head, device 1 downstream.
+    await h.setChain([3, 1]);
+    _expectChain(await h.chain(), [3, 1]);
+    await h.waitFor('Continue with 2 devices', timeout: _settle);
+
+    // Restore the full chain.
+    await h.setChain([1, 2, 3]);
+    await h.waitFor('Continue with 3 devices', timeout: _settle);
+
+    // Disconnecting a mid-chain device re-closes the chain (the others stay connected).
+    await h.disconnect(2);
+    _expectChain(await h.chain(), [1, 3]);
+    await h.waitFor('Continue with 2 devices', timeout: _settle);
+    await h.connect(2);
     await h.waitFor('Continue with 3 devices', timeout: _settle);
 
     stdout.writeln(
-      'MULTI_DEVICE_DRIVE_OK: 3-device chain; mid-chain unplug drops the subtree',
+      'MULTI_DEVICE_DRIVE_OK: setChain isolation + head-changing reorder + re-close',
     );
   }, deviceCount: 3);
 }

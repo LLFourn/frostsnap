@@ -208,6 +208,11 @@ legacy-run +ARGS="": maybe-gen
 sim-keygen-drive: maybe-gen
     cd frostsnapp && dart run test_driver/keygen_drive.dart
 
+# sim-12: a full 2-of-3 keygen over a dynamic chain — 4 devices, disconnect one, keygen
+# across the remaining 3. Needs a display.
+sim-keygen-2of3: maybe-gen
+    cd frostsnapp && dart run test_driver/keygen_2of3_drive.dart
+
 # sim-9 acceptance: bring up a 3-device fleet and assert independent plug/unplug +
 # distinct ids through the SimHarness, then tear down with no residue. Needs a display.
 sim-multi-drive: maybe-gen

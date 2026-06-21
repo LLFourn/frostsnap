@@ -6,6 +6,7 @@
 //! See [`VirtualDevice`] for the ownership model (owned parts +
 //! caller-owned [`VirtualDeviceSession`] holding one persistent loop).
 
+mod chain_router;
 mod channel;
 mod clock;
 mod device;
@@ -21,6 +22,7 @@ mod thread;
 mod touch;
 mod virtual_serial;
 
+pub use chain_router::{ChainRouter, DeviceLink};
 pub use channel::DeviceChannel;
 pub use clock::SimClock;
 pub use device::{SimUi, VirtualDevice, VirtualDeviceSession};
@@ -30,7 +32,7 @@ pub use flash::{RamFlash, SECTORS};
 pub use hal::{SimDownstream, SimHal, SimUpstream};
 pub use input::DeviceInput;
 pub use secrets::SimKeyedHash;
-pub use serial::{device_link, pipe, ByteChannel, HostEnd, LinkGate, PipeByteIo};
+pub use serial::{pipe, ByteChannel, HostEnd, LinkGate, PipeByteIo};
 pub use sim_coordinator::{SimCoordinator, StateCell, StepOutcome};
 pub use thread::{DeviceThread, SpawnedDevice};
 pub use touch::TouchQueue;
@@ -40,7 +42,7 @@ pub use touch::TouchQueue;
 pub use embedded_graphics::geometry::Point;
 pub use frostsnap_embedded::device_hal::{TouchEvent, TouchGesture};
 pub use virtual_serial::{
-    ParentLink, PortConnection, VirtualPort, VirtualSerial, FROSTSNAP_PID, FROSTSNAP_VID,
+    PortConnection, VirtualPort, VirtualSerial, FROSTSNAP_PID, FROSTSNAP_VID,
 };
 
 use frostsnap_coordinator::{DeviceChange, UsbSerialManager};
@@ -508,110 +510,6 @@ mod tests {
         assert!(reregistered, "device re-registers after replug");
 
         drop(spawned);
-    }
-
-    // sim-10: three devices wired as a DAISY CHAIN (coordinator -> d0 -> d1 -> d2)
-    // register over a SINGLE coordinator port — which is only possible if the firmware's
-    // downstream forward/relay path runs (d0 relays d1's and d2's announces upstream).
-    // Then cutting the d0<->d1 link drops the whole subtree (d1 AND d2) while d0 stays,
-    // through the genuine protocol (no sim-side disconnect bookkeeping).
-    #[test]
-    fn three_device_chain_registers_over_one_port_then_unplug_drops_subtree() {
-        use crate::serial::{device_link, pipe};
-        use frostsnap_coordinator::{DeviceChange, UsbSerialManager};
-        use frostsnap_core::DeviceId;
-        use std::collections::HashSet;
-        use std::time::{Duration, Instant};
-
-        let digest = crate::firmware::SimFirmware::PLACEHOLDER_DIGEST;
-
-        // Wire the chain: d0's upstream is the coordinator port; d0<->d1 and d1<->d2 are
-        // gated device links (each gate is also the parent's downstream-detect).
-        let (up0, host0) = pipe();
-        let (d0_down, d1_up, gate01) = device_link();
-        let (d1_down, d2_up, gate12) = device_link();
-
-        let d0 = VirtualDevice::spawn_chained(
-            10,
-            digest,
-            up0,
-            d0_down,
-            Some(gate01.clone()),
-            |_, _, _| {},
-        );
-        let d1 =
-            VirtualDevice::spawn_chained(11, digest, d1_up, d1_down, Some(gate12), |_, _, _| {});
-        let d2 = VirtualDevice::spawn_chained(
-            12,
-            digest,
-            d2_up,
-            PipeByteIo::disconnected(),
-            None,
-            |_, _, _| {},
-        );
-        let (id0, id1, id2) = (d0.device_id, d1.device_id, d2.device_id);
-        let all = HashSet::from([id0, id1, id2]);
-        assert_eq!(all.len(), 3, "distinct seeds give distinct device ids");
-
-        let mut manager =
-            UsbSerialManager::new(Box::new(VirtualSerial::single("sim-device-0", host0)));
-
-        // Phase 1: pump until all three register. d1 and d2 can only be seen if d0 relays
-        // their announces upstream — i.e. the firmware's downstream forward path ran.
-        let mut registered: HashSet<DeviceId> = HashSet::new();
-        let deadline = Instant::now() + Duration::from_secs(90);
-        while Instant::now() < deadline && !registered.is_superset(&all) {
-            for change in manager.poll_ports() {
-                match change {
-                    DeviceChange::NeedsName { id } => {
-                        manager.accept_device_name(id, "Sim".to_string());
-                    }
-                    DeviceChange::Registered { id, .. } => {
-                        registered.insert(id);
-                    }
-                    _ => {}
-                }
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(
-            registered.is_superset(&all),
-            "all three chained devices register over one port; saw {registered:?}"
-        );
-        assert_eq!(
-            manager.active_ports().len(),
-            1,
-            "the whole chain is on a single coordinator port"
-        );
-        assert_eq!(
-            manager.devices_by_ports().get("sim-device-0").map(Vec::len),
-            Some(3),
-            "all three devices are reached through the one port"
-        );
-
-        // Phase 2: cut the d0<->d1 cable. The subtree (d1, d2) must disconnect — through
-        // the genuine protocol (d0's downstream tears down; the orphans go silent) — while
-        // d0 stays.
-        gate01.set_connected(false);
-        let mut disconnected: HashSet<DeviceId> = HashSet::new();
-        let deadline = Instant::now() + Duration::from_secs(90);
-        while Instant::now() < deadline
-            && !(disconnected.contains(&id1) && disconnected.contains(&id2))
-        {
-            for change in manager.poll_ports() {
-                if let DeviceChange::Disconnected { id } = change {
-                    disconnected.insert(id);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(
-            disconnected.contains(&id1) && disconnected.contains(&id2),
-            "cutting d0<->d1 drops the subtree (d1+d2); saw disconnected {disconnected:?}"
-        );
-        assert!(!disconnected.contains(&id0), "d0 stays connected");
-
-        drop((d0, d1, d2));
     }
 
     // Slice 1: a complete 1-of-1 keygen, driven by a *scripted device touch through

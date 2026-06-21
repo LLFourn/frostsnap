@@ -9,7 +9,7 @@ use flutter_rust_bridge::frb;
 use frostsnap_coordinator::{FirmwareBin, ValidatedFirmwareBin};
 use frostsnap_core::DeviceId;
 use frostsnap_virtual_device::{
-    DeviceChannel, ParentLink, Point, SharedFramebuffer, SpawnedDevice, TouchEvent, TouchGesture,
+    ChainRouter, DeviceChannel, Point, SharedFramebuffer, SpawnedDevice, TouchEvent, TouchGesture,
     TouchQueue,
 };
 use std::sync::{Arc, Mutex};
@@ -56,7 +56,10 @@ pub struct SimDevice {
     touch: TouchQueue,
     framebuffer: SharedFramebuffer,
     frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>>,
-    connection: ParentLink,
+    // The shared chain config (single source of truth): "connected" == this device's
+    // number is in the chain. Per-device connect/disconnect are thin edits to that one
+    // ordered list via [`ChainRouter::set_chain`] — no separate per-device state.
+    router: Arc<ChainRouter>,
 }
 
 impl SimDevice {
@@ -109,6 +112,8 @@ pub struct DevicePool {
     // accept loops and removes the socket files (teardown leaves no residue).
     _channels: Vec<DeviceChannel>,
     devices: Vec<SimDevice>,
+    // The single source of truth for which devices are connected and in what order.
+    router: Arc<ChainRouter>,
 }
 
 impl DevicePool {
@@ -116,16 +121,47 @@ impl DevicePool {
         spawned: Vec<SpawnedDevice>,
         channels: Vec<DeviceChannel>,
         devices: Vec<SimDevice>,
+        router: Arc<ChainRouter>,
     ) -> Self {
         Self {
             _spawned: spawned,
             _channels: channels,
             devices,
+            router,
         }
     }
 
     pub fn devices(&self) -> Vec<SimDevice> {
         self.devices.clone()
+    }
+
+    /// The connected chain as 1-based device numbers, in order (first = the device on the
+    /// coordinator USB port). Devices not listed are disconnected.
+    #[frb(sync)]
+    pub fn chain(&self) -> Vec<u32> {
+        self.router
+            .chain()
+            .iter()
+            .map(|&index| (index + 1) as u32)
+            .collect()
+    }
+
+    /// Re-cable the chain to exactly these 1-based device numbers, in order. This is the
+    /// single mutation behind connect, disconnect, and reorder. Invalid input (a `0`, an
+    /// out-of-range number, or a duplicate) is rejected, leaving the chain unchanged.
+    #[frb(sync)]
+    pub fn set_chain(&self, order: Vec<u32>) {
+        // 1-based -> 0-based with checked_sub so a `0` can't underflow; if any number is
+        // out of the valid 1-based range, don't apply a partial chain. The router then
+        // re-validates range + duplicates and no-ops anything still invalid.
+        let indices: Vec<usize> = order
+            .iter()
+            .filter_map(|&n| n.checked_sub(1).map(|i| i as usize))
+            .collect();
+        if indices.len() != order.len() {
+            return;
+        }
+        let _ = self.router.set_chain(indices);
     }
 }
 
@@ -136,7 +172,7 @@ impl SimDevice {
         touch: TouchQueue,
         framebuffer: SharedFramebuffer,
         frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>>,
-        connection: ParentLink,
+        router: Arc<ChainRouter>,
     ) -> Self {
         Self {
             number,
@@ -144,23 +180,33 @@ impl SimDevice {
             touch,
             framebuffer,
             frames_sink,
-            connection,
+            router,
         }
     }
 
-    /// Plug/unplug this device at the link to its parent (device 1: the coordinator USB
-    /// port; lower devices: the cable up to their parent). Unplugging drops this device
-    /// AND everything downstream of it, since power and data flow down the chain — the
-    /// firmware tears the connections down and the coordinator stops seeing the subtree.
-    /// Drives the sim tray's connect/disconnect toggle.
+    /// Connect (append to the tail of the chain) or disconnect (remove from the chain)
+    /// this device. Removing a mid-chain device re-closes the chain — the others stay
+    /// connected — so a device connects/disconnects independently of the rest. Use
+    /// [`DevicePool::set_chain`] to also reorder. Drives the sim tray's per-device toggle.
     #[frb(sync)]
     pub fn set_connected(&self, connected: bool) {
-        self.connection.set_connected(connected);
+        let index = (self.number - 1) as usize;
+        let mut order = self.router.chain();
+        let present = order.contains(&index);
+        // Editing the current (valid) chain by one in-range index stays valid.
+        if connected && !present {
+            order.push(index);
+            let _ = self.router.set_chain(order);
+        } else if !connected && present {
+            order.retain(|&i| i != index);
+            let _ = self.router.set_chain(order);
+        }
     }
 
+    /// Whether this device is currently in the chain.
     #[frb(sync)]
     pub fn is_connected(&self) -> bool {
-        self.connection.is_connected()
+        self.router.chain().contains(&((self.number - 1) as usize))
     }
 }
 

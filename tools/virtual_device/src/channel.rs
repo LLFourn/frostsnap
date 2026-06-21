@@ -12,6 +12,8 @@
 //!   {"cmd":"touch","x":..,"y":..,"lift_up":bool}            -> {"ok":true}   (raw)
 //!   {"cmd":"set_connected","connected":bool}               -> {"ok":true}
 //!   {"cmd":"is_connected"}                                 -> {"ok":true,"connected":bool}
+//!   {"cmd":"chain"}                                        -> {"ok":true,"chain":[<num>,..]}
+//!   {"cmd":"set_chain","order":[<num>,..]}                 -> {"ok":true}   (pool-level)
 //!   {"cmd":"device_id"}                                    -> {"ok":true,"device_id":"<hex>"}
 //!   {"cmd":"screen","path":"/abs/out.png"}                 -> {"ok":true,"path":"..."}
 //! ```
@@ -21,10 +23,10 @@
 //! connection is served on its own thread; the device runs concurrently and integrates
 //! the elapsed clock.
 
+use crate::chain_router::ChainRouter;
 use crate::display::SharedFramebuffer;
 use crate::input::DeviceInput;
 use crate::touch::TouchQueue;
-use crate::virtual_serial::ParentLink;
 use frostsnap_core::DeviceId;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -44,7 +46,10 @@ const ACCEPT_POLL: Duration = Duration::from_millis(20);
 struct Handles {
     touch: TouchQueue,
     framebuffer: SharedFramebuffer,
-    connection: ParentLink,
+    // The shared chain config + this device's index, so `set_connected`/`is_connected`
+    // edit/read the one ordered chain (connected == in the chain).
+    router: Arc<ChainRouter>,
+    index: usize,
     device_id: DeviceId,
 }
 
@@ -58,13 +63,15 @@ pub struct DeviceChannel {
 
 impl DeviceChannel {
     /// Serve the protocol on a unix socket at `socket_path`. The handles are clones of
-    /// the running device's `TouchQueue` / `SharedFramebuffer` / `ParentLink` (its
-    /// plug control) plus its id. A stale socket file at the path is removed first.
+    /// the running device's `TouchQueue` / `SharedFramebuffer`, plus the shared
+    /// `ChainRouter` and this device's `index` (so connect/disconnect edit the one chain
+    /// config), and its id. A stale socket file at the path is removed first.
     pub fn serve(
         socket_path: PathBuf,
         touch: TouchQueue,
         framebuffer: SharedFramebuffer,
-        connection: ParentLink,
+        router: Arc<ChainRouter>,
+        index: usize,
         device_id: DeviceId,
     ) -> std::io::Result<Self> {
         let _ = std::fs::remove_file(&socket_path);
@@ -74,7 +81,8 @@ impl DeviceChannel {
         let handles = Handles {
             touch,
             framebuffer,
-            connection,
+            router,
+            index,
             device_id,
         };
         let stop = Arc::new(AtomicBool::new(false));
@@ -200,11 +208,51 @@ fn dispatch(line: &str, input: &DeviceInput, handles: &Handles) -> Value {
             Ok(ok())
         }
         Some("set_connected") => {
-            handles.connection.set_connected(boolean("connected")?);
+            let connected = boolean("connected")?;
+            let mut order = handles.router.chain();
+            let present = order.contains(&handles.index);
+            // Editing the current (valid) chain by one in-range index stays valid.
+            if connected && !present {
+                order.push(handles.index);
+                let _ = handles.router.set_chain(order);
+            } else if !connected && present {
+                order.retain(|&i| i != handles.index);
+                let _ = handles.router.set_chain(order);
+            }
             Ok(ok())
         }
-        Some("is_connected") => {
-            Ok(json!({"ok": true, "connected": handles.connection.is_connected()}))
+        Some("is_connected") => Ok(json!({
+            "ok": true,
+            "connected": handles.router.chain().contains(&handles.index),
+        })),
+        // Pool-level chain ops (the router is shared, so any device socket serves them):
+        // `chain` reads the connected order as 1-based numbers; `set_chain` re-cables to a
+        // given order. connect/disconnect/reorder are computed by the caller over these.
+        Some("chain") => Ok(json!({
+            "ok": true,
+            "chain": handles
+                .router
+                .chain()
+                .iter()
+                .map(|&i| (i + 1) as u32)
+                .collect::<Vec<u32>>(),
+        })),
+        Some("set_chain") => {
+            let order = req
+                .get("order")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "missing/invalid array field `order`".to_string())?;
+            let indices = order
+                .iter()
+                .map(|v| {
+                    v.as_u64()
+                        .filter(|&n| n >= 1)
+                        .map(|n| (n - 1) as usize)
+                        .ok_or_else(|| "`order` must be 1-based device numbers".to_string())
+                })
+                .collect::<Result<Vec<usize>, String>>()?;
+            handles.router.set_chain(indices)?;
+            Ok(ok())
         }
         Some("device_id") => Ok(json!({"ok": true, "device_id": handles.device_id.to_string()})),
         Some("screen") => {
@@ -233,9 +281,18 @@ fn err(message: String) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain_router::DeviceLink;
     use crate::firmware::SimFirmware;
+    use crate::serial::{ByteChannel, HostEnd, LinkGate};
     use crate::VirtualDevice;
     use crate::VirtualSerial;
+
+    fn host() -> HostEnd {
+        HostEnd {
+            rx: ByteChannel::new(),
+            tx: ByteChannel::new(),
+        }
+    }
 
     /// Send one request line, read one reply line, parse it.
     fn req(reader: &mut impl BufRead, writer: &mut UnixStream, line: &str) -> Value {
@@ -250,7 +307,19 @@ mod tests {
     fn device_channel_round_trips_over_the_socket() {
         let spawned = VirtualDevice::spawn(11, SimFirmware::PLACEHOLDER_DIGEST, |_, _, _| {});
         let serial = VirtualSerial::single("sim-0", spawned.host.clone().unwrap());
-        let connection = ParentLink::Usb(serial.connection());
+        // A one-device router so the socket's set_connected/is_connected edit/read a real
+        // chain config (the device itself is standalone — this test exercises the protocol).
+        let link = DeviceLink {
+            up: host(),
+            down: host(),
+            downstream_present: LinkGate::new(false),
+        };
+        let router = Arc::new(ChainRouter::new(
+            host(),
+            serial.connection(),
+            vec![link],
+            vec![0],
+        ));
 
         // A dedicated temp dir so the socket + screen PNG are cleaned up together.
         let dir = std::env::temp_dir().join("frostsnap-devchan-roundtrip");
@@ -262,7 +331,8 @@ mod tests {
             sock.clone(),
             spawned.touch.clone(),
             spawned.framebuffer.clone(),
-            connection,
+            router,
+            0,
             spawned.device_id,
         )
         .unwrap();

@@ -110,6 +110,15 @@ class SimDeviceChannel {
   Future<bool> isConnected() async =>
       (await _ok({'cmd': 'is_connected'}))['connected'] as bool;
 
+  /// The connected chain as 1-based device numbers, in order (pool-level — the router is
+  /// shared, so any device socket answers it).
+  Future<List<int>> chain() async =>
+      ((await _ok({'cmd': 'chain'}))['chain'] as List).cast<int>();
+
+  /// Re-cable the chain to exactly these 1-based numbers, in order (pool-level).
+  Future<void> setChain(List<int> order) =>
+      _ok({'cmd': 'set_chain', 'order': order});
+
   Future<String> deviceId() async =>
       (await _ok({'cmd': 'device_id'}))['device_id'] as String;
 
@@ -409,14 +418,58 @@ class SimHarness {
     }
   }
 
-  // ---- device channel convenience over [device] ----
+  // ---- chain composition (pool-level; one source of truth via setChain) ----
+  // The connected chain is an ordered list of 1-based device numbers (first = the device
+  // on the coordinator USB port). connect/disconnect/reorder all funnel through setChain.
 
-  // Plug/unplug device [number] at the link to its PARENT (device 1 = the coordinator
-  // USB port; lower devices = the cable up the chain). On the daisy chain, unplugging a
-  // device therefore drops it AND everything downstream of it; re-plugging restores the
-  // subtree.
-  Future<void> unplug([int number = 1]) => device(number).setConnected(false);
-  Future<void> plug([int number = 1]) => device(number).setConnected(true);
+  /// The connected chain, in order.
+  Future<List<int>> chain() => device(1).chain();
+
+  /// Re-cable the chain to exactly [order] (1-based numbers, in order).
+  Future<void> setChain(List<int> order) => device(1).setChain(order);
+
+  /// Connect [number] by appending it to the chain (no-op if already connected).
+  Future<void> connect(int number) async {
+    final order = await chain();
+    if (!order.contains(number)) {
+      order.add(number);
+      await setChain(order);
+    }
+  }
+
+  /// Disconnect [number]; the chain re-closes (the others stay connected).
+  Future<void> disconnect(int number) async {
+    final order = await chain();
+    if (order.remove(number)) await setChain(order);
+  }
+
+  /// Move [number] one position toward the head (the coordinator end).
+  Future<void> moveUp(int number) async {
+    final order = await chain();
+    final i = order.indexOf(number);
+    if (i > 0) {
+      order
+        ..removeAt(i)
+        ..insert(i - 1, number);
+      await setChain(order);
+    }
+  }
+
+  /// Move [number] one position toward the tail.
+  Future<void> moveDown(int number) async {
+    final order = await chain();
+    final i = order.indexOf(number);
+    if (i >= 0 && i < order.length - 1) {
+      order
+        ..removeAt(i)
+        ..insert(i + 1, number);
+      await setChain(order);
+    }
+  }
+
+  /// Disconnect/connect [number] (kept for the keygen driver's post-keygen unplug).
+  Future<void> unplug([int number = 1]) => disconnect(number);
+  Future<void> plug([int number = 1]) => connect(number);
 
   // ---- whole-app screenshot (incl. the tray) ----
 

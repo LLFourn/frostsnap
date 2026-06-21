@@ -30,10 +30,10 @@ Future<void> main() async {
     //    match a substring) -> name the wallet -> advance.
     await h.tapUntil(RegExp('Create a multi-sig wallet'), 'Wallet name');
     await h.enterText('Wallet name', 'SimTest');
-    await h.tapUntil('Next', 'Device name');
+    await h.tapUntil('Next', 'Device name 1');
 
     // 2. Name the connected device -> advance -> confirm the single-device dialog.
-    await h.enterText('Device name', 'SimDev');
+    await h.enterText('Device name 1', 'SimDev');
     await h.tapUntil('Continue with 1 device', 'Continue anyway');
     await h.tapUntil('Continue anyway', 'Generate keys');
 
