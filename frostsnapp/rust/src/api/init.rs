@@ -113,9 +113,10 @@ impl super::Api {
         seed: u64,
     ) -> Result<(Coordinator, AppCtx, super::sim::DevicePool)> {
         use super::sim::{sim_firmware_bin, DevicePool, SimDevice, SimFrame};
-        use frostsnap_virtual_device::{VirtualDevice, VirtualSerial};
+        use frostsnap_virtual_device::{DeviceChannel, VirtualDevice, VirtualSerial};
 
         let app_dir = PathBuf::from_str(&app_dir)?;
+        let device_socket = app_dir.join("device-0.sock");
 
         let firmware = sim_firmware_bin();
 
@@ -137,6 +138,17 @@ impl super::Api {
             UsbSerialManager::new(Box::new(virtual_serial)).with_firmware_bin(firmware);
         let (coord, app_state) = load_internal(app_dir, usb_manager)?;
 
+        // The device-input channel: drive the device by hardware semantics over a
+        // unix socket, independent of Flutter. Dropping the pool stops it + removes
+        // the socket file.
+        let channel = DeviceChannel::serve(
+            device_socket,
+            spawned.touch.clone(),
+            spawned.framebuffer.clone(),
+            connection.clone(),
+            spawned.device_id,
+        )?;
+
         let device = SimDevice::new(
             spawned.device_id,
             spawned.touch.clone(),
@@ -144,7 +156,7 @@ impl super::Api {
             frames_sink,
             connection,
         );
-        let pool = DevicePool::new(vec![spawned], vec![device]);
+        let pool = DevicePool::new(vec![spawned], vec![channel], vec![device]);
 
         Ok((coord, app_state, pool))
     }

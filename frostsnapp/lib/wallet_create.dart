@@ -7,7 +7,6 @@ import 'package:frostsnap/device_action_fullscreen_dialog.dart';
 import 'package:frostsnap/device_action_upgrade.dart';
 import 'package:frostsnap/hex.dart';
 import 'package:frostsnap/id_ext.dart';
-import 'package:frostsnap/keygen_keys.dart';
 import 'package:frostsnap/secure_key_provider.dart';
 import 'package:frostsnap/settings.dart';
 import 'package:frostsnap/snackbar.dart';
@@ -212,11 +211,7 @@ class WalletCreateController extends ChangeNotifier {
         },
       ),
       actionButtons: [
-        OutlinedButton(
-          key: KeygenKeys.dialogCancel,
-          onPressed: _onCancel,
-          child: Text('Cancel'),
-        ),
+        OutlinedButton(onPressed: _onCancel, child: Text('Cancel')),
         ListenableBuilder(
           listenable: this,
           builder: (context, _) {
@@ -617,20 +612,24 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
 
   Widget buildWalletNameBody(BuildContext context) {
     return SliverToBoxAdapter(
-      child: TextField(
-        key: KeygenKeys.walletNameField,
-        autofocus: true,
-        controller: _controller.nameController,
-        decoration: InputDecoration(
-          border: OutlineInputBorder(),
-          errorText: _controller.nameError,
+      // Accessible name for the field (screen readers + the sim-8 driver target it).
+      child: Semantics(
+        label: 'Wallet name',
+        textField: true,
+        child: TextField(
+          autofocus: true,
+          controller: _controller.nameController,
+          decoration: InputDecoration(
+            border: OutlineInputBorder(),
+            errorText: _controller.nameError,
+          ),
+          maxLength: keyNameMaxLength(),
+          inputFormatters: [nameInputFormatter],
+          textCapitalization: TextCapitalization.words,
+          onSubmitted: (_) {
+            _controller.next(context);
+          },
         ),
-        maxLength: keyNameMaxLength(),
-        inputFormatters: [nameInputFormatter],
-        textCapitalization: TextCapitalization.words,
-        onSubmitted: (_) {
-          _controller.next(context);
-        },
       ),
     );
   }
@@ -845,24 +844,28 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
       () => TextEditingController(text: currentName),
     );
     final isDuplicate = _controller.duplicateNamedDeviceIds.contains(device.id);
-    return TextField(
-      key: KeygenKeys.deviceNameField,
-      controller: textController,
-      focusNode: _nameFocusNodes.putIfAbsent(device.id, () => FocusNode()),
-      style: monospaceTextStyle,
-      maxLength: DeviceName.maxLength(),
-      inputFormatters: [nameInputFormatter],
-      textCapitalization: TextCapitalization.sentences,
-      decoration: InputDecoration(
-        hintText: 'Enter device name',
-        hintStyle: monospaceTextStyle.copyWith(color: cs.onSurfaceVariant),
-        border: InputBorder.none,
-        isDense: true,
-        contentPadding: EdgeInsets.zero,
-        counterText: '',
-        errorText: isDuplicate ? 'Name already used in this wallet' : null,
+    // Accessible name for the field (screen readers + the sim-8 driver target it).
+    return Semantics(
+      label: 'Device name',
+      textField: true,
+      child: TextField(
+        controller: textController,
+        focusNode: _nameFocusNodes.putIfAbsent(device.id, () => FocusNode()),
+        style: monospaceTextStyle,
+        maxLength: DeviceName.maxLength(),
+        inputFormatters: [nameInputFormatter],
+        textCapitalization: TextCapitalization.sentences,
+        decoration: InputDecoration(
+          hintText: 'Enter device name',
+          hintStyle: monospaceTextStyle.copyWith(color: cs.onSurfaceVariant),
+          border: InputBorder.none,
+          isDense: true,
+          contentPadding: EdgeInsets.zero,
+          counterText: '',
+          errorText: isDuplicate ? 'Name already used in this wallet' : null,
+        ),
+        onChanged: (name) => _controller.setDeviceName(device.id, name),
       ),
-      onChanged: (name) => _controller.setDeviceName(device.id, name),
     );
   }
 
@@ -875,7 +878,6 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
     return SliverList.list(
       children: [
         ThresholdSelector(
-          key: KeygenKeys.thresholdSelector,
           threshold: form.threshold!,
           totalDevices: totalCount,
           recommendedThreshold: recommendedThresholdFor(totalCount),
@@ -1046,12 +1048,10 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
                       actionsAlignment: MainAxisAlignment.spaceBetween,
                       actions: [
                         TextButton(
-                          key: KeygenKeys.confirmNo,
                           onPressed: () => Navigator.pop(context, false),
                           child: Text('No'),
                         ),
                         TextButton(
-                          key: KeygenKeys.confirmYes,
                           onPressed: () => Navigator.pop(context, true),
                           child: Text('Yes'),
                         ),
@@ -1284,9 +1284,6 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
                   child: Align(
                     alignment: Alignment.centerRight,
                     child: FilledButton(
-                      key: KeygenKeys.primaryButtonForStep(
-                        _controller.step.name,
-                      ),
                       onPressed:
                           !_controller.canGoNext ||
                               (_controller.step == WalletCreateStep.threshold &&

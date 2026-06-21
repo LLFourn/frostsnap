@@ -9,7 +9,8 @@ use flutter_rust_bridge::frb;
 use frostsnap_coordinator::{FirmwareBin, ValidatedFirmwareBin};
 use frostsnap_core::DeviceId;
 use frostsnap_virtual_device::{
-    Point, PortConnection, SharedFramebuffer, SpawnedDevice, TouchEvent, TouchGesture, TouchQueue,
+    DeviceChannel, Point, PortConnection, SharedFramebuffer, SpawnedDevice, TouchEvent,
+    TouchGesture, TouchQueue,
 };
 use std::sync::{Arc, Mutex};
 
@@ -96,13 +97,21 @@ impl SimDevice {
 pub struct DevicePool {
     // Kept alive so the device threads keep running; never read directly.
     _spawned: Vec<SpawnedDevice>,
+    // Kept alive so the device-input sockets stay served; dropping the pool stops the
+    // accept loops and removes the socket files (teardown leaves no residue).
+    _channels: Vec<DeviceChannel>,
     devices: Vec<SimDevice>,
 }
 
 impl DevicePool {
-    pub(crate) fn new(spawned: Vec<SpawnedDevice>, devices: Vec<SimDevice>) -> Self {
+    pub(crate) fn new(
+        spawned: Vec<SpawnedDevice>,
+        channels: Vec<DeviceChannel>,
+        devices: Vec<SimDevice>,
+    ) -> Self {
         Self {
             _spawned: spawned,
+            _channels: channels,
             devices,
         }
     }

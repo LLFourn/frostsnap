@@ -1,0 +1,445 @@
+// The sim-8 dual-channel harness: one object that brings up the sim app + virtual
+// device, drives BOTH through one ergonomic API, and tears everything down (app
+// process, both channels, the disposable app dir, and all screenshots) as a unit.
+//
+//   - app (Flutter widget tree): driven by semantic label over flutter_driver / the VM
+//     service. `app.*` + `screenshot()`.
+//   - device (a framebuffer + touchscreen): driven by hardware gestures over the
+//     device-channel unix socket. `device.*`.
+//
+// Lives in test_driver/ so flutter_driver stays a dev dependency. Used by the keygen
+// driver test and by `simctl`. See `.clank/plans/sim-8-dual-channel-harness.md`.
+
+import 'dart:async';
+import 'dart:collection';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter_driver/flutter_driver.dart';
+
+/// Root for all sim temp artifacts — disposable app dirs, the simctl control socket,
+/// ad-hoc screenshots — grouped under one folder instead of loose in the system temp
+/// root. Created on demand.
+Directory simTmpRoot() {
+  final dir = Directory('${Directory.systemTemp.path}/frostsnap-sim');
+  dir.createSync(recursive: true);
+  return dir;
+}
+
+/// The device-input channel client: JSON request/reply lines over the device's unix
+/// socket. Replies arrive in request order on the single connection, so a FIFO of
+/// completers correlates them.
+class SimDeviceChannel {
+  final Socket _socket;
+  final Queue<Completer<Map<String, dynamic>>> _pending = Queue();
+  late final StreamSubscription<String> _sub;
+
+  SimDeviceChannel._(this._socket) {
+    _sub = _socket
+        .cast<List<int>>()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .listen((line) {
+          if (line.trim().isEmpty) return;
+          final reply = jsonDecode(line) as Map<String, dynamic>;
+          if (_pending.isNotEmpty) _pending.removeFirst().complete(reply);
+        });
+  }
+
+  static Future<SimDeviceChannel> connect(String socketPath) async {
+    final socket = await Socket.connect(
+      InternetAddress(socketPath, type: InternetAddressType.unix),
+      0,
+    );
+    return SimDeviceChannel._(socket);
+  }
+
+  Future<Map<String, dynamic>> _send(Map<String, dynamic> req) {
+    final completer = Completer<Map<String, dynamic>>();
+    _pending.add(completer);
+    _socket.write('${jsonEncode(req)}\n');
+    return completer.future;
+  }
+
+  /// Send a command and throw if the server reports `ok:false`.
+  Future<Map<String, dynamic>> _ok(Map<String, dynamic> req) async {
+    final reply = await _send(req);
+    if (reply['ok'] != true) {
+      throw StateError(
+        'device command ${req['cmd']} failed: ${reply['error']}',
+      );
+    }
+    return reply;
+  }
+
+  Future<void> tap(int x, int y) => _ok({'cmd': 'tap', 'x': x, 'y': y});
+
+  /// Press and hold at `(x,y)` for `duration` (the device integrates the elapsed
+  /// wall-clock; a hold-to-confirm control fires once past its threshold).
+  Future<void> hold(int x, int y, Duration duration) =>
+      _ok({'cmd': 'hold', 'x': x, 'y': y, 'ms': duration.inMilliseconds});
+
+  /// Hold a hold-to-confirm button at `(x,y)` long enough to fire it. Hold-to-confirm
+  /// is a device-wide pattern; the caller supplies the per-screen button point, so this
+  /// is generic (not specific to any flow).
+  Future<void> holdConfirm(
+    int x,
+    int y, [
+    Duration duration = const Duration(milliseconds: 2600),
+  ]) => hold(x, y, duration);
+
+  Future<void> swipe(int x1, int y1, int x2, int y2, Duration duration) => _ok({
+    'cmd': 'swipe',
+    'x1': x1,
+    'y1': y1,
+    'x2': x2,
+    'y2': y2,
+    'ms': duration.inMilliseconds,
+  });
+
+  /// Raw single touch event (press/move when `liftUp` false, release when true).
+  Future<void> touch(int x, int y, {required bool liftUp}) =>
+      _ok({'cmd': 'touch', 'x': x, 'y': y, 'lift_up': liftUp});
+
+  /// Write the exact device framebuffer to `path` as a PNG.
+  Future<void> screen(String path) => _ok({'cmd': 'screen', 'path': path});
+
+  Future<void> setConnected(bool connected) =>
+      _ok({'cmd': 'set_connected', 'connected': connected});
+
+  Future<bool> isConnected() async =>
+      (await _ok({'cmd': 'is_connected'}))['connected'] as bool;
+
+  Future<String> deviceId() async =>
+      (await _ok({'cmd': 'device_id'}))['device_id'] as String;
+
+  Future<void> close() async {
+    await _sub.cancel();
+    await _socket.close();
+    _socket.destroy();
+  }
+}
+
+/// One launched sim app + virtual device, with both channels connected.
+class SimHarness {
+  final Process _appProcess;
+  final Directory appDir;
+  final FlutterDriver driver;
+  final SimDeviceChannel device;
+  final List<String> _appLog;
+  int _shotSeq = 0;
+
+  SimHarness._(
+    this._appProcess,
+    this.appDir,
+    this.driver,
+    this.device,
+    this._appLog,
+  );
+
+  /// Run [body] against a fresh harness; on ANY failure capture diagnostics — a
+  /// whole-app screenshot, the device framebuffer, the error+stack, and recent app
+  /// logs — to a persistent dir, then always tear down. Rethrows so the run still
+  /// fails. This is the supported way to drive a scenario: a failure leaves you a
+  /// picture of where it stopped plus the logs, instead of a bare stack trace.
+  ///
+  /// On success it also enforces the no-residue invariant: the disposable app dir (and
+  /// thus the device socket + all screenshots) must be gone after teardown.
+  static Future<void> runScenario(
+    String name,
+    Future<void> Function(SimHarness h) body, {
+    String device = 'macos',
+  }) async {
+    final h = await SimHarness.launch(device: device);
+    try {
+      await body(h);
+    } catch (error, stack) {
+      await h._captureFailure(name, error, stack);
+      rethrow;
+    } finally {
+      await h.tearDown();
+    }
+    // Reached only when [body] succeeded: assert teardown left nothing behind.
+    if (await h.appDir.exists()) {
+      throw StateError('teardown left residue: ${h.appDir.path}');
+    }
+  }
+
+  /// Launch the instrumented sim app on a fresh disposable app dir, then connect the
+  /// app channel (flutter_driver) and the device channel (socket).
+  static Future<SimHarness> launch({String device = 'macos'}) async {
+    final appDir = await simTmpRoot().createTemp('app-');
+    // Ring buffer of recent app stdout/stderr, dumped into the failure artifacts.
+    final appLog = <String>[];
+    void log(String line) {
+      appLog.add(line);
+      if (appLog.length > 400) appLog.removeAt(0);
+    }
+
+    // Track partial resources so a failure anywhere in setup tears them all down
+    // (otherwise a timed-out connect would leak the flutter process + the app dir).
+    Process? proc;
+    FlutterDriver? driver;
+    SimDeviceChannel? channel;
+    try {
+      await Directory('${appDir.path}/screenshots').create();
+
+      proc = await Process.start('flutter', [
+        'run',
+        '-t',
+        'test_driver/sim_app.dart',
+        '-d',
+        device,
+        '--dart-define=SIM=true',
+        '--dart-define=SIM_APP_DIR=${appDir.path}',
+      ]);
+
+      // Capture the VM service URL from the run output (surface logs on stderr).
+      final vmUrl = Completer<String>();
+      final urlRe = RegExp(r'(http://127\.0\.0\.1:\d+/[^\s]+)');
+      proc.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((line) {
+            stderr.writeln('[app] $line');
+            log('[app] $line');
+            if (!vmUrl.isCompleted && line.contains('Dart VM Service')) {
+              final m = urlRe.firstMatch(line);
+              if (m != null) vmUrl.complete(m.group(1));
+            }
+          });
+      proc.stderr
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((line) {
+            stderr.writeln('[app:err] $line');
+            log('[app:err] $line');
+          });
+
+      final url = await vmUrl.future.timeout(const Duration(minutes: 5));
+      driver = await FlutterDriver.connect(dartVmServiceUrl: url);
+      // Build the semantics tree so find.bySemanticsLabel resolves (it isn't generated
+      // without an a11y client otherwise).
+      await driver.setSemantics(true);
+
+      // load_sim creates the socket during startup; wait for it before connecting.
+      final socketPath = '${appDir.path}/device-0.sock';
+      final deadline = DateTime.now().add(const Duration(seconds: 30));
+      while (!await File(socketPath).exists()) {
+        if (DateTime.now().isAfter(deadline)) {
+          throw StateError('device socket never appeared at $socketPath');
+        }
+        await Future.delayed(const Duration(milliseconds: 100));
+      }
+      channel = await SimDeviceChannel.connect(socketPath);
+
+      return SimHarness._(proc, appDir, driver, channel, appLog);
+    } catch (_) {
+      // Tear down whatever got created, then rethrow the original setup error.
+      await _cleanup(
+        channel: channel,
+        driver: driver,
+        proc: proc,
+        appDir: appDir,
+      );
+      rethrow;
+    }
+  }
+
+  /// Guarded best-effort teardown of any subset of the harness resources. Every step
+  /// runs even if an earlier one throws; returns the first error seen (or null).
+  static Future<Object?> _cleanup({
+    SimDeviceChannel? channel,
+    FlutterDriver? driver,
+    Process? proc,
+    Directory? appDir,
+  }) async {
+    Object? firstError;
+    Future<void> guard(Future<void> Function() step) async {
+      try {
+        await step();
+      } catch (e) {
+        firstError ??= e;
+      }
+    }
+
+    if (channel != null) await guard(channel.close);
+    if (driver != null) await guard(driver.close);
+    if (proc != null) {
+      final p = proc;
+      p.kill();
+      await guard(
+        () => p.exitCode.timeout(
+          const Duration(seconds: 10),
+          onTimeout: () {
+            p.kill(ProcessSignal.sigkill);
+            return -1;
+          },
+        ),
+      );
+    }
+    if (appDir != null && await appDir.exists()) {
+      await guard(() => appDir.delete(recursive: true));
+    }
+    return firstError;
+  }
+
+  // ---- app channel (widget tree, by semantic label) ----
+  // `label` is a Pattern: a String matches the accessible name exactly; a RegExp
+  // matches a substring (needed for composite widgets, e.g. a card that merges its
+  // title + subtitle into one semantics label).
+  //
+  // Every command runs UNSYNCHRONIZED and with a timeout. Unsynchronized because the
+  // sim device tray repaints whenever the device screen changes, so the app rarely
+  // reaches the frame-quiescent state flutter_driver waits for by default — a
+  // synchronized command (e.g. a tap that triggers device activity) would otherwise
+  // never return. The timeout turns an unresolvable target into a fast, clear failure
+  // instead of an indefinite hang (flutter_driver waits forever with no timeout).
+
+  /// Per-command timeout for app interactions.
+  static const Duration _cmdTimeout = Duration(seconds: 20);
+
+  Future<void> tap(Pattern label) => driver.runUnsynchronized(
+    () => driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout),
+  );
+
+  /// Tap [label] and wait for [expect] to appear. Distinguishes two failure modes of
+  /// an unsynchronized tap:
+  ///  - the tap *no-ops* (landed before the control was interactable) — [label] is
+  ///    still present afterwards, so re-tap;
+  ///  - the tap *worked but the result is slow* (e.g. a brief "preparing" step before
+  ///    the next screen) — [label] is gone, so DON'T re-tap (it would hit nothing);
+  ///    just wait longer for [expect].
+  /// Throws if [expect] never appears.
+  Future<void> tapUntil(
+    Pattern label,
+    Pattern expect, {
+    int tries = 8,
+    Duration settle = const Duration(seconds: 30),
+  }) async {
+    for (var i = 0; i < tries; i++) {
+      await tap(label);
+      if (await _appears(expect, const Duration(seconds: 3))) return;
+      // Tap took effect (button gone) but the result is slow — wait it out.
+      if (!await _appears(label, const Duration(milliseconds: 500))) {
+        await waitFor(expect, timeout: settle);
+        return;
+      }
+      // Otherwise [label] is still there: the tap no-op'd, so loop and re-tap.
+    }
+    throw StateError(
+      'tapped "$label" $tries times but "$expect" never appeared',
+    );
+  }
+
+  Future<bool> _appears(Pattern label, Duration timeout) async {
+    try {
+      await driver.runUnsynchronized(
+        () => driver.waitFor(find.bySemanticsLabel(label), timeout: timeout),
+      );
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> enterText(Pattern label, String text) =>
+      driver.runUnsynchronized(() async {
+        await driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout);
+        await driver.enterText(text, timeout: _cmdTimeout);
+      });
+
+  Future<String> getText(Pattern label) => driver.runUnsynchronized(
+    () => driver.getText(find.bySemanticsLabel(label), timeout: _cmdTimeout),
+  );
+
+  Future<void> waitFor(
+    Pattern label, {
+    Duration timeout = const Duration(seconds: 30),
+  }) => driver.runUnsynchronized(
+    () => driver.waitFor(find.bySemanticsLabel(label), timeout: timeout),
+  );
+
+  Future<void> waitForAbsent(
+    Pattern label, {
+    Duration timeout = const Duration(seconds: 30),
+  }) => driver.runUnsynchronized(
+    () => driver.waitForAbsent(find.bySemanticsLabel(label), timeout: timeout),
+  );
+
+  /// Whether a control with semantic [label] is present right now.
+  Future<bool> exists(Pattern label) async {
+    try {
+      await driver.runUnsynchronized(
+        () => driver.waitFor(
+          find.bySemanticsLabel(label),
+          timeout: const Duration(milliseconds: 800),
+        ),
+      );
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // ---- device channel convenience over [device] ----
+
+  Future<void> unplug() => device.setConnected(false);
+  Future<void> plug() => device.setConnected(true);
+
+  // ---- whole-app screenshot (incl. the tray) ----
+
+  /// Capture the whole Flutter surface (app + tray) to `<appDir>/screenshots/`. The
+  /// file is removed with everything else on [tearDown]; pass [keep] for a path
+  /// outside the app dir to retain a shot. Returns the written path.
+  Future<String> screenshot(String name, {String? keep}) async {
+    final png = await driver.runUnsynchronized(() => driver.screenshot());
+    final path = keep ?? '${appDir.path}/screenshots/${_shotSeq++}-$name.png';
+    await File(path).writeAsBytes(png);
+    return path;
+  }
+
+  // ---- failure diagnostics ----
+
+  /// On a scenario failure, dump where it stopped to `build/sim-failures/<name>/`
+  /// (a gitignored, persistent dir — survives tearDown): the whole-app screenshot,
+  /// the exact device framebuffer, and `error.txt` (the error + stack + recent app
+  /// logs). Best-effort: a capture step failing must not mask the original error.
+  Future<void> _captureFailure(
+    String name,
+    Object error,
+    StackTrace stack,
+  ) async {
+    final dir = Directory('build/sim-failures/$name');
+    try {
+      if (await dir.exists()) await dir.delete(recursive: true);
+      await dir.create(recursive: true);
+      try {
+        await screenshot('app', keep: '${dir.path}/app.png');
+      } catch (_) {}
+      try {
+        await device.screen('${dir.path}/device.png');
+      } catch (_) {}
+      await File('${dir.path}/error.txt').writeAsString(
+        '$error\n\n$stack\n\n--- recent app log ---\n${_appLog.join('\n')}\n',
+      );
+      stderr.writeln('sim-failure diagnostics: ${dir.absolute.path}');
+    } catch (_) {
+      // Diagnostics are best-effort; never mask the scenario's own error.
+    }
+  }
+
+  /// Close both channels, quit the app, and delete the disposable app dir (which
+  /// holds the device socket and all harness screenshots) — no residue. App
+  /// termination and dir deletion run even if a client close fails; the first
+  /// cleanup error (if any) is rethrown once everything has been torn down.
+  Future<void> tearDown() async {
+    final err = await _cleanup(
+      channel: device,
+      driver: driver,
+      proc: _appProcess,
+      appDir: appDir,
+    );
+    if (err != null) throw err;
+  }
+}

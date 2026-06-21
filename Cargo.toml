@@ -50,6 +50,7 @@ serde = { version = "1", features = [
     "derive",
     "alloc",
 ], default-features = false }
+serde_json = "1"
 frostsnap_core = { path = "frostsnap_core", default-features = false }
 frostsnap_comms = { path = "frostsnap_comms", default-features = false }
 frostsnap_coordinator = { path = "frostsnap_coordinator" }

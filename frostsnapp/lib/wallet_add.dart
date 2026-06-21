@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:frostsnap/contexts.dart';
 import 'package:frostsnap/global.dart';
-import 'package:frostsnap/keygen_keys.dart';
 import 'package:frostsnap/maybe_fullscreen_dialog.dart';
 import 'package:frostsnap/restoration.dart';
 import 'package:frostsnap/src/rust/api.dart';
@@ -47,11 +46,11 @@ class WalletAddColumn extends StatelessWidget {
         if (showNewToFrostsnap) buildTitle(context, text: 'Create wallet'),
         buildCard(
           context,
-          tappableKey: KeygenKeys.createMultisigEntry,
           action: () => onPressed(AddType.newWallet),
           emphasize: true,
           isThreeLine: true,
           icon: Icon(Icons.add_rounded, size: iconSize),
+          // The sim-8 driver targets this card by its title's semantic label.
           title: 'Create a multi-sig wallet',
           subtitle: 'Set up a secure wallet using multiple Frostsnap devices',
         ),
@@ -118,7 +117,6 @@ class WalletAddColumn extends StatelessWidget {
     bool emphasize = false,
     bool? isThreeLine,
     Function()? action,
-    Key? tappableKey,
   }) {
     final theme = Theme.of(context);
     final Color? emphasisColor = theme.colorScheme.secondary;
@@ -127,7 +125,6 @@ class WalletAddColumn extends StatelessWidget {
     final Color? onColor = theme.colorScheme.onSecondaryContainer;
 
     final listTile = ListTile(
-      key: tappableKey,
       textColor: emphasize ? onEmphasisColor : onColor,
       iconColor: emphasize ? onEmphasisColor : onColor,
       onTap: action,

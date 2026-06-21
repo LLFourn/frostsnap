@@ -62,8 +62,12 @@ Future<void> main() async {
     final appDir = await getApplicationSupportDirectory();
     final appDirPath = appDir.path;
     if (kSim) {
+      // Point the sim at a disposable app dir (clean DB per run, and the device
+      // channel's socket lives here too) via `--dart-define=SIM_APP_DIR=/tmp/...`;
+      // defaults to the app-support dir.
+      const simAppDir = String.fromEnvironment('SIM_APP_DIR');
       final (coord_, appCtx_, pool_) = await api.loadSim(
-        appDir: appDirPath,
+        appDir: simAppDir.isEmpty ? appDirPath : simAppDir,
         seed: 1,
       );
       coord = coord_;

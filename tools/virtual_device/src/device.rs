@@ -20,6 +20,7 @@ use crate::secrets::SimKeyedHash;
 use crate::serial::{pipe, HostEnd, PipeByteIo};
 use crate::touch::TouchQueue;
 use core::cell::RefCell;
+use frostsnap_comms::Sha256Digest;
 use frostsnap_embedded::{
     device_hal::{InitOutcome, Poll},
     device_loop::DeviceLoop,
@@ -27,7 +28,6 @@ use frostsnap_embedded::{
     frosty_ui::FrostyUi,
     FlashPartition, ShareEncryptionSecrets,
 };
-use frostsnap_comms::Sha256Digest;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use std::sync::atomic::{AtomicU32, Ordering};

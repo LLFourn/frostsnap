@@ -6,12 +6,14 @@
 //! See [`VirtualDevice`] for the ownership model (owned parts +
 //! caller-owned [`VirtualDeviceSession`] holding one persistent loop).
 
+mod channel;
 mod clock;
 mod device;
 mod display;
 mod firmware;
 mod flash;
 mod hal;
+mod input;
 mod secrets;
 mod serial;
 mod sim_coordinator;
@@ -19,12 +21,14 @@ mod thread;
 mod touch;
 mod virtual_serial;
 
+pub use channel::DeviceChannel;
 pub use clock::SimClock;
 pub use device::{SimUi, VirtualDevice, VirtualDeviceSession};
 pub use display::{FramebufferDisplay, SharedFramebuffer, HEIGHT, WIDTH};
 pub use firmware::SimFirmware;
 pub use flash::{RamFlash, SECTORS};
 pub use hal::{SimDownstream, SimHal, SimUpstream};
+pub use input::DeviceInput;
 pub use secrets::SimKeyedHash;
 pub use serial::{pipe, ByteChannel, HostEnd, PipeByteIo};
 pub use sim_coordinator::{SimCoordinator, StateCell, StepOutcome};
@@ -35,7 +39,9 @@ pub use touch::TouchQueue;
 /// touches without depending on `frostsnap_embedded`/`embedded-graphics` directly.
 pub use embedded_graphics::geometry::Point;
 pub use frostsnap_embedded::device_hal::{TouchEvent, TouchGesture};
-pub use virtual_serial::{PortConnection, VirtualPort, VirtualSerial, FROSTSNAP_PID, FROSTSNAP_VID};
+pub use virtual_serial::{
+    PortConnection, VirtualPort, VirtualSerial, FROSTSNAP_PID, FROSTSNAP_VID,
+};
 
 use frostsnap_coordinator::{DeviceChange, UsbSerialManager};
 use frostsnap_embedded::device_hal::Poll;
@@ -447,9 +453,8 @@ mod tests {
 
         // Pump the manager (real wall-clock; magic cadence is ~100ms) until `f`
         // observes the change it wants in a poll round, or the deadline passes.
-        let pump_until = |manager: &mut UsbSerialManager,
-                          mut f: Box<dyn FnMut(&mut UsbSerialManager, DeviceChange) -> bool>|
-         -> bool {
+        type ChangePred = Box<dyn FnMut(&mut UsbSerialManager, DeviceChange) -> bool>;
+        let pump_until = |manager: &mut UsbSerialManager, mut f: ChangePred| -> bool {
             let deadline = Instant::now() + Duration::from_secs(30);
             while Instant::now() < deadline {
                 for change in manager.poll_ports() {
@@ -481,7 +486,9 @@ mod tests {
         connection.set_connected(false);
         let saw_disconnect = pump_until(
             &mut manager,
-            Box::new(move |_, change| matches!(change, DeviceChange::Disconnected { id: gone } if gone == id)),
+            Box::new(
+                move |_, change| matches!(change, DeviceChange::Disconnected { id: gone } if gone == id),
+            ),
         );
         assert!(saw_disconnect, "coordinator sees the device unplug");
 
