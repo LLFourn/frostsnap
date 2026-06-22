@@ -12,7 +12,7 @@ import 'sim_harness.dart';
 // this test failing. The device confirm-button point (120,215) is the keygen security
 // screen's calibration (sim-3), supplied to the generic device.holdConfirm.
 //
-// Run: `just sim-keygen-drive` (or `cd frostsnapp && dart run
+// Run: `./simctl test keygen` (or `cd frostsnapp && dart run
 // test_driver/keygen_drive.dart`). Needs a display (Xvfb on Linux CI).
 
 /// The keygen security-code confirm button on the device's KeygenCheck screen.

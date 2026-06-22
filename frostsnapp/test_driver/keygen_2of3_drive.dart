@@ -7,7 +7,7 @@ import 'sim_harness.dart';
 // disconnect one, and run keygen across the remaining 3 — exercising multi-device naming,
 // the default 2-of-3 threshold, and a per-device security-check confirm. Driven OUT OF
 // PROCESS through the SimHarness: app by semantic label (flutter_driver) + each device by
-// hold-to-confirm over its socket. Run: `just sim-keygen-2of3`. Needs a display.
+// hold-to-confirm over its socket. Run: `./simctl test keygen_2of3`. Needs a display.
 
 /// The keygen security-code confirm button on each device's KeygenCheck screen (sim-3).
 const int _confirmX = 120;

@@ -202,33 +202,11 @@ legacy-run +ARGS="": maybe-gen
     cd frostsnapp && BUNDLE_FIRMWARE=../../target/riscv32imc-unknown-none-elf/release/legacy.bin \
       flutter run $FLAVOR_FLAG --dart-define=BUILD_COMMIT="$BUILD_COMMIT" --dart-define=BUILD_VERSION="$BUILD_VERSION" {{ARGS}}
 
-# Drive a full 1-of-1 keygen OUT OF PROCESS through the SimHarness (sim-8): app taps by
-# semantic label (flutter_driver) + device gestures (the device socket), on a clean
-# disposable app dir. Needs a display; on Linux CI wrap in Xvfb.
-sim-keygen-drive: maybe-gen
-    cd frostsnapp && dart run test_driver/keygen_drive.dart
-
-# sim-12: a full 2-of-3 keygen over a dynamic chain — 4 devices, disconnect one, keygen
-# across the remaining 3. Needs a display.
-sim-keygen-2of3: maybe-gen
-    cd frostsnapp && dart run test_driver/keygen_2of3_drive.dart
-
-# sim-9 acceptance: bring up a 3-device fleet and assert independent plug/unplug +
-# distinct ids through the SimHarness, then tear down with no residue. Needs a display.
-sim-multi-drive: maybe-gen
-    cd frostsnapp && dart run test_driver/multi_device_drive.dart
-
-# Start the interactive sim session: launches the app + N devices ONCE (`--count N`,
-# default 1) and keeps them alive, listening for `just sim ...` commands. Run in the
-# background; stop with `just sim down`. Drives the SAME SimHarness calls the tests use.
-sim-serve +ARGS="": maybe-gen
-    cd frostsnapp && dart run test_driver/simctl.dart serve {{ARGS}}
-
-# Send ONE command to the running sim session (app stays alive between commands), e.g.
-# `just sim tap "Create a multi-sig wallet"`, `just sim hold 120 215 3000 --device 2`,
-# `just sim devices`, `just sim shot /tmp/x.png`, `just sim down`. See simctl.dart.
-sim +ARGS="":
-    cd frostsnapp && dart run test_driver/simctl.dart {{ARGS}}
+# App-simulator tooling is NOT here — it lives in the repo-root `./simctl` CLI (sim-14), so
+# the sim doesn't accrete recipes in this shared justfile. `./simctl serve` runs the
+# interactive session, `./simctl <cmd>` drives it, `./simctl test [NAME]` runs the e2e driver
+# tests (`./simctl test` runs all). It reuses `just maybe-gen` for codegen. See test_driver/simctl.dart.
+# (`simulate`/`demo` below is the unrelated tools/widget_simulator, not this app sim.)
 
 build-appimage +ARGS="":
     #!/bin/sh

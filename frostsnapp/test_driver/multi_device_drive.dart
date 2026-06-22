@@ -10,7 +10,7 @@ import 'sim_harness.dart';
 //   - setChain([3,1]) -> a head-changing reorder (device 3 is now the head) -> 2 devices;
 //   - disconnect(2) cuts the daisy chain there: device 2 AND everything downstream of it
 //     fall off (a pulled device takes its subtree with it), not a gap-close.
-// runScenario asserts no residue. Run: `just sim-multi-drive`. Needs a display.
+// runScenario asserts no residue. Run: `./simctl test multi_device`. Needs a display.
 
 // A head change re-enumerates over the coordinator's real ~100ms cadence and a downstream
 // add/remove re-handshakes hop-by-hop, so give the count changes a generous settle window.

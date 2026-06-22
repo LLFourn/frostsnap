@@ -1,0 +1,23 @@
+#!/bin/sh
+# simctl — the app-simulator CLI (sim-14). The single entrypoint for the Frostsnap app sim:
+#
+#   ./simctl serve [--count N] [--agent-owns-keyboard]   launch the session, keep it alive
+#   ./simctl <cmd> ...                                   drive the running session (chain,
+#                                                        disconnect, tap, shot, down, …)
+#   ./simctl test [NAME]                                 run e2e driver test NAME (a
+#                                                        *_drive.dart stem), or all with no NAME
+#
+# `serve` and `test` launch/build the app, so we first run the project's shared gen-ensure
+# (`just maybe-gen`: re-run FRB bindgen if the Rust API changed, then build_runner) — the
+# single source of truth for codegen, which the sim consumes but does not own. Forwarded
+# commands talk to an already-running app, so they skip gen-ensure (and stay fast).
+set -e
+
+root="$(cd "$(dirname "$0")" && pwd)"
+
+case "${1:-}" in
+  serve | test) (cd "$root" && just maybe-gen) ;;
+esac
+
+cd "$root/frostsnapp"
+exec dart run test_driver/simctl.dart "$@"

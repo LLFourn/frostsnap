@@ -18,13 +18,16 @@ import 'sim_harness.dart';
 // `serve` holds a SimHarness and forwards each command to its methods over a control
 // socket, so the app stays alive across commands: send one, see the result, try the
 // next — a failed attempt is just followed by another command on the same live app
-// (no relaunch). See `_usage` for commands. Run via `just sim-serve` / `just sim ...`.
+// (no relaunch). `test` runs the driver e2e tests. See `_usage` for commands. Run via the
+// repo-root `./simctl` launcher (e.g. `./simctl serve`, `./simctl test keygen`).
 
 String get _socketPath => '${simTmpRoot().path}/control.sock';
 
 const _usage = '''
 simctl — drive the running sim app/devices through SimHarness.
   simctl serve [--count N] [--platform <d>] [--agent-owns-keyboard]   launch app + listen
+  simctl test [NAME]                          run e2e driver test <NAME> (a *_drive.dart stem),
+                                              or all of them with no NAME
   simctl tap <label> [--regex]                tap a control by semantic label
   simctl tap-until <label> <expect> [--regex] [--regex-expect]
   simctl enter <label> <text> [--regex]       focus a field + type (agent-owns-keyboard only)
@@ -54,9 +57,60 @@ Future<void> main(List<String> args) async {
   }
   if (args.first == 'serve') {
     await _serve(args.skip(1).toList());
+  } else if (args.first == 'test') {
+    await _runTests(args.skip(1).toList());
   } else {
     await _client(args);
   }
+}
+
+// ---- test runner: run the driver e2e tests (test_driver/*_drive.dart) ----
+
+/// Run one driver test by its file STEM (`<stem>_drive.dart`), or all of them with no arg.
+/// Each runs as its own `dart run` so they get a fresh app/harness; a non-zero exit from any
+/// fails the whole run. Replaces the per-test justfile recipes — a new test is just a new
+/// `*_drive.dart` file, discovered here automatically.
+Future<void> _runTests(List<String> args) async {
+  final stems = <String, String>{}; // stem -> filename
+  for (final entry in Directory('test_driver').listSync()) {
+    final name = entry.uri.pathSegments.last;
+    if (entry is File && name.endsWith('_drive.dart')) {
+      stems[name.substring(0, name.length - '_drive.dart'.length)] = name;
+    }
+  }
+  final available = stems.keys.toList()..sort();
+
+  final List<String> files;
+  if (args.isEmpty) {
+    files = available.map((s) => stems[s]!).toList();
+  } else {
+    final file = stems[args.first];
+    if (file == null) {
+      stderr.writeln(
+        'simctl test: no test "${args.first}". Available: ${available.join(', ')}',
+      );
+      exit(2);
+    }
+    files = [file];
+  }
+
+  final failed = <String>[];
+  for (final file in files) {
+    stdout.writeln('=== simctl test: $file ===');
+    final proc = await Process.start('dart', [
+      'run',
+      'test_driver/$file',
+    ], mode: ProcessStartMode.inheritStdio);
+    if (await proc.exitCode != 0) failed.add(file);
+  }
+
+  if (files.length > 1) {
+    stdout.writeln(
+      '=== simctl test: ${files.length - failed.length}/${files.length} passed'
+      '${failed.isEmpty ? '' : ' — FAILED: ${failed.join(', ')}'} ===',
+    );
+  }
+  exit(failed.isEmpty ? 0 : 1);
 }
 
 // ---- daemon: holds one SimHarness, forwards commands to it ----
@@ -156,7 +210,7 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
               'ok': false,
               'error':
                   'enter is unavailable when a human owns the keyboard; type into the '
-                  'app directly, or relaunch with `just sim-serve --agent-owns-keyboard`',
+                  'app directly, or relaunch with `./simctl serve --agent-owns-keyboard`',
             },
             false,
           );
@@ -253,8 +307,8 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
 
 // ---- client: run one command against the running daemon ----
 
-/// Connect to the daemon, waiting for it to come up rather than failing instantly: `just
-/// sim-serve` builds + launches the app (cold builds take a while), so a `just sim <cmd>`
+/// Connect to the daemon, waiting for it to come up rather than failing instantly:
+/// `./simctl serve` builds + launches the app (cold builds take a while), so a `./simctl <cmd>`
 /// fired right after should just block until the control socket is ready — no external
 /// "wait for SIMCTL_READY" polling. Retries until [SIMCTL_WAIT_SECS] (default 300s), then
 /// gives up so a genuine missing-daemon mistake still errors. Announces once so a wait is
