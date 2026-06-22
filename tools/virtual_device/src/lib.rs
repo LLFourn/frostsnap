@@ -22,7 +22,7 @@ mod thread;
 mod touch;
 mod virtual_serial;
 
-pub use chain_router::{ChainRouter, DeviceLink};
+pub use chain_router::{ChainRouter, SlotSpec};
 pub use channel::DeviceChannel;
 pub use clock::SimClock;
 pub use device::{SimUi, VirtualDevice, VirtualDeviceSession};
@@ -34,7 +34,7 @@ pub use input::DeviceInput;
 pub use secrets::SimKeyedHash;
 pub use serial::{pipe, ByteChannel, HostEnd, LinkGate, PipeByteIo};
 pub use sim_coordinator::{SimCoordinator, StateCell, StepOutcome};
-pub use thread::{DeviceThread, SpawnedDevice};
+pub use thread::{DeviceThread, FrameSink, SpawnedDevice};
 pub use touch::TouchQueue;
 
 /// The touch-injection types, re-exported so callers (the FRB `SimDevice`) can push
@@ -515,9 +515,10 @@ mod tests {
     // Slice 1: a complete 1-of-1 keygen, driven by a *scripted device touch through
     // the real FrostyUi* (no injected UiEvent) plus the Rust-level coordinator bridge.
     // The device confirms the security code via a held hold-to-confirm; the
-    // coordinator advances to all-acks and finalizes an AccessStructureRef.
-    #[test]
-    fn one_device_keygen_completes() {
+    // coordinator advances to all-acks and finalizes an AccessStructureRef. Returns the
+    // booted device (session dropped) + the finalized ref so callers can also inspect the
+    // post-keygen device (the power-cycle test recovers its flash).
+    fn run_one_device_keygen(seed: u64) -> (VirtualDevice, frostsnap_core::AccessStructureRef) {
         use embedded_graphics::geometry::Point;
         use frostsnap_core::coordinator::BeginKeygen;
         use frostsnap_core::device::KeyPurpose;
@@ -532,7 +533,7 @@ mod tests {
         // the 2000ms hold are both real-time (the sim clock is Instant-backed).
         let deadline = || Instant::now() + Duration::from_secs(40);
 
-        let mut device = VirtualDevice::new(1);
+        let mut device = VirtualDevice::new(seed);
         let fb = device.framebuffer();
         let touch = device.touch();
         let host = device.host_serial();
@@ -681,10 +682,66 @@ mod tests {
         save_phase_png(&fb, "frostsnap_keygen_finished.png");
 
         drop(session);
+        (device, asr)
+    }
+
+    // The keygen completes and the sim was never offered a firmware upgrade.
+    #[test]
+    fn one_device_keygen_completes() {
+        let (device, _asr) = run_one_device_keygen(1);
         assert_eq!(
             device.upgrades_offered(),
             0,
             "a genuine-off sim device must never be offered a firmware upgrade"
+        );
+    }
+
+    // sim-13: a power-cycle preserves NVS. Drive a real keygen so the device persists a
+    // finalized share, recover its flash (power off), then boot a FRESH device from that
+    // flash (power on): it STILL holds the key. The negative control — booting from an
+    // empty flash — does NOT, proving the check is about a runtime-written value surviving,
+    // not the seed-derivable device id (which is stable regardless of flash).
+    #[test]
+    fn power_cycle_preserves_persisted_share() {
+        let seed = 1;
+        let (device, asr) = run_one_device_keygen(seed);
+        let preserved = device.into_flash();
+
+        let mut rebooted = VirtualDevice::from_saved(
+            seed,
+            SimFirmware::PLACEHOLDER_DIGEST,
+            PipeByteIo::disconnected(),
+            PipeByteIo::disconnected(),
+            SharedFramebuffer::new(),
+            TouchQueue::new(),
+            preserved,
+        );
+        let session = match rebooted.session() {
+            InitOutcome::Ready(session) => session,
+            InitOutcome::ResetRequested => panic!("boot from preserved flash should be Ready"),
+        };
+        assert!(
+            session.holds_key(asr.key_id),
+            "the finalized share must survive a power-cycle (flash preserved)"
+        );
+        drop(session);
+
+        let mut fresh = VirtualDevice::from_saved(
+            seed,
+            SimFirmware::PLACEHOLDER_DIGEST,
+            PipeByteIo::disconnected(),
+            PipeByteIo::disconnected(),
+            SharedFramebuffer::new(),
+            TouchQueue::new(),
+            RamFlash::new(),
+        );
+        let session = match fresh.session() {
+            InitOutcome::Ready(session) => session,
+            InitOutcome::ResetRequested => panic!("fresh boot should be Ready"),
+        };
+        assert!(
+            !session.holds_key(asr.key_id),
+            "an empty flash must NOT hold the key — proves persistence, not seed-derivation"
         );
     }
 

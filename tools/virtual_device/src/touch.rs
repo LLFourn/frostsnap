@@ -19,6 +19,20 @@ impl TouchQueue {
     pub fn push(&self, event: TouchEvent) {
         self.0.lock().unwrap().push_back(event);
     }
+
+    /// Drop every pending touch. Called on power-on (sim-13) so touches that arrived
+    /// while the device was powered off don't replay into the freshly-booted thread.
+    pub fn clear(&self) {
+        self.0.lock().unwrap().clear();
+    }
+
+    /// How many touches are queued but not yet pulled by the device. Lets a test observe
+    /// that a running thread drains the queue (proving touch reaches the device) versus a
+    /// powered-off slot where it does not.
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
 }
 
 impl TouchSource for TouchQueue {

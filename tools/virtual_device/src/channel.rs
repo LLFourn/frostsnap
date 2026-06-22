@@ -208,16 +208,12 @@ fn dispatch(line: &str, input: &DeviceInput, handles: &Handles) -> Value {
             Ok(ok())
         }
         Some("set_connected") => {
-            let connected = boolean("connected")?;
-            let mut order = handles.router.chain();
-            let present = order.contains(&handles.index);
-            // Editing the current (valid) chain by one in-range index stays valid.
-            if connected && !present {
-                order.push(handles.index);
-                let _ = handles.router.set_chain(order);
-            } else if !connected && present {
-                order.retain(|&i| i != handles.index);
-                let _ = handles.router.set_chain(order);
+            // Disconnect cuts the daisy chain here: this device and everything downstream
+            // leave. Connect plugs it into the tail. (See `ChainRouter::connect`/`disconnect`.)
+            if boolean("connected")? {
+                handles.router.connect(handles.index);
+            } else {
+                handles.router.disconnect(handles.index);
             }
             Ok(ok())
         }
@@ -281,10 +277,9 @@ fn err(message: String) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain_router::DeviceLink;
+    use crate::chain_router::SlotSpec;
     use crate::firmware::SimFirmware;
-    use crate::serial::{ByteChannel, HostEnd, LinkGate};
-    use crate::VirtualDevice;
+    use crate::serial::{ByteChannel, HostEnd};
     use crate::VirtualSerial;
 
     fn host() -> HostEnd {
@@ -305,21 +300,19 @@ mod tests {
 
     #[test]
     fn device_channel_round_trips_over_the_socket() {
-        let spawned = VirtualDevice::spawn(11, SimFirmware::PLACEHOLDER_DIGEST, |_, _, _| {});
-        let serial = VirtualSerial::single("sim-0", spawned.host.clone().unwrap());
-        // A one-device router so the socket's set_connected/is_connected edit/read a real
-        // chain config (the device itself is standalone — this test exercises the protocol).
-        let link = DeviceLink {
-            up: host(),
-            down: host(),
-            downstream_present: LinkGate::new(false),
+        // A one-device router owns the device (slot); the socket drives it through the
+        // router's STABLE handles — exactly the wiring `load_sim` uses. No coordinator
+        // polls `coord` here; this test exercises the socket protocol only.
+        let coord = host();
+        let serial = VirtualSerial::single("sim-0", coord.clone());
+        let port = serial.connection();
+        let spec = SlotSpec {
+            seed: 11,
+            digest: SimFirmware::PLACEHOLDER_DIGEST,
+            on_frame: Arc::new(|_, _, _| {}),
         };
-        let router = Arc::new(ChainRouter::new(
-            host(),
-            serial.connection(),
-            vec![link],
-            vec![0],
-        ));
+        let router = Arc::new(ChainRouter::new(coord, port, vec![spec], vec![0]));
+        let device_id = router.device_id(0);
 
         // A dedicated temp dir so the socket + screen PNG are cleaned up together.
         let dir = std::env::temp_dir().join("frostsnap-devchan-roundtrip");
@@ -329,11 +322,11 @@ mod tests {
 
         let channel = DeviceChannel::serve(
             sock.clone(),
-            spawned.touch.clone(),
-            spawned.framebuffer.clone(),
-            router,
+            router.touch(0),
+            router.framebuffer(0),
+            router.clone(),
             0,
-            spawned.device_id,
+            device_id,
         )
         .unwrap();
 
@@ -371,9 +364,9 @@ mod tests {
             json!(true)
         );
 
-        // device_id matches the spawned device.
+        // device_id matches the slot's device.
         let id = req(&mut reader, &mut writer, r#"{"cmd":"device_id"}"#);
-        assert_eq!(id["device_id"], json!(spawned.device_id.to_string()));
+        assert_eq!(id["device_id"], json!(device_id.to_string()));
 
         // plug state round-trips.
         assert_eq!(
@@ -408,6 +401,5 @@ mod tests {
         assert!(!sock.exists(), "socket file removed on drop");
 
         let _ = std::fs::remove_dir_all(&dir);
-        drop(spawned);
     }
 }

@@ -72,18 +72,43 @@ impl VirtualDevice {
         device
     }
 
-    /// Build a device wired to externally-supplied upstream and downstream byte links —
-    /// the chained construction (sim-10): the caller owns the link ends, so neighbours
-    /// can be connected device-to-device. Has no `host` of its own.
+    /// Build a device wired to externally-supplied upstream and downstream byte links,
+    /// with its own fresh peripherals and empty flash — the chained construction
+    /// (sim-10): the caller owns the link ends, so neighbours can be connected
+    /// device-to-device. Has no `host` of its own.
     pub fn from_io(
         seed: u64,
         firmware_digest: Sha256Digest,
         upstream_io: PipeByteIo,
         downstream_io: PipeByteIo,
     ) -> Self {
+        Self::from_saved(
+            seed,
+            firmware_digest,
+            upstream_io,
+            downstream_io,
+            SharedFramebuffer::new(),
+            TouchQueue::new(),
+            RamFlash::new(),
+        )
+    }
+
+    /// Build a device wired to externally-owned peripherals and flash — the power-slot
+    /// construction (sim-13). The `framebuffer`, `touch`, and `flash` outlive any single
+    /// power-cycle: the slot owns them and hands the same handles to each freshly-spawned
+    /// device thread, so a re-boot resumes on the same screen/touch surface and the same
+    /// NVS (only the volatile loop/UI/RAM is rebuilt). [`Self::into_flash`] hands the
+    /// (mutated) flash back to the slot when the thread stops. Has no `host` of its own.
+    pub fn from_saved(
+        seed: u64,
+        firmware_digest: Sha256Digest,
+        upstream_io: PipeByteIo,
+        downstream_io: PipeByteIo,
+        framebuffer: SharedFramebuffer,
+        touch: TouchQueue,
+        flash: RamFlash,
+    ) -> Self {
         let clock = SimClock::new();
-        let framebuffer = SharedFramebuffer::new();
-        let touch = TouchQueue::new();
 
         let firmware = SimFirmware::new(firmware_digest);
         let upgrades_offered = firmware.upgrades_offered();
@@ -106,7 +131,7 @@ impl VirtualDevice {
         );
 
         Self {
-            flash: RefCell::new(RamFlash::new()),
+            flash: RefCell::new(flash),
             hal,
             ui,
             clock,
@@ -115,6 +140,13 @@ impl VirtualDevice {
             host: None,
             upgrades_offered,
         }
+    }
+
+    /// Recover the device's flash (NVS) after its session has ended — the power-off path
+    /// (sim-13). Consumes the device (its volatile loop/UI/HAL are dropped) and returns
+    /// the flash store so the slot can preserve it and feed it to the next power-on.
+    pub fn into_flash(self) -> RamFlash {
+        self.flash.into_inner()
     }
 
     /// How many firmware-upgrade messages the coordinator has offered this device —

@@ -428,20 +428,14 @@ class SimHarness {
   /// Re-cable the chain to exactly [order] (1-based numbers, in order).
   Future<void> setChain(List<int> order) => device(1).setChain(order);
 
-  /// Connect [number] by appending it to the chain (no-op if already connected).
-  Future<void> connect(int number) async {
-    final order = await chain();
-    if (!order.contains(number)) {
-      order.add(number);
-      await setChain(order);
-    }
-  }
+  /// Connect [number] by plugging it into the tail of the chain (no-op if already
+  /// connected). Routes through the device's `set_connected` so the router applies the
+  /// daisy-chain semantics (the single source of truth), same as the tray.
+  Future<void> connect(int number) => device(number).setConnected(true);
 
-  /// Disconnect [number]; the chain re-closes (the others stay connected).
-  Future<void> disconnect(int number) async {
-    final order = await chain();
-    if (order.remove(number)) await setChain(order);
-  }
+  /// Disconnect [number] AND everything downstream of it — pulling a device from a daisy
+  /// chain cuts power/comms to every device below it.
+  Future<void> disconnect(int number) => device(number).setConnected(false);
 
   /// Move [number] one position toward the head (the coordinator end).
   Future<void> moveUp(int number) async {
@@ -476,11 +470,33 @@ class SimHarness {
   /// Capture the whole Flutter surface (app + tray) to `<appDir>/screenshots/`. The
   /// file is removed with everything else on [tearDown]; pass [keep] for a path
   /// outside the app dir to retain a shot. Returns the written path.
+  ///
+  /// Brings the app window to the foreground first: macOS pauses a backgrounded window's
+  /// render loop, so `driver.screenshot()` would otherwise return the last on-screen frame
+  /// (e.g. a chain edit made via the socket would not appear, even though the tray's widget
+  /// tree already reflects it). Foregrounding resumes rendering so the shot is current.
   Future<String> screenshot(String name, {String? keep}) async {
+    await _bringAppToFront();
     final png = await driver.runUnsynchronized(() => driver.screenshot());
     final path = keep ?? '${appDir.path}/screenshots/${_shotSeq++}-$name.png';
     await File(path).writeAsBytes(png);
     return path;
+  }
+
+  /// Best-effort: raise the macOS app window so its render loop resumes and the next
+  /// screenshot is a fresh frame. A no-op (silently) off macOS or if osascript is absent.
+  Future<void> _bringAppToFront() async {
+    if (!Platform.isMacOS) return;
+    try {
+      await Process.run('osascript', [
+        '-e',
+        'tell application "Frostsnap" to activate',
+      ]);
+      // Give the embedder a moment to resume and render a frame before capturing.
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+    } catch (_) {
+      // Foregrounding is a convenience; never fail a screenshot over it.
+    }
   }
 
   // ---- failure diagnostics ----

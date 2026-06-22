@@ -33,8 +33,8 @@ simctl — drive the running sim app/devices through SimHarness.
   simctl devices                              list each device (number/id/connected)
   simctl chain                                print the connected chain order
   simctl set-chain <n>...                     re-cable to exactly these devices, in order
-  simctl connect <n>                          append device n to the chain
-  simctl disconnect <n>                       remove device n (chain re-closes)
+  simctl connect <n>                          plug device n into the tail of the chain
+  simctl disconnect <n>                       disconnect device n + everything downstream
   simctl move-up <n> / move-down <n>          reorder device n within the chain
   simctl hold <x> <y> [ms] [--device N]       device hold-to-confirm at a point
   simctl swipe <x1> <y1> <x2> <y2> [ms] [--device N]   device swipe
@@ -253,6 +253,32 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
 
 // ---- client: run one command against the running daemon ----
 
+/// Connect to the daemon, waiting for it to come up rather than failing instantly: `just
+/// sim-serve` builds + launches the app (cold builds take a while), so a `just sim <cmd>`
+/// fired right after should just block until the control socket is ready — no external
+/// "wait for SIMCTL_READY" polling. Retries until [SIMCTL_WAIT_SECS] (default 300s), then
+/// gives up so a genuine missing-daemon mistake still errors. Announces once so a wait is
+/// visible, not a silent hang.
+Future<Socket> _connectWaiting() async {
+  final addr = InternetAddress(_socketPath, type: InternetAddressType.unix);
+  final waitSecs =
+      int.tryParse(Platform.environment['SIMCTL_WAIT_SECS'] ?? '') ?? 300;
+  final deadline = DateTime.now().add(Duration(seconds: waitSecs));
+  var announced = false;
+  while (true) {
+    try {
+      return await Socket.connect(addr, 0);
+    } on SocketException {
+      if (DateTime.now().isAfter(deadline)) rethrow;
+      if (!announced) {
+        stderr.writeln('simctl: waiting for the sim daemon to come up …');
+        announced = true;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
+  }
+}
+
 Future<void> _client(List<String> args) async {
   final req = _argsToCommand(args);
   if (req == null) {
@@ -261,10 +287,7 @@ Future<void> _client(List<String> args) async {
   }
   final Socket socket;
   try {
-    socket = await Socket.connect(
-      InternetAddress(_socketPath, type: InternetAddressType.unix),
-      0,
-    );
+    socket = await _connectWaiting();
   } catch (e) {
     stderr.writeln(
       'simctl: no daemon at $_socketPath (run `simctl serve`): $e',

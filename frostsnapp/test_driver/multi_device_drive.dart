@@ -8,11 +8,12 @@ import 'sim_harness.dart';
 //   - initial full chain [1,2,3] -> "Continue with 3 devices" (all register over one port);
 //   - setChain([2]) -> only device 2 (connected independently of device 1) -> 1 device;
 //   - setChain([3,1]) -> a head-changing reorder (device 3 is now the head) -> 2 devices;
-//   - disconnect(2) re-closes the chain (the others stay) rather than dropping a subtree.
+//   - disconnect(2) cuts the daisy chain there: device 2 AND everything downstream of it
+//     fall off (a pulled device takes its subtree with it), not a gap-close.
 // runScenario asserts no residue. Run: `just sim-multi-drive`. Needs a display.
 
-// Each re-cable pulses the coordinator port and re-enumerates hop-by-hop over the real
-// ~100ms cadence, so give the count changes a generous settle window.
+// A head change re-enumerates over the coordinator's real ~100ms cadence and a downstream
+// add/remove re-handshakes hop-by-hop, so give the count changes a generous settle window.
 const _settle = Duration(seconds: 90);
 
 void _expectChain(List<int> actual, List<int> want) {
@@ -62,15 +63,21 @@ Future<void> main() async {
     await h.setChain([1, 2, 3]);
     await h.waitFor('Continue with 3 devices', timeout: _settle);
 
-    // Disconnecting a mid-chain device re-closes the chain (the others stay connected).
+    // Disconnecting the mid-chain device cuts the daisy chain there: device 2 AND the
+    // device downstream of it (3) fall off — only the head (1) remains. We assert BOTH the
+    // pool chain config (h.chain() reads the same ChainRouter the tray renders from — its
+    // single source of truth) AND the coordinator's live count, so a stale tray/pool read
+    // can't pass green.
     await h.disconnect(2);
-    _expectChain(await h.chain(), [1, 3]);
-    await h.waitFor('Continue with 2 devices', timeout: _settle);
-    await h.connect(2);
+    _expectChain(await h.chain(), [1]);
+    await h.waitFor('Continue with 1 device', timeout: _settle);
+
+    // Reconnecting plugs devices back into the tail; restore the full chain and count.
+    await h.setChain([1, 2, 3]);
     await h.waitFor('Continue with 3 devices', timeout: _settle);
 
     stdout.writeln(
-      'MULTI_DEVICE_DRIVE_OK: setChain isolation + head-changing reorder + re-close',
+      'MULTI_DEVICE_DRIVE_OK: setChain isolation + head-changing reorder + downstream cut',
     );
   }, deviceCount: 3);
 }

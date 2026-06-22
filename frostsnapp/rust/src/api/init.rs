@@ -115,52 +115,13 @@ impl super::Api {
     ) -> Result<(Coordinator, AppCtx, super::sim::DevicePool)> {
         use super::sim::{sim_firmware_bin, DevicePool, SimDevice, SimFrame};
         use frostsnap_virtual_device::{
-            pipe, ByteChannel, ChainRouter, DeviceChannel, DeviceLink, HostEnd, LinkGate,
-            VirtualDevice, VirtualSerial,
+            ByteChannel, ChainRouter, DeviceChannel, FrameSink, HostEnd, SlotSpec, VirtualSerial,
         };
 
         let app_dir = PathBuf::from_str(&app_dir)?;
         let firmware = sim_firmware_bin();
+        let digest = firmware.digest();
         let count = device_count.max(1) as usize;
-
-        // Each device is wired to the router via an upstream and a downstream pipe (the
-        // device holds the `PipeByteIo`s; the router holds the host ends + a
-        // downstream-detect flag it drives from the current chain order). The router — not
-        // a fixed cabling — decides which devices form the chain and in what order, so any
-        // device can connect independently and the order is reconfigurable at runtime.
-        let mut spawned = Vec::with_capacity(count);
-        let mut frame_sinks = Vec::with_capacity(count);
-        let mut links = Vec::with_capacity(count);
-        for i in 0..count {
-            let frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>> = Arc::new(Mutex::new(None));
-            let on_frame_sink = frames_sink.clone();
-            let (up_io, up_host) = pipe();
-            let (down_io, down_host) = pipe();
-            let downstream_present = LinkGate::new(false);
-            let dev = VirtualDevice::spawn_chained(
-                seed.wrapping_add(i as u64),
-                firmware.digest(),
-                up_io,
-                down_io,
-                Some(downstream_present.clone()),
-                move |width, height, data| {
-                    if let Some(sink) = &*on_frame_sink.lock().unwrap() {
-                        let _ = sink.add(SimFrame {
-                            width,
-                            height,
-                            data,
-                        });
-                    }
-                },
-            );
-            links.push(DeviceLink {
-                up: up_host,
-                down: down_host,
-                downstream_present,
-            });
-            frame_sinks.push(frames_sink);
-            spawned.push(dev);
-        }
 
         // One coordinator port; the router splices it to the head and relays the chain, so
         // the coordinator sees exactly ONE port and learns the rest via the firmware relay.
@@ -174,40 +135,68 @@ impl super::Api {
             UsbSerialManager::new(Box::new(virtual_serial)).with_firmware_bin(firmware);
         let (coordinator, app_state) = load_internal(app_dir.clone(), usb_manager)?;
 
-        // Initial chain = all devices in number order.
+        // One power slot per device, each with its own frame sink. The slot owns what
+        // survives a power-cycle (flash + screen/touch + links); the router boots them,
+        // owns the chain order, and powers devices on/off as chain membership changes — so
+        // any device can connect independently and the order is reconfigurable at runtime.
+        let mut specs = Vec::with_capacity(count);
+        let mut frame_sinks = Vec::with_capacity(count);
+        for i in 0..count {
+            let frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>> = Arc::new(Mutex::new(None));
+            let on_frame_sink = frames_sink.clone();
+            let on_frame: FrameSink = Arc::new(move |width, height, data| {
+                if let Some(sink) = &*on_frame_sink.lock().unwrap() {
+                    let _ = sink.add(SimFrame {
+                        width,
+                        height,
+                        data,
+                    });
+                }
+            });
+            specs.push(SlotSpec {
+                seed: seed.wrapping_add(i as u64),
+                digest,
+                on_frame,
+            });
+            frame_sinks.push(frames_sink);
+        }
+
+        // The router owns the device slots; initial chain = all devices in number order.
         let router = Arc::new(ChainRouter::new(
             coord_host,
             port,
-            links,
+            specs,
             (0..count).collect(),
         ));
 
-        // One device-input channel + Dart handle per device (numbered 1-based), each
-        // holding the shared router so its connect/disconnect edits the one chain config.
+        // One device-input channel + Dart handle per device (numbered 1-based), each wired
+        // to the slot's STABLE handles (so it keeps driving the device across power-cycles)
+        // plus the shared router (so connect/disconnect edits the one chain config).
         let mut channels = Vec::with_capacity(count);
         let mut devices = Vec::with_capacity(count);
-        for (i, (dev, frames_sink)) in spawned.iter().zip(frame_sinks).enumerate() {
+        for (i, frames_sink) in frame_sinks.into_iter().enumerate() {
             let number = (i + 1) as u32;
+            let device_id = router.device_id(i);
             let socket = app_dir.join(format!("device-{number}.sock"));
             channels.push(DeviceChannel::serve(
                 socket,
-                dev.touch.clone(),
-                dev.framebuffer.clone(),
+                router.touch(i),
+                router.framebuffer(i),
                 router.clone(),
                 i,
-                dev.device_id,
+                device_id,
             )?);
             devices.push(SimDevice::new(
                 number,
-                dev.device_id,
-                dev.touch.clone(),
-                dev.framebuffer.clone(),
+                device_id,
+                router.touch(i),
+                router.framebuffer(i),
                 frames_sink,
                 router.clone(),
             ));
         }
 
-        let pool = DevicePool::new(spawned, channels, devices, router);
+        let pool = DevicePool::new(channels, devices, router);
 
         Ok((coordinator, app_state, pool))
     }

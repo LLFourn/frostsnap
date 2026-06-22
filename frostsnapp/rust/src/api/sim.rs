@@ -9,8 +9,7 @@ use flutter_rust_bridge::frb;
 use frostsnap_coordinator::{FirmwareBin, ValidatedFirmwareBin};
 use frostsnap_core::DeviceId;
 use frostsnap_virtual_device::{
-    ChainRouter, DeviceChannel, Point, SharedFramebuffer, SpawnedDevice, TouchEvent, TouchGesture,
-    TouchQueue,
+    ChainRouter, DeviceChannel, Point, SharedFramebuffer, TouchEvent, TouchGesture, TouchQueue,
 };
 use std::sync::{Arc, Mutex};
 
@@ -102,29 +101,27 @@ impl SimDevice {
     }
 }
 
-/// Owns the host virtual device thread(s) and the Dart-facing [`SimDevice`] handles.
-/// Dropping the pool drops the [`SpawnedDevice`]s, which stops + joins their threads.
+/// Owns the host virtual device fleet (via the [`ChainRouter`], which holds each device's
+/// power slot) and the Dart-facing [`SimDevice`] handles. Dropping the pool drops the last
+/// router reference, which stops the forwarding thread and powers off every device.
 #[frb(opaque)]
 pub struct DevicePool {
-    // Kept alive so the device threads keep running; never read directly.
-    _spawned: Vec<SpawnedDevice>,
     // Kept alive so the device-input sockets stay served; dropping the pool stops the
     // accept loops and removes the socket files (teardown leaves no residue).
     _channels: Vec<DeviceChannel>,
     devices: Vec<SimDevice>,
-    // The single source of truth for which devices are connected and in what order.
+    // The single source of truth: owns each device's power slot (flash + peripherals) and
+    // the chain order, where chain membership IS power.
     router: Arc<ChainRouter>,
 }
 
 impl DevicePool {
     pub(crate) fn new(
-        spawned: Vec<SpawnedDevice>,
         channels: Vec<DeviceChannel>,
         devices: Vec<SimDevice>,
         router: Arc<ChainRouter>,
     ) -> Self {
         Self {
-            _spawned: spawned,
             _channels: channels,
             devices,
             router,
@@ -184,22 +181,17 @@ impl SimDevice {
         }
     }
 
-    /// Connect (append to the tail of the chain) or disconnect (remove from the chain)
-    /// this device. Removing a mid-chain device re-closes the chain — the others stay
-    /// connected — so a device connects/disconnects independently of the rest. Use
-    /// [`DevicePool::set_chain`] to also reorder. Drives the sim tray's per-device toggle.
+    /// Connect this device (plug it into the tail of the chain) or disconnect it. Because
+    /// the chain is a daisy chain, disconnecting a device also disconnects everything
+    /// downstream of it (they were reached through it) — see [`ChainRouter::disconnect`].
+    /// Use [`DevicePool::set_chain`] to reorder. Drives the sim tray's per-device toggle.
     #[frb(sync)]
     pub fn set_connected(&self, connected: bool) {
         let index = (self.number - 1) as usize;
-        let mut order = self.router.chain();
-        let present = order.contains(&index);
-        // Editing the current (valid) chain by one in-range index stays valid.
-        if connected && !present {
-            order.push(index);
-            let _ = self.router.set_chain(order);
-        } else if !connected && present {
-            order.retain(|&i| i != index);
-            let _ = self.router.set_chain(order);
+        if connected {
+            self.router.connect(index);
+        } else {
+            self.router.disconnect(index);
         }
     }
 

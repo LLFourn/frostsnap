@@ -58,6 +58,13 @@ impl SharedFramebuffer {
     pub fn take_dirty(&self) -> bool {
         self.0.lock().unwrap().take_dirty()
     }
+
+    /// Paint the whole screen black — the powered-off look. On power-off (sim-13) the
+    /// slot clears the framebuffer and pushes the resulting blank frame so the tray and
+    /// `screen` show a dark device, not the last live frame from before it was unplugged.
+    pub fn clear(&self) {
+        self.0.lock().unwrap().clear(Rgb565::BLACK);
+    }
 }
 
 impl Default for SharedFramebuffer {

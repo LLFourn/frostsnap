@@ -110,6 +110,11 @@ impl LinkGate {
 /// The device-side byte transport. Byte flow is governed externally (by the
 /// [`ChainRouter`](crate::ChainRouter), which drains/feeds the host ends), so the device
 /// end itself just reads its `rx` and writes its `tx`.
+///
+/// Cloneable like [`HostEnd`] (the `ByteChannel`s are `Arc`-backed): the power slot keeps
+/// a copy and clones a fresh one into each newly-spawned device thread on power-on, so a
+/// power-cycle re-wires the rebuilt device to the same link the router already drives.
+#[derive(Clone)]
 pub struct PipeByteIo {
     rx: ByteChannel,
     tx: ByteChannel,

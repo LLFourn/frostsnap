@@ -55,6 +55,14 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
     setState(() {});
   }
 
+  // Connect/disconnect one device. Routes through the device's set_connected so the router
+  // applies the daisy-chain semantics in ONE place: connect plugs into the tail, disconnect
+  // cuts the chain there (the device and everything downstream go to the disconnected pool).
+  void _setConnected(SimDevice? device, bool connected) {
+    device?.setConnected(connected: connected);
+    setState(() {});
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -113,14 +121,15 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
                                 onMoveUp: (n) => _apply(_moved(chain, n, -1)),
                                 onMoveDown: (n) => _apply(_moved(chain, n, 1)),
                                 onDisconnect: (n) =>
-                                    _apply([...chain]..remove(n)),
+                                    _setConnected(byNumber[n], false),
                               ),
                             ),
                             const VerticalDivider(width: 1),
                             Expanded(
                               child: _OffColumn(
                                 disconnected: disconnected,
-                                onConnect: (n) => _apply([...chain, n]),
+                                onConnect: (n) =>
+                                    _setConnected(byNumber[n], true),
                               ),
                             ),
                           ],
@@ -280,16 +289,17 @@ class _OffColumn extends StatelessWidget {
                   children: [
                     for (final device in disconnected)
                       Padding(
+                        key: ValueKey(device.number()),
                         padding: const EdgeInsets.symmetric(
                           horizontal: 8,
-                          vertical: 4,
+                          vertical: 6,
                         ),
-                        child: Card(
-                          margin: EdgeInsets.zero,
-                          color: theme.colorScheme.surfaceContainerHigh,
-                          child: Padding(
-                            padding: const EdgeInsets.fromLTRB(10, 2, 2, 2),
-                            child: Row(
+                        // Mirror the chain cell, but the screen is dark (the device is
+                        // powered off) and not touchable; the action reconnects it.
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
                               children: [
                                 Expanded(
                                   child: Tooltip(
@@ -301,16 +311,21 @@ class _OffColumn extends StatelessWidget {
                                     ),
                                   ),
                                 ),
-                                IconButton(
-                                  iconSize: 18,
-                                  visualDensity: VisualDensity.compact,
-                                  tooltip: 'Connect (add to chain)',
-                                  icon: const Icon(Icons.add_link_rounded),
-                                  onPressed: () => onConnect(device.number()),
+                                _denseIcon(
+                                  Icons.add_link_rounded,
+                                  'Connect (add to chain)',
+                                  () => onConnect(device.number()),
                                 ),
                               ],
                             ),
-                          ),
+                            const SizedBox(height: 2),
+                            Center(
+                              child: _DeviceScreen(
+                                device: device,
+                                interactive: false,
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                   ],
@@ -322,7 +337,7 @@ class _OffColumn extends StatelessWidget {
 }
 
 /// One connected device in the chain: live screen + reorder/disconnect controls.
-class _ChainCell extends StatefulWidget {
+class _ChainCell extends StatelessWidget {
   final SimDevice device;
   final bool isHead;
   final bool isTail;
@@ -340,10 +355,59 @@ class _ChainCell extends StatefulWidget {
   });
 
   @override
-  State<_ChainCell> createState() => _ChainCellState();
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Tooltip(
+                message: device.id(),
+                child: Text(
+                  'Device ${device.number()}',
+                  style: theme.textTheme.labelMedium,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ),
+            _denseIcon(
+              Icons.keyboard_arrow_up_rounded,
+              'Move up',
+              isHead ? null : onMoveUp,
+            ),
+            _denseIcon(
+              Icons.keyboard_arrow_down_rounded,
+              'Move down',
+              isTail ? null : onMoveDown,
+            ),
+            _denseIcon(Icons.link_off_rounded, 'Disconnect', onDisconnect),
+          ],
+        ),
+        const SizedBox(height: 2),
+        Center(child: _DeviceScreen(device: device, interactive: true)),
+      ],
+    );
+  }
 }
 
-class _ChainCellState extends State<_ChainCell> {
+/// A device's live screen, used in both tray columns. Subscribes to the device's frame
+/// stream and paints each frame; the stream replays the current framebuffer on subscribe,
+/// so a powered-off device — whose framebuffer was cleared to black on disconnect (sim-13) —
+/// paints dark immediately. Touchable only when [interactive] (the connected chain cell); a
+/// disconnected device is shown going dark but is not drivable.
+class _DeviceScreen extends StatefulWidget {
+  final SimDevice device;
+  final bool interactive;
+
+  const _DeviceScreen({required this.device, required this.interactive});
+
+  @override
+  State<_DeviceScreen> createState() => _DeviceScreenState();
+}
+
+class _DeviceScreenState extends State<_DeviceScreen> {
   StreamSubscription<SimFrame>? _subscription;
   ui.Image? _image;
 
@@ -393,80 +457,43 @@ class _ChainCellState extends State<_ChainCell> {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     final image = _image;
-    final width = _chainRenderWidth;
-    final height = _chainRenderWidth * _deviceHeight / _deviceWidth;
-    final rendered = Size(width, height);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Expanded(
-              child: Tooltip(
-                message: widget.device.id(),
-                child: Text(
-                  'Device ${widget.device.number()}',
-                  style: theme.textTheme.labelMedium,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            ),
-            _denseIcon(
-              Icons.keyboard_arrow_up_rounded,
-              'Move up',
-              widget.isHead ? null : widget.onMoveUp,
-            ),
-            _denseIcon(
-              Icons.keyboard_arrow_down_rounded,
-              'Move down',
-              widget.isTail ? null : widget.onMoveDown,
-            ),
-            _denseIcon(
-              Icons.link_off_rounded,
-              'Disconnect',
-              widget.onDisconnect,
-            ),
-          ],
-        ),
-        const SizedBox(height: 2),
-        Center(
-          child: Listener(
-            onPointerDown: (e) =>
-                _touchAt(e.localPosition, rendered, liftUp: false),
-            onPointerUp: (e) =>
-                _touchAt(e.localPosition, rendered, liftUp: true),
-            onPointerCancel: (e) =>
-                _touchAt(e.localPosition, rendered, liftUp: true),
-            child: SizedBox(
+    const width = _chainRenderWidth;
+    const height = _chainRenderWidth * _deviceHeight / _deviceWidth;
+    const rendered = Size(width, height);
+    final screen = SizedBox(
+      width: width,
+      height: height,
+      child: image == null
+          ? const ColoredBox(color: Colors.black)
+          : RawImage(
+              image: image,
               width: width,
               height: height,
-              child: image == null
-                  ? const Center(child: CircularProgressIndicator())
-                  : RawImage(
-                      image: image,
-                      width: width,
-                      height: height,
-                      fit: BoxFit.fill,
-                      filterQuality: FilterQuality.none,
-                    ),
+              fit: BoxFit.fill,
+              filterQuality: FilterQuality.none,
             ),
-          ),
-        ),
-      ],
+    );
+    if (!widget.interactive) {
+      return screen;
+    }
+    return Listener(
+      onPointerDown: (e) => _touchAt(e.localPosition, rendered, liftUp: false),
+      onPointerUp: (e) => _touchAt(e.localPosition, rendered, liftUp: true),
+      onPointerCancel: (e) => _touchAt(e.localPosition, rendered, liftUp: true),
+      child: screen,
     );
   }
+}
 
-  Widget _denseIcon(IconData icon, String tooltip, VoidCallback? onPressed) {
-    return IconButton(
-      iconSize: 16,
-      visualDensity: VisualDensity.compact,
-      padding: EdgeInsets.zero,
-      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-      tooltip: tooltip,
-      icon: Icon(icon),
-      onPressed: onPressed,
-    );
-  }
+Widget _denseIcon(IconData icon, String tooltip, VoidCallback? onPressed) {
+  return IconButton(
+    iconSize: 16,
+    visualDensity: VisualDensity.compact,
+    padding: EdgeInsets.zero,
+    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+    tooltip: tooltip,
+    icon: Icon(icon),
+    onPressed: onPressed,
+  );
 }
