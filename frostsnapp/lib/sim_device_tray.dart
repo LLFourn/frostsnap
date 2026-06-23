@@ -156,13 +156,6 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
                                     device: connected[i],
                                     position: i + 1,
                                     isHead: i == 0,
-                                    isTail: i == connected.length - 1,
-                                    onMoveUp: () => _apply(
-                                      _moved(chain, connected[i].number(), -1),
-                                    ),
-                                    onMoveDown: () => _apply(
-                                      _moved(chain, connected[i].number(), 1),
-                                    ),
                                     onDisconnect: () =>
                                         _setConnected(connected[i], false),
                                   ),
@@ -197,18 +190,6 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
         ],
       ),
     );
-  }
-
-  // The chain with [number] shifted by [delta] positions (clamped to the ends).
-  List<int> _moved(List<int> chain, int number, int delta) {
-    final order = [...chain];
-    final i = order.indexOf(number);
-    final j = i + delta;
-    if (i < 0 || j < 0 || j >= order.length) return order;
-    order
-      ..removeAt(i)
-      ..insert(j, number);
-    return order;
   }
 }
 
@@ -702,18 +683,12 @@ class _ChainCard extends StatelessWidget {
   final SimDevice device;
   final int position;
   final bool isHead;
-  final bool isTail;
-  final VoidCallback onMoveUp;
-  final VoidCallback onMoveDown;
   final VoidCallback onDisconnect;
 
   const _ChainCard({
     required this.device,
     required this.position,
     required this.isHead,
-    required this.isTail,
-    required this.onMoveUp,
-    required this.onMoveDown,
     required this.onDisconnect,
   });
 
@@ -723,84 +698,78 @@ class _ChainCard extends StatelessWidget {
     final cs = theme.colorScheme;
     return _Card(
       padding: const EdgeInsets.all(10),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
+      child: Stack(
         children: [
-          _DeviceScreen(
-            device: device,
-            width: _chainScreenWidth,
-            interactive: true,
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              _DeviceScreen(
+                device: device,
+                width: _chainScreenWidth,
+                interactive: true,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    _PositionBadge(position),
-                    const SizedBox(width: 8),
-                    Expanded(
+                    Row(
+                      children: [
+                        _PositionBadge(position),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Device ${device.number()}',
+                            style: theme.textTheme.titleSmall?.copyWith(
+                              fontWeight: FontWeight.w600,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        // room for the corner disconnect button
+                        const SizedBox(width: 28),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    if (isHead)
+                      Row(
+                        children: [
+                          Icon(Icons.usb_rounded, size: 13, color: cs.primary),
+                          const SizedBox(width: 4),
+                          Text(
+                            'coordinator port',
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: cs.primary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    Tooltip(
+                      message: device.id(),
                       child: Text(
-                        'Device ${device.number()}',
-                        style: theme.textTheme.titleSmall?.copyWith(
-                          fontWeight: FontWeight.w600,
-                        ),
+                        device.id(),
+                        maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 4),
-                if (isHead)
-                  Row(
-                    children: [
-                      Icon(Icons.usb_rounded, size: 13, color: cs.primary),
-                      const SizedBox(width: 4),
-                      Text(
-                        'coordinator port',
                         style: theme.textTheme.bodySmall?.copyWith(
-                          color: cs.primary,
+                          fontFamily: 'monospace',
+                          color: cs.onSurfaceVariant,
                         ),
                       ),
-                    ],
-                  ),
-                Tooltip(
-                  message: device.id(),
-                  child: Text(
-                    device.id(),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      fontFamily: 'monospace',
-                      color: cs.onSurfaceVariant,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Row(
-                  children: [
-                    _denseIcon(
-                      Icons.keyboard_arrow_up_rounded,
-                      'Move up',
-                      isHead ? null : onMoveUp,
-                    ),
-                    _denseIcon(
-                      Icons.keyboard_arrow_down_rounded,
-                      'Move down',
-                      isTail ? null : onMoveDown,
-                    ),
-                    const Spacer(),
-                    _denseIcon(
-                      Icons.link_off_rounded,
-                      'Disconnect',
-                      onDisconnect,
-                      color: cs.error,
                     ),
                   ],
                 ),
-              ],
+              ),
+            ],
+          ),
+          Positioned(
+            top: 0,
+            right: 0,
+            child: _denseIcon(
+              Icons.link_off_rounded,
+              'Disconnect',
+              onDisconnect,
+              color: cs.error,
             ),
           ),
         ],
