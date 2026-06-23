@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:frostsnap/copy_feedback.dart';
 import 'package:frostsnap/sim_faucet.dart';
 import 'package:frostsnap/src/rust/api/sim.dart';
 import 'package:frostsnap/wallet.dart' show SatoshiText;
@@ -378,6 +379,7 @@ class _FaucetCardState extends State<_FaucetCard> {
   int? _balanceSat;
   int? _blockHeight;
   String? _electrumUrl;
+  String? _nodeAddress;
   bool _busy = false;
   String? _result;
   bool _resultIsError = false;
@@ -404,12 +406,16 @@ class _FaucetCardState extends State<_FaucetCard> {
       faucet = await SimFaucet.connect(widget.socketPath);
       final balance = await faucet.balanceSat();
       final height = await faucet.blockHeight();
+      // The URL and node address never change, so fetch each once and keep it (faucetAddress()
+      // hands out a fresh address per call, so caching is what keeps the displayed one stable).
       final url = _electrumUrl ?? await faucet.electrumUrl();
+      final nodeAddress = _nodeAddress ?? await faucet.faucetAddress();
       if (mounted) {
         setState(() {
           _balanceSat = balance;
           _blockHeight = height;
           _electrumUrl = url;
+          _nodeAddress = nodeAddress;
         });
       }
     } catch (_) {
@@ -568,6 +574,43 @@ class _FaucetCardState extends State<_FaucetCard> {
                     ?.merge(mono)
                     .copyWith(color: cs.onSurfaceVariant),
               ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          // The regtest node's own wallet address — a handy destination to send test coins back
+          // to. Copyable (faucetAddress() vends a fresh address each call; the displayed one is
+          // cached so it stays put).
+          Row(
+            children: [
+              Icon(
+                Icons.account_balance_rounded,
+                size: 13,
+                color: cs.onSurfaceVariant,
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  _nodeAddress ?? 'node address …',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall
+                      ?.merge(mono)
+                      .copyWith(color: cs.onSurfaceVariant),
+                ),
+              ),
+              if (_nodeAddress != null)
+                IconButton(
+                  iconSize: 15,
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(
+                    minWidth: 28,
+                    minHeight: 28,
+                  ),
+                  tooltip: 'Copy node address',
+                  icon: const Icon(Icons.copy_rounded),
+                  onPressed: () => copyToClipboardQuietly(_nodeAddress!),
+                ),
             ],
           ),
           Padding(

@@ -160,6 +160,26 @@ impl Regtest {
             .map(|h| h.height))
     }
 
+    /// The CONFIRMED balance electrs reports for `address`, in satoshis. Unlike
+    /// [`faucet_balance_sat`](Self::faucet_balance_sat) (the node wallet's balance, which is
+    /// dominated by maturing coinbase and so useless for isolating a single payment), this is
+    /// scoped to one script — a freshly-vended faucet address used purely as a send destination
+    /// shows exactly the received amount once the send confirms. The cross-check for a wallet→node
+    /// send.
+    pub fn electrs_address_balance_sat(&self, address: &str) -> anyhow::Result<u64> {
+        let spk = Address::from_str(address)
+            .context("invalid bitcoin address")?
+            .require_network(Network::Regtest)
+            .context("not a regtest address")?
+            .script_pubkey();
+        Ok(self
+            .electrsd
+            .client
+            .script_get_balance(&spk)
+            .context("electrs script balance")?
+            .confirmed)
+    }
+
     /// Mine `blocks` blocks (coinbase to the faucet), advancing the chain, then wait for
     /// electrs to index up to the new tip so the wallet sees the result promptly.
     pub fn mine(&self, blocks: usize) -> anyhow::Result<()> {

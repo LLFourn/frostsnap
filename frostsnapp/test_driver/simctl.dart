@@ -38,6 +38,7 @@ simctl — drive the running sim app/devices through SimHarness.
   simctl enter <label> <text> [--regex]       focus a field + type (agent-owns-keyboard only)
   simctl wait <label> [--regex]               wait for a label to appear
   simctl exists <label> [--regex]             report whether a label is present
+  simctl clipboard                            print the app clipboard text (e.g. a copied address)
   simctl devices                              list each device (number/id/connected)
   simctl chain                                print the connected chain order
   simctl set-chain <n>...                     re-cable to exactly these devices, in order
@@ -270,6 +271,8 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
           {'ok': true, 'exists': await h.exists(pat('label', 'regex'))},
           false,
         );
+      case 'clipboard':
+        return ({'ok': true, 'text': await h.getClipboard()}, false);
       case 'devices':
         final list = <Map<String, dynamic>>[];
         for (var n = 1; n <= h.devices.length; n++) {
@@ -446,6 +449,8 @@ Map<String, dynamic>? _argsToCommand(List<String> args) {
       return {'cmd': 'wait', 'label': pos[1], 'regex': flag('--regex')};
     case 'exists':
       return {'cmd': 'exists', 'label': pos[1], 'regex': flag('--regex')};
+    case 'clipboard':
+      return {'cmd': 'clipboard'};
     case 'devices':
       return {'cmd': 'devices'};
     case 'chain':

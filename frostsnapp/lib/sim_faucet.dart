@@ -63,6 +63,12 @@ class SimFaucet {
 
   Future<int> balanceSat() async =>
       (await _ok({'cmd': 'balance'}))['sat'] as int;
+
+  /// electrs's CONFIRMED balance for a single [address], in sats. Coinbase-immune (scoped to
+  /// one script), unlike [balanceSat] — use it to cross-check that a send actually landed at a
+  /// freshly-vended node address.
+  Future<int> addressBalanceSat(String address) async =>
+      (await _ok({'cmd': 'address_balance', 'address': address}))['sat'] as int;
   Future<int> blockHeight() async =>
       (await _ok({'cmd': 'height'}))['height'] as int;
   Future<String> faucetAddress() async =>

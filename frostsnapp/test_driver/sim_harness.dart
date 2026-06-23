@@ -426,6 +426,12 @@ class SimHarness {
   Future<String> getClipboard() =>
       driver.runUnsynchronized(() => driver.requestData('clipboard'));
 
+  /// Set the app clipboard (e.g. to seed a recipient address before tapping a Paste button), via
+  /// the sim_app driver data handler. Portable counterpart to [getClipboard] — uses Flutter's
+  /// Clipboard, so scenarios need no platform pasteboard tool (pbcopy/xclip) and stay cross-platform.
+  Future<void> setClipboard(String text) =>
+      driver.runUnsynchronized(() => driver.requestData('setclip:$text'));
+
   Future<void> waitFor(
     Pattern label, {
     Duration timeout = const Duration(seconds: 30),

@@ -322,7 +322,7 @@ class _WalletSendPageState extends State<WalletSendPage> {
                   onPressed: addrController.errorText != null
                       ? null
                       : () => recipientDone(context),
-                  icon: Icon(Icons.done),
+                  icon: Icon(Icons.done, semanticLabel: 'Confirm recipient'),
                 ),
               ],
             ),
@@ -419,7 +419,7 @@ class _WalletSendPageState extends State<WalletSendPage> {
                 ),
                 IconButton.filled(
                   onPressed: amount == null ? null : () => amountDone(context),
-                  icon: Icon(Icons.done),
+                  icon: Icon(Icons.done, semanticLabel: 'Confirm amount'),
                 ),
               ],
             ),

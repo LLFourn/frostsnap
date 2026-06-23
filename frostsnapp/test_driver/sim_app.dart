@@ -2,10 +2,18 @@ import 'package:flutter/services.dart';
 import 'package:flutter_driver/driver_extension.dart';
 import 'package:frostsnap/main.dart' as app;
 
-/// Driver data channel for values the harness can't read off the widget tree by semantic label.
-/// Today: `clipboard` returns the app clipboard (e.g. the wallet receive address after its Copy
-/// button is tapped). Test-only — reads the clipboard, never app internals.
+/// Driver data channel for clipboard access the harness can't get off the widget tree by semantic
+/// label. `clipboard` reads the app clipboard (e.g. a wallet receive address after its Copy
+/// button); `setclip:<text>` writes it (e.g. to seed a recipient before a Paste button) — portably,
+/// via Flutter's own Clipboard, so scenarios don't shell out to pbcopy/xclip. Test-only.
 Future<String> _driverData(String? payload) async {
+  const setClipPrefix = 'setclip:';
+  if (payload != null && payload.startsWith(setClipPrefix)) {
+    await Clipboard.setData(
+      ClipboardData(text: payload.substring(setClipPrefix.length)),
+    );
+    return 'ok';
+  }
   switch (payload) {
     case 'clipboard':
       final data = await Clipboard.getData(Clipboard.kTextPlain);

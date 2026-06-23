@@ -7,6 +7,7 @@
 //!   {"cmd":"electrum_url"}                  -> {"ok":true,"url":"tcp://127.0.0.1:PORT"}
 //!   {"cmd":"faucet_address"}                -> {"ok":true,"address":"bcrt1..."}
 //!   {"cmd":"balance"}                       -> {"ok":true,"sat":N}
+//!   {"cmd":"address_balance","address":"bcrt1.."} -> {"ok":true,"sat":N}  (electrs, confirmed)
 //!   {"cmd":"height"}                         -> {"ok":true,"height":N}
 //!   {"cmd":"fund","address":"bcrt1..","sats":N} -> {"ok":true,"txid":"<hex>"}   (UNCONFIRMED)
 //!   {"cmd":"mine","blocks":N}               -> {"ok":true}
@@ -119,6 +120,16 @@ fn dispatch(line: &str, regtest: &Regtest) -> (Value, bool) {
             json!({"ok": true, "sat": regtest.faucet_balance_sat()?}),
             false,
         )),
+        Some("address_balance") => {
+            let address = req
+                .get("address")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("missing/invalid string field `address`"))?;
+            Ok((
+                json!({"ok": true, "sat": regtest.electrs_address_balance_sat(address)?}),
+                false,
+            ))
+        }
         Some("height") => Ok((json!({"ok": true, "height": regtest.block_height()}), false)),
         Some("mine") => {
             let blocks = req.get("blocks").and_then(Value::as_u64).unwrap_or(1) as usize;
@@ -247,6 +258,15 @@ mod tests {
             confirmed > 0,
             "after mine the tx should confirm in electrs within ~10s, got height {confirmed}"
         );
+        // The per-address (electrs) balance is scoped to `target` and so reflects exactly the
+        // funded amount — coinbase to the faucet's OWN address does not pollute it.
+        assert_eq!(
+            regtest
+                .electrs_address_balance_sat(&target)
+                .expect("address balance"),
+            100_000,
+            "electrs address balance must be exactly the confirmed amount funded to it"
+        );
         assert!(regtest.electrum_url().starts_with("tcp://127.0.0.1:"));
 
         // ---- control socket round-trip ----
@@ -280,6 +300,9 @@ mod tests {
                         r#"{{"cmd":"fund","address":"{target}","sats":50000}}"#
                     )),
                     call(r#"{"cmd":"mine","blocks":2}"#),
+                    call(&format!(
+                        r#"{{"cmd":"address_balance","address":"{target}"}}"#
+                    )),
                     call(r#"{"cmd":"nope"}"#),
                     call(r#"{"cmd":"down"}"#),
                 ]
@@ -311,12 +334,19 @@ mod tests {
         );
         assert_eq!(replies[4]["txid"].as_str().unwrap().len(), 64, "fund txid");
         assert_eq!(replies[5]["ok"], json!(true), "mine");
+        // 100_000 (lib section) + 50_000 (just funded) confirmed to `target`, coinbase-free.
         assert_eq!(
-            replies[6]["ok"],
+            replies[6]["sat"].as_u64(),
+            Some(150_000),
+            "address_balance: {:?}",
+            replies[6]
+        );
+        assert_eq!(
+            replies[7]["ok"],
             json!(false),
             "unknown cmd is a clean error"
         );
-        assert_eq!(replies[7]["down"], json!(true), "down");
+        assert_eq!(replies[8]["down"], json!(true), "down");
 
         let _ = std::fs::remove_file(&sock);
     }
