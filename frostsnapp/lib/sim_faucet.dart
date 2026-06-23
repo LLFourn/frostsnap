@@ -63,6 +63,8 @@ class SimFaucet {
 
   Future<int> balanceSat() async =>
       (await _ok({'cmd': 'balance'}))['sat'] as int;
+  Future<int> blockHeight() async =>
+      (await _ok({'cmd': 'height'}))['height'] as int;
   Future<String> faucetAddress() async =>
       (await _ok({'cmd': 'faucet_address'}))['address'] as String;
   Future<String> electrumUrl() async =>

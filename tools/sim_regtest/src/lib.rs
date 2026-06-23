@@ -106,21 +106,58 @@ impl Regtest {
         Ok(self.bitcoind.client.get_balance()?.into_model()?.0.to_sat())
     }
 
-    /// Send `sats` to `address` (a regtest address string from the app's wallet) and confirm
-    /// it with one mined block so the wallet sees a confirmed receive. Returns the txid.
+    /// Broadcast `sats` to `address` (a regtest address string from the app's wallet) as an
+    /// UNCONFIRMED mempool tx — [`mine`](Self::mine) is the only thing that confirms it — and block
+    /// until electrs has actually indexed it, so the app's electrum sync can see the pending
+    /// receive the moment this returns. Returns the txid.
     pub fn fund(&self, address: &str, sats: u64) -> anyhow::Result<String> {
-        let address = Address::from_str(address)
+        let addr = Address::from_str(address)
             .context("invalid bitcoin address")?
             .require_network(Network::Regtest)
             .context("not a regtest address")?;
         let txid = self
             .bitcoind
             .client
-            .send_to_address(&address, Amount::from_sat(sats))
+            .send_to_address(&addr, Amount::from_sat(sats))
             .context("send to address")?
-            .txid()?;
-        self.mine(1)?;
-        Ok(txid.to_string())
+            .txid()?
+            .to_string();
+        // Broadcast only — leave it UNCONFIRMED in the mempool; `mine` is the only thing that
+        // confirms it. `electrsd.trigger()` merely signals electrs (non-blocking), so poll its
+        // electrum history until the tx is actually indexed — otherwise fund could return before
+        // the app's electrum sync can see the pending receive (racey).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            self.electrsd.trigger().context("trigger electrs")?;
+            if self.electrs_tx_height(address, &txid)?.is_some() {
+                return Ok(txid);
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("electrs did not index the funded tx {txid} within 30s");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// electrs's view of `txid` against `address`: `Some(height)` once electrs has indexed it
+    /// (height `0` is an UNCONFIRMED mempool entry; `> 0` is confirmed at that block), or `None`
+    /// if electrs hasn't picked it up yet. [`fund`](Self::fund) polls this to wait for a broadcast
+    /// to become visible to the app's electrum sync.
+    pub fn electrs_tx_height(&self, address: &str, txid: &str) -> anyhow::Result<Option<i32>> {
+        let spk = Address::from_str(address)
+            .context("invalid bitcoin address")?
+            .require_network(Network::Regtest)
+            .context("not a regtest address")?
+            .script_pubkey();
+        let history = self
+            .electrsd
+            .client
+            .script_get_history(&spk)
+            .context("electrs script history")?;
+        Ok(history
+            .iter()
+            .find(|h| h.tx_hash.to_string() == txid)
+            .map(|h| h.height))
     }
 
     /// Mine `blocks` blocks (coinbase to the faucet), advancing the chain, then wait for
@@ -138,5 +175,11 @@ impl Regtest {
     /// The chain-tip height as seen by ELECTRS (not just bitcoind) — proves electrs is synced.
     pub fn electrs_tip_height(&self) -> anyhow::Result<usize> {
         Ok(self.electrsd.client.block_headers_subscribe()?.height)
+    }
+
+    /// Current chain height (blocks mined; regtest starts at genesis 0 and only advances via
+    /// [`mine`](Self::mine)).
+    pub fn block_height(&self) -> usize {
+        self.tip.load(Ordering::SeqCst)
     }
 }

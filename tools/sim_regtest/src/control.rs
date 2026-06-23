@@ -7,7 +7,8 @@
 //!   {"cmd":"electrum_url"}                  -> {"ok":true,"url":"tcp://127.0.0.1:PORT"}
 //!   {"cmd":"faucet_address"}                -> {"ok":true,"address":"bcrt1..."}
 //!   {"cmd":"balance"}                       -> {"ok":true,"sat":N}
-//!   {"cmd":"fund","address":"bcrt1..","sats":N} -> {"ok":true,"txid":"<hex>"}
+//!   {"cmd":"height"}                         -> {"ok":true,"height":N}
+//!   {"cmd":"fund","address":"bcrt1..","sats":N} -> {"ok":true,"txid":"<hex>"}   (UNCONFIRMED)
 //!   {"cmd":"mine","blocks":N}               -> {"ok":true}
 //!   {"cmd":"ping"}                          -> {"ok":true,"pid":PID}
 //!   {"cmd":"down"}                          -> {"ok":true,"down":true}   (then serve returns)
@@ -118,6 +119,7 @@ fn dispatch(line: &str, regtest: &Regtest) -> (Value, bool) {
             json!({"ok": true, "sat": regtest.faucet_balance_sat()?}),
             false,
         )),
+        Some("height") => Ok((json!({"ok": true, "height": regtest.block_height()}), false)),
         Some("mine") => {
             let blocks = req.get("blocks").and_then(Value::as_u64).unwrap_or(1) as usize;
             regtest.mine(blocks)?;
@@ -204,10 +206,46 @@ mod tests {
             "electrs should be synced to the mined tip"
         );
         let target = regtest.faucet_address().expect("regtest address");
+        // fund broadcasts an UNCONFIRMED tx: it returns a txid but must NOT advance the chain, and
+        // (since fund waits for indexing) electrs must already see it as unconfirmed before mine.
+        let height_before = regtest.block_height();
+        let funded = regtest.fund(&target, 100_000).expect("fund");
+        assert_eq!(funded.len(), 64, "fund returns a hex txid");
         assert_eq!(
-            regtest.fund(&target, 100_000).expect("fund").len(),
-            64,
-            "fund returns a hex txid"
+            regtest.block_height(),
+            height_before,
+            "fund must not mine — the receive stays unconfirmed until mine"
+        );
+        let unconfirmed = regtest
+            .electrs_tx_height(&target, &funded)
+            .expect("electrs query")
+            .expect("funded tx must be visible to electrs before any mine");
+        assert!(
+            unconfirmed <= 0,
+            "funded tx must be unconfirmed in electrs, got height {unconfirmed}"
+        );
+        regtest.mine(1).expect("mine");
+        assert_eq!(
+            regtest.block_height(),
+            height_before + 1,
+            "mine advances the chain height"
+        );
+        // electrs can advance its header tip before its per-script index reflects the new block,
+        // so poll until the tx reads confirmed (height > 0) rather than checking once.
+        let mut confirmed = 0;
+        for _ in 0..50 {
+            confirmed = regtest
+                .electrs_tx_height(&target, &funded)
+                .expect("electrs query")
+                .unwrap_or(0);
+            if confirmed > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(
+            confirmed > 0,
+            "after mine the tx should confirm in electrs within ~10s, got height {confirmed}"
         );
         assert!(regtest.electrum_url().starts_with("tcp://127.0.0.1:"));
 
@@ -237,6 +275,7 @@ mod tests {
                     call(r#"{"cmd":"ping"}"#),
                     call(r#"{"cmd":"electrum_url"}"#),
                     call(r#"{"cmd":"balance"}"#),
+                    call(r#"{"cmd":"height"}"#),
                     call(&format!(
                         r#"{{"cmd":"fund","address":"{target}","sats":50000}}"#
                     )),
@@ -265,14 +304,19 @@ mod tests {
             replies[1]
         );
         assert!(replies[2]["sat"].as_u64().unwrap() > 0, "balance");
-        assert_eq!(replies[3]["txid"].as_str().unwrap().len(), 64, "fund txid");
-        assert_eq!(replies[4]["ok"], json!(true), "mine");
+        assert!(
+            replies[3]["height"].as_u64().unwrap() >= 101,
+            "height: {:?}",
+            replies[3]
+        );
+        assert_eq!(replies[4]["txid"].as_str().unwrap().len(), 64, "fund txid");
+        assert_eq!(replies[5]["ok"], json!(true), "mine");
         assert_eq!(
-            replies[5]["ok"],
+            replies[6]["ok"],
             json!(false),
             "unknown cmd is a clean error"
         );
-        assert_eq!(replies[6]["down"], json!(true), "down");
+        assert_eq!(replies[7]["down"], json!(true), "down");
 
         let _ = std::fs::remove_file(&sock);
     }

@@ -30,7 +30,7 @@ simctl — drive the running sim app/devices through SimHarness.
   simctl test [NAME]                          run e2e driver test <NAME> (a *_drive.dart stem),
                                               or all of them with no NAME
   simctl regtest up|down|status               manage the shared regtest bitcoind+electrs+faucet
-  simctl regtest fund <addr> <sats> | mine [n] | balance | address | url   drive the faucet
+  simctl regtest fund <addr> <sats> | mine [n] | balance | height | address | url   drive the faucet
   simctl clean                                remove sim temp artifacts + reap any backend
                                               (no daemon running)
   simctl tap <label> [--regex]                tap a control by semantic label

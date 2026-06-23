@@ -73,23 +73,30 @@ Future<void> main() async {
       );
     }
 
-    // 3. Fund it from the faucet — the same SimFaucet client `./simctl regtest fund` uses; the
-    //    backend sends and auto-mines one block, so the receive confirms.
+    // 3. Fund the address. fund now broadcasts WITHOUT mining, so the receive must land
+    //    UNCONFIRMED first: the activity tile reads "Receiving…" and shows the +1 BTC amount.
+    //    (Generous timeouts for electrs to index + the app's streaming sync to pick it up.)
     final faucet = await SimFaucet.connect(regtestControlSocket);
     try {
       await faucet.fund(address, _fundSats);
+      await h.waitFor(
+        RegExp('Receiving'),
+        timeout: const Duration(seconds: 90),
+      );
+      await h.waitFor(
+        RegExp(r'1\.00 000 000'),
+        timeout: const Duration(seconds: 20),
+      );
+      // 4. Confirm it by mining one block — the ONLY thing that confirms now.
+      await faucet.mine(1);
     } finally {
       await faucet.close();
     }
 
-    // 4. The app's REAL electrum sync should reflect the received 1 BTC as the wallet balance
-    //    (allow generous time for electrs to index + the streaming client to pick it up).
-    await h.waitFor(
-      RegExp(r'1\.00 000 000'),
-      timeout: const Duration(seconds: 90),
-    );
+    // 5. Once a block confirms it, the same tx flips to "Received" over the real electrum sync.
+    await h.waitFor(RegExp('Received'), timeout: const Duration(seconds: 90));
     stdout.writeln(
-      'REGTEST_RECEIVE_DRIVE_OK: wallet received 1 BTC over real electrum sync',
+      'REGTEST_RECEIVE_DRIVE_OK: receive landed unconfirmed, then confirmed after mine',
     );
   }, withRegtest: true);
 }

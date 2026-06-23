@@ -74,6 +74,12 @@ Future<void> runRegtest(List<String> args) async {
           jsonEncode({'ok': true, 'sat': await faucet.balanceSat()}),
         ),
       );
+    case 'height':
+      await _withFaucet(
+        (faucet) async => stdout.writeln(
+          jsonEncode({'ok': true, 'height': await faucet.blockHeight()}),
+        ),
+      );
     case 'address':
       await _withFaucet(
         (faucet) async => stdout.writeln(
@@ -88,7 +94,8 @@ Future<void> runRegtest(List<String> args) async {
       );
     default:
       stderr.writeln(
-        'regtest: unknown subcommand "$sub" (up|down|status|fund|mine|balance|address|url)',
+        'regtest: unknown subcommand "$sub" '
+        '(up|down|status|fund|mine|balance|height|address|url)',
       );
       exit(2);
   }

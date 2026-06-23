@@ -4,6 +4,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:frostsnap/sim_faucet.dart';
 import 'package:frostsnap/src/rust/api/sim.dart';
+import 'package:frostsnap/wallet.dart' show SatoshiText;
 
 const double _trayWidth = 384;
 
@@ -375,6 +376,7 @@ class _FaucetCardState extends State<_FaucetCard> {
   final _amountController = TextEditingController(text: '1');
   Timer? _poll;
   int? _balanceSat;
+  int? _blockHeight;
   String? _electrumUrl;
   bool _busy = false;
   String? _result;
@@ -401,10 +403,12 @@ class _FaucetCardState extends State<_FaucetCard> {
     try {
       faucet = await SimFaucet.connect(widget.socketPath);
       final balance = await faucet.balanceSat();
+      final height = await faucet.blockHeight();
       final url = _electrumUrl ?? await faucet.electrumUrl();
       if (mounted) {
         setState(() {
           _balanceSat = balance;
+          _blockHeight = height;
           _electrumUrl = url;
         });
       }
@@ -520,26 +524,18 @@ class _FaucetCardState extends State<_FaucetCard> {
             ),
           ),
           const SizedBox(height: 2),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.baseline,
-            textBaseline: TextBaseline.alphabetic,
-            children: [
-              Text(
-                live ? _formatBtc(balance!) : '––––',
-                style: theme.textTheme.headlineSmall
-                    ?.merge(mono)
-                    .copyWith(color: cs.onSurface, fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(width: 6),
-              Text(
-                '₿',
-                style: theme.textTheme.titleMedium?.copyWith(
-                  color: cs.primary,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ],
-          ),
+          // Reuse the app's SatoshiText so the faucet balance is grouped and the ₿ is sized
+          // exactly like every other amount in the app.
+          live
+              ? SatoshiText(
+                  value: balance!,
+                  align: TextAlign.start,
+                  style: theme.textTheme.headlineSmall?.copyWith(
+                    color: cs.onSurface,
+                    fontWeight: FontWeight.w600,
+                  ),
+                )
+              : Text('––––', style: theme.textTheme.headlineSmall?.merge(mono)),
           const SizedBox(height: 8),
           Row(
             children: [
@@ -558,6 +554,19 @@ class _FaucetCardState extends State<_FaucetCard> {
                       ?.merge(mono)
                       .copyWith(color: cs.onSurfaceVariant),
                 ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Icon(Icons.layers_rounded, size: 13, color: cs.onSurfaceVariant),
+              const SizedBox(width: 6),
+              Text(
+                _blockHeight == null ? 'block …' : 'block ${_blockHeight!}',
+                style: theme.textTheme.bodySmall
+                    ?.merge(mono)
+                    .copyWith(color: cs.onSurfaceVariant),
               ),
             ],
           ),
