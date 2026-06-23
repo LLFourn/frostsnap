@@ -9,9 +9,11 @@ use flutter_rust_bridge::frb;
 use frostsnap_coordinator::{FirmwareBin, ValidatedFirmwareBin};
 use frostsnap_core::DeviceId;
 use frostsnap_virtual_device::{
-    ChainRouter, DeviceChannel, Point, SharedFramebuffer, TouchEvent, TouchGesture, TouchQueue,
+    ChainRouter, DeviceChannel, DeviceInput, Point, SharedFramebuffer, TouchEvent, TouchGesture,
+    TouchQueue,
 };
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// A minimal but structurally-valid ESP firmware image, used only so the simulator is
 /// self-contained: real builds embed firmware via `BUNDLE_FIRMWARE`, but the sim has no
@@ -98,6 +100,21 @@ impl SimDevice {
             lift_up,
             gesture: TouchGesture::None,
         });
+    }
+
+    /// Inject a SWIPE from `(x1,y1)` to `(x2,y2)` over `ms`. Runs through the SAME gesture-
+    /// inferring path the device channel/CLI use ([`DeviceInput::swipe`]), so the synthesized
+    /// `SlideUp`/`SlideDown` is exactly what the CST816S would report and the widget tree's
+    /// vertical-drag handling fires. NOT `#[frb(sync)]`: it emits intermediate move events across
+    /// `ms` of wall-clock, so it runs off the UI isolate.
+    pub fn swipe(&self, x1: u16, y1: u16, x2: u16, y2: u16, ms: u32) {
+        DeviceInput::new(self.touch.clone()).swipe(
+            x1 as i32,
+            y1 as i32,
+            x2 as i32,
+            y2 as i32,
+            Duration::from_millis(ms as u64),
+        );
     }
 }
 

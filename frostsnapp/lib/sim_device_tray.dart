@@ -906,6 +906,9 @@ class _DeviceScreen extends StatefulWidget {
 class _DeviceScreenState extends State<_DeviceScreen> {
   StreamSubscription<SimFrame>? _subscription;
   ui.Image? _image;
+  // Device-coord start of the current press — lets pointer-up tell a tap/hold from a drag (swipe).
+  int? _downX;
+  int? _downY;
 
   @override
   void initState() {
@@ -932,7 +935,7 @@ class _DeviceScreenState extends State<_DeviceScreen> {
     );
   }
 
-  void _touchAt(Offset local, Size rendered, {required bool liftUp}) {
+  (int, int) _deviceCoords(Offset local, Size rendered) {
     final x = (local.dx / rendered.width * _deviceWidth).round().clamp(
       0,
       _deviceWidth - 1,
@@ -941,7 +944,43 @@ class _DeviceScreenState extends State<_DeviceScreen> {
       0,
       _deviceHeight - 1,
     );
-    widget.device.touch(x: x, y: y, liftUp: liftUp);
+    return (x, y);
+  }
+
+  void _pointerDown(Offset local, Size rendered) {
+    final (x, y) = _deviceCoords(local, rendered);
+    _downX = x;
+    _downY = y;
+    widget.device.touch(x: x, y: y, liftUp: false);
+  }
+
+  // A predominantly VERTICAL drag past the threshold becomes a swipe (the virtual device infers
+  // SlideUp/SlideDown — the same path `./simctl swipe` uses). Horizontal or near-stationary
+  // movement finishes the original press as a tap/hold (a horizontal swipe would toggle the
+  // device's debug log, which is out of scope here).
+  void _pointerUp(Offset local, Size rendered) {
+    final (x, y) = _deviceCoords(local, rendered);
+    final sx = _downX;
+    final sy = _downY;
+    _downX = null;
+    _downY = null;
+    const dragThreshold = 12;
+    if (sx != null && sy != null) {
+      final dx = (x - sx).abs();
+      final dy = (y - sy).abs();
+      if (dy > dragThreshold && dy >= dx) {
+        widget.device.swipe(x1: sx, y1: sy, x2: x, y2: y, ms: 250);
+        return;
+      }
+    }
+    widget.device.touch(x: x, y: y, liftUp: true);
+  }
+
+  void _pointerCancel(Offset local, Size rendered) {
+    _downX = null;
+    _downY = null;
+    final (x, y) = _deviceCoords(local, rendered);
+    widget.device.touch(x: x, y: y, liftUp: true);
   }
 
   @override
@@ -977,9 +1016,9 @@ class _DeviceScreenState extends State<_DeviceScreen> {
       return screen;
     }
     return Listener(
-      onPointerDown: (e) => _touchAt(e.localPosition, rendered, liftUp: false),
-      onPointerUp: (e) => _touchAt(e.localPosition, rendered, liftUp: true),
-      onPointerCancel: (e) => _touchAt(e.localPosition, rendered, liftUp: true),
+      onPointerDown: (e) => _pointerDown(e.localPosition, rendered),
+      onPointerUp: (e) => _pointerUp(e.localPosition, rendered),
+      onPointerCancel: (e) => _pointerCancel(e.localPosition, rendered),
       child: screen,
     );
   }
