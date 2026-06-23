@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:frostsnap/animated_gradient_card.dart';
+import 'package:frostsnap/contexts.dart';
 import 'package:frostsnap/device_action_fullscreen_dialog.dart';
 import 'package:frostsnap/device_action_upgrade.dart';
 import 'package:frostsnap/hex.dart';
@@ -39,7 +40,9 @@ class WalletCreateException implements Exception {
 }
 
 class WalletCreateForm {
-  BitcoinNetwork network = BitcoinNetwork.bitcoin;
+  WalletCreateForm({this.network = BitcoinNetwork.bitcoin});
+
+  BitcoinNetwork network;
   String? name;
 
   final Set<DeviceId> selectedDevices = deviceIdSet([]);
@@ -81,7 +84,7 @@ Set<DeviceId> duplicateNamedDeviceIdsAmong(
 
 class WalletCreateController extends ChangeNotifier {
   WalletCreateStep _step = WalletCreateStep.values.first;
-  final WalletCreateForm _form = WalletCreateForm();
+  final WalletCreateForm _form;
   final _nameController = TextEditingController();
   String? _nameError;
   late final StreamSubscription _deviceListSub;
@@ -94,7 +97,9 @@ class WalletCreateController extends ChangeNotifier {
   FullscreenActionDialogController? _keygenController;
   AccessStructureRef? _asRef;
 
-  WalletCreateController() {
+  WalletCreateController({
+    BitcoinNetwork defaultNetwork = BitcoinNetwork.bitcoin,
+  }) : _form = WalletCreateForm(network: defaultNetwork) {
     {
       bool firstRun = true;
       _nameController.addListener(() {
@@ -592,7 +597,14 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
   @override
   void initState() {
     super.initState();
-    _controller = WalletCreateController();
+    // Non-subscribing read (FrostsnapContext never changes): the composition root decides the
+    // default network, keeping the sim/regtest branch out of this flow.
+    final defaultNetwork =
+        context
+            .getInheritedWidgetOfExactType<FrostsnapContext>()
+            ?.defaultNetwork ??
+        BitcoinNetwork.bitcoin;
+    _controller = WalletCreateController(defaultNetwork: defaultNetwork);
     _controller.addListener(() => mounted ? setState(() {}) : null);
   }
 

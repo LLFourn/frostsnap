@@ -19,6 +19,17 @@ late HostPortHandler? globalHostPortHandler;
 /// debug device tray. Null on a normal build.
 DevicePool? simDevicePool;
 
+/// The regtest electrs URL the harness wired in (`--dart-define=SIM_REGTEST_ELECTRUM_URL`), set
+/// on the SIM entrypoint when a faucet backend is live. Its presence is the "regtest active"
+/// signal: new sim wallets default to Regtest (so faucet funds land) and the tray shows the
+/// faucet column. Null on a normal build or an offline sim.
+String? simRegtestElectrumUrl;
+
+/// Path to the `sim_regtest` faucet control socket (`--dart-define=SIM_REGTEST_CONTROL_SOCKET`),
+/// set alongside [simRegtestElectrumUrl]. The sim tray's "Test BTC" column drives the faucet
+/// (balance/mine/fund) over this socket via [SimFaucet]. Null on a normal build or offline sim.
+String? simRegtestControlSocket;
+
 final nameInputFormatter = TextInputFormatter.withFunction((
   oldValue,
   newValue,

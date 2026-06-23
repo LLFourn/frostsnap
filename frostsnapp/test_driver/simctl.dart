@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'regtest.dart';
 import 'sim_harness.dart';
 
 // simctl: interactively drive the running sim app + devices through the SAME SimHarness
@@ -25,9 +26,13 @@ String get _socketPath => '${simTmpRoot().path}/control.sock';
 
 const _usage = '''
 simctl — drive the running sim app/devices through SimHarness.
-  simctl serve [--count N] [--platform <d>] [--agent-owns-keyboard]   launch app + listen
+  simctl serve [--count N] [--platform <d>] [--agent-owns-keyboard] [--regtest]   launch app + listen
   simctl test [NAME]                          run e2e driver test <NAME> (a *_drive.dart stem),
                                               or all of them with no NAME
+  simctl regtest up|down|status               manage the shared regtest bitcoind+electrs+faucet
+  simctl regtest fund <addr> <sats> | mine [n] | balance | address | url   drive the faucet
+  simctl clean                                remove sim temp artifacts + reap any backend
+                                              (no daemon running)
   simctl tap <label> [--regex]                tap a control by semantic label
   simctl tap-until <label> <expect> [--regex] [--regex-expect]
   simctl enter <label> <text> [--regex]       focus a field + type (agent-owns-keyboard only)
@@ -59,8 +64,43 @@ Future<void> main(List<String> args) async {
     await _serve(args.skip(1).toList());
   } else if (args.first == 'test') {
     await _runTests(args.skip(1).toList());
+  } else if (args.first == 'regtest') {
+    await runRegtest(args.skip(1).toList());
+  } else if (args.first == 'clean') {
+    await _clean();
   } else {
     await _client(args);
+  }
+}
+
+/// Remove all sim temp artifacts under the session root (disposable app dirs, screenshots, a
+/// stopped backend's files) and reap any running regtest backend — for clearing residue left by
+/// a killed session. Refuses while a serve daemon is live so it can't nuke an active session;
+/// `./simctl down` first.
+Future<void> _clean() async {
+  if (await _daemonAlive()) {
+    stderr.writeln(
+      'simctl: a serve daemon is running — run `./simctl down` first',
+    );
+    exit(1);
+  }
+  await stopRegtestBackend();
+  final root = simTmpRoot();
+  if (await root.exists()) await root.delete(recursive: true);
+  stdout.writeln(jsonEncode({'ok': true, 'cleaned': root.path}));
+}
+
+/// Whether a `serve` daemon is listening on the control socket.
+Future<bool> _daemonAlive() async {
+  try {
+    final socket = await Socket.connect(
+      InternetAddress(_socketPath, type: InternetAddressType.unix),
+      0,
+    ).timeout(const Duration(seconds: 1));
+    socket.destroy();
+    return true;
+  } catch (_) {
+    return false;
   }
 }
 
@@ -127,10 +167,15 @@ Future<void> _serve(List<String> args) async {
     if (args[i] == '--count') count = int.parse(args[i + 1]);
   }
 
+  // Spawn the regtest faucet when asked (`--regtest`), or attach to one already running so the
+  // wallet can receive — otherwise stay offline (no surprise bitcoind/electrs spawn).
+  final withRegtest = args.contains('--regtest') || await regtestLive();
+
   final harness = await SimHarness.launch(
     deviceCount: count,
     flutterDevice: platform,
     agentOwnsKeyboard: agentOwnsKeyboard,
+    withRegtest: withRegtest,
   );
 
   try {
@@ -291,9 +336,11 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
         await h.device(dn).screen(req['path'] as String);
         return ({'ok': true, 'path': req['path']}, false);
       case 'shot':
-        final path =
-            (req['path'] as String?) ?? '${simTmpRoot().path}/shot.png';
-        await h.screenshot('manual', keep: path);
+        // No path -> the session dir (cleaned up on teardown); an explicit path is kept.
+        final reqPath = req['path'] as String?;
+        final path = reqPath == null
+            ? await h.screenshot('manual')
+            : await h.screenshot('manual', keep: reqPath);
         return ({'ok': true, 'path': path}, false);
       case 'down':
         return ({'ok': true, 'down': true}, true);

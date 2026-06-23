@@ -24,8 +24,10 @@ import 'package:frostsnap/theme.dart';
 import 'package:frostsnap/wallet.dart';
 import 'package:frostsnap/wallet_list_controller.dart';
 import 'package:frostsnap/src/rust/api.dart';
+import 'package:frostsnap/src/rust/api/bitcoin.dart';
 import 'package:frostsnap/src/rust/api/device_list.dart';
 import 'package:frostsnap/src/rust/api/init.dart';
+import 'package:frostsnap/src/rust/api/settings.dart';
 import 'package:frostsnap/src/rust/api/log.dart';
 import 'package:frostsnap/src/rust/frb_generated.dart';
 
@@ -79,6 +81,31 @@ Future<void> main() async {
       appCtx = appCtx_;
       simDevicePool = pool_;
       globalHostPortHandler = null;
+      // The harness seeds its local electrs URL here (regtest only); point the regtest wallet
+      // at it via the existing setter so "receive bitcoin" syncs over the sim's own node. No
+      // effect on other networks, and absent (offline sim) when the harness didn't start one.
+      const simRegtestElectrum = String.fromEnvironment(
+        'SIM_REGTEST_ELECTRUM_URL',
+      );
+      const simRegtestControl = String.fromEnvironment(
+        'SIM_REGTEST_CONTROL_SOCKET',
+      );
+      if (simRegtestElectrum.isNotEmpty) {
+        simRegtestElectrumUrl = simRegtestElectrum;
+        simRegtestControlSocket = simRegtestControl.isEmpty
+            ? null
+            : simRegtestControl;
+        final regtest = BitcoinNetwork.fromString(string: 'regtest')!;
+        await appCtx_.settings.setElectrumServers(
+          network: regtest,
+          primary: simRegtestElectrum,
+          backup: simRegtestElectrum,
+        );
+        await appCtx_.settings.setElectrumEnabled(
+          network: regtest,
+          enabled: ElectrumEnabled.primaryOnly,
+        );
+      }
     } else if (Platform.isAndroid) {
       final (coord_, appCtx_, ffiserial) = await api.loadHostHandlesSerial(
         appDir: appDirPath,
@@ -172,6 +199,9 @@ Widget buildMainWidget(AppCtx appCtx, Stream<String> logStream) {
   return FrostsnapContext(
     appCtx: appCtx,
     logStream: logStream,
+    defaultNetwork: simRegtestElectrumUrl != null
+        ? BitcoinNetwork.regtest
+        : BitcoinNetwork.bitcoin,
     child: SettingsContext(
       settings: appCtx.settings,
       child: SuperWalletContext(appCtx: appCtx, child: MyApp()),
@@ -247,7 +277,10 @@ class _MyAppState extends State<MyApp> {
               textDirection: TextDirection.ltr,
               children: [
                 Expanded(child: app),
-                SimDeviceTray(pool: pool),
+                SimDeviceTray(
+                  pool: pool,
+                  regtestControlSocket: simRegtestControlSocket,
+                ),
               ],
             );
           },

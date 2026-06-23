@@ -17,6 +17,9 @@ import 'dart:io';
 
 import 'package:flutter_driver/flutter_driver.dart';
 
+import 'regtest.dart'
+    show ensureRegtestBackend, stopRegtestBackend, regtestControlSocket;
+
 /// Root for all sim temp artifacts — disposable app dirs, the simctl control socket,
 /// ad-hoc screenshots — grouped under one folder instead of loose in the system temp
 /// root. Created on demand.
@@ -141,12 +144,17 @@ class SimHarness {
   final List<String> _appLog;
   int _shotSeq = 0;
 
+  /// True if THIS session spawned the regtest backend (so tearDown stops it). False when it
+  /// attached to a pre-existing one (e.g. started by `./simctl regtest up`) — left running.
+  final bool _ownsRegtest;
+
   SimHarness._(
     this._appProcess,
     this.appDir,
     this.driver,
     this.devices,
     this._appLog,
+    this._ownsRegtest,
   );
 
   /// The device-input channel for device [number] (1-based; defaults to device 1).
@@ -165,10 +173,12 @@ class SimHarness {
     Future<void> Function(SimHarness h) body, {
     int deviceCount = 1,
     String flutterDevice = 'macos',
+    bool withRegtest = false,
   }) async {
     final h = await SimHarness.launch(
       deviceCount: deviceCount,
       flutterDevice: flutterDevice,
+      withRegtest: withRegtest,
     );
     try {
       await body(h);
@@ -194,7 +204,19 @@ class SimHarness {
     int deviceCount = 1,
     String flutterDevice = 'macos',
     bool agentOwnsKeyboard = true,
+    bool withRegtest = false,
   }) async {
+    // Bring up (or attach to) the shared regtest backend BEFORE the app, so its electrum URL
+    // can be seeded into the app at launch. `owned` => we spawned it and must stop it on
+    // teardown; attaching to a pre-existing one leaves it running.
+    String? regtestElectrumUrl;
+    var ownsRegtest = false;
+    if (withRegtest) {
+      final backend = await ensureRegtestBackend();
+      regtestElectrumUrl = backend.url;
+      ownsRegtest = backend.owned;
+    }
+
     final appDir = await simTmpRoot().createTemp('app-');
     // Ring buffer of recent app stdout/stderr, dumped into the failure artifacts.
     final appLog = <String>[];
@@ -221,6 +243,12 @@ class SimHarness {
         '--dart-define=SIM_APP_DIR=${appDir.path}',
         '--dart-define=SIM_DEVICE_COUNT=$deviceCount',
         '--dart-define=SIM_AGENT_OWNS_KEYBOARD=$agentOwnsKeyboard',
+        // main.dart points the regtest wallet at this electrs (regtest-only); empty = offline.
+        if (regtestElectrumUrl != null)
+          '--dart-define=SIM_REGTEST_ELECTRUM_URL=$regtestElectrumUrl',
+        // ...and gives the tray's "Test BTC" column the faucet control socket to drive.
+        if (regtestElectrumUrl != null)
+          '--dart-define=SIM_REGTEST_CONTROL_SOCKET=$regtestControlSocket',
       ]);
 
       // Capture the VM service URL from the run output (surface logs on stderr).
@@ -265,7 +293,7 @@ class SimHarness {
         channels.add(await SimDeviceChannel.connect(socketPath));
       }
 
-      return SimHarness._(proc, appDir, driver, channels, appLog);
+      return SimHarness._(proc, appDir, driver, channels, appLog, ownsRegtest);
     } catch (_) {
       // Tear down whatever got created, then rethrow the original setup error.
       await _cleanup(
@@ -273,6 +301,7 @@ class SimHarness {
         driver: driver,
         proc: proc,
         appDir: appDir,
+        ownsRegtest: ownsRegtest,
       );
       rethrow;
     }
@@ -285,6 +314,7 @@ class SimHarness {
     FlutterDriver? driver,
     Process? proc,
     Directory? appDir,
+    bool ownsRegtest = false,
   }) async {
     Object? firstError;
     Future<void> guard(Future<void> Function() step) async {
@@ -295,6 +325,8 @@ class SimHarness {
       }
     }
 
+    // Stop the regtest backend only if we started it; an attached (pre-existing) one stays up.
+    if (ownsRegtest) await guard(stopRegtestBackend);
     if (channels != null) {
       for (final channel in channels) {
         await guard(channel.close);
@@ -388,6 +420,11 @@ class SimHarness {
   Future<String> getText(Pattern label) => driver.runUnsynchronized(
     () => driver.getText(find.bySemanticsLabel(label), timeout: _cmdTimeout),
   );
+
+  /// The app clipboard, via the sim_app driver data handler — e.g. to read a wallet receive
+  /// address after tapping its Copy button (the address Text has no stable label to target).
+  Future<String> getClipboard() =>
+      driver.runUnsynchronized(() => driver.requestData('clipboard'));
 
   Future<void> waitFor(
     Pattern label, {
@@ -541,6 +578,7 @@ class SimHarness {
       driver: driver,
       proc: _appProcess,
       appDir: appDir,
+      ownsRegtest: _ownsRegtest,
     );
     if (err != null) throw err;
   }

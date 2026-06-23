@@ -15,6 +15,7 @@ members = [
     "tools/widget_simulator",
     "tools/stack_check",
     "tools/virtual_device",
+    "tools/sim_regtest",
     "cst816s",
     "frostsnapp/desktop_camera",
     "macros",

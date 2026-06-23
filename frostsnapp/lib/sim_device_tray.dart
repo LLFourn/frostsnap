@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:frostsnap/sim_faucet.dart';
 import 'package:frostsnap/src/rust/api/sim.dart';
 
 const double _trayWidth = 320;
@@ -22,7 +23,15 @@ const double _chainRenderWidth = 132;
 class SimDeviceTray extends StatefulWidget {
   final DevicePool pool;
 
-  const SimDeviceTray({super.key, required this.pool});
+  /// The faucet control socket, when the session was launched with a regtest backend; enables
+  /// the "Test BTC" column. Null in an offline sim — the column is hidden.
+  final String? regtestControlSocket;
+
+  const SimDeviceTray({
+    super.key,
+    required this.pool,
+    this.regtestControlSocket,
+  });
 
   @override
   State<SimDeviceTray> createState() => _SimDeviceTrayState();
@@ -111,6 +120,10 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
                         ),
                       ),
                       const Divider(height: 1),
+                      if (widget.regtestControlSocket != null) ...[
+                        _FaucetPanel(socketPath: widget.regtestControlSocket!),
+                        const Divider(height: 1),
+                      ],
                       Expanded(
                         child: Row(
                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -485,6 +498,206 @@ class _DeviceScreenState extends State<_DeviceScreen> {
     );
   }
 }
+
+/// The "Test BTC" column: drives the regtest faucet (sim-only, shown when the session has a
+/// backend). Shows the faucet's spendable balance and the electrum URL the wallet syncs against,
+/// mines blocks, and sends test coins to ANY address you paste in (copy a receive address from
+/// the wallet, paste it here, Fund) — deliberately wallet-agnostic, so the tray needs no
+/// knowledge of the open wallet. Each action opens a short-lived [SimFaucet] connection because
+/// the backend serves one client at a time (a held socket would starve `./simctl`).
+class _FaucetPanel extends StatefulWidget {
+  final String socketPath;
+
+  const _FaucetPanel({required this.socketPath});
+
+  @override
+  State<_FaucetPanel> createState() => _FaucetPanelState();
+}
+
+class _FaucetPanelState extends State<_FaucetPanel> {
+  final _addressController = TextEditingController();
+  final _amountController = TextEditingController(text: '1');
+  Timer? _poll;
+  int? _balanceSat;
+  String? _electrumUrl;
+  bool _busy = false;
+  String? _fundResult;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+    _poll = Timer.periodic(const Duration(seconds: 2), (_) => _refresh());
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    _addressController.dispose();
+    _amountController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _refresh() async {
+    if (_busy) return;
+    SimFaucet? faucet;
+    try {
+      faucet = await SimFaucet.connect(widget.socketPath);
+      final balance = await faucet.balanceSat();
+      // The URL never changes, so fetch it once and keep it.
+      final url = _electrumUrl ?? await faucet.electrumUrl();
+      if (mounted) {
+        setState(() {
+          _balanceSat = balance;
+          _electrumUrl = url;
+        });
+      }
+    } catch (_) {
+      // Backend not (yet) reachable; keep the last-known values rather than flicker.
+    } finally {
+      await faucet?.close();
+    }
+  }
+
+  /// Run [action] against a short-lived faucet connection, surfacing its outcome (or error) in
+  /// the panel and refreshing the balance after.
+  Future<void> _run(Future<String> Function(SimFaucet) action) async {
+    setState(() {
+      _busy = true;
+      _fundResult = null;
+    });
+    SimFaucet? faucet;
+    String result;
+    try {
+      faucet = await SimFaucet.connect(widget.socketPath);
+      result = await action(faucet);
+    } catch (e) {
+      result = '$e';
+    } finally {
+      await faucet?.close();
+    }
+    if (mounted) {
+      setState(() {
+        _busy = false;
+        _fundResult = result;
+      });
+    }
+    await _refresh();
+  }
+
+  Future<void> _mine() => _run((f) async {
+    await f.mine(1);
+    return 'mined 1 block';
+  });
+
+  Future<void> _fund() {
+    final address = _addressController.text.trim();
+    final btc = double.tryParse(_amountController.text.trim());
+    if (address.isEmpty) {
+      setState(() => _fundResult = 'enter an address');
+      return Future.value();
+    }
+    if (btc == null || btc <= 0) {
+      setState(() => _fundResult = 'enter a positive amount');
+      return Future.value();
+    }
+    final sats = (btc * 100000000).round();
+    return _run((f) async {
+      final txid = await f.fund(address, sats);
+      return 'sent ${_formatBtc(sats)} BTC · ${txid.substring(0, 12)}…';
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final balance = _balanceSat;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text('Test BTC', style: theme.textTheme.labelLarge),
+              ),
+              TextButton.icon(
+                onPressed: _busy ? null : _mine,
+                icon: const Icon(Icons.add_box_rounded, size: 16),
+                label: const Text('Mine'),
+              ),
+            ],
+          ),
+          Text(
+            balance == null
+                ? 'Faucet: connecting…'
+                : 'Faucet: ${_formatBtc(balance)} BTC',
+            style: theme.textTheme.bodyMedium,
+          ),
+          if (_electrumUrl != null)
+            Text(
+              _electrumUrl!,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+              overflow: TextOverflow.ellipsis,
+            ),
+          const SizedBox(height: 6),
+          TextField(
+            controller: _addressController,
+            style: theme.textTheme.bodySmall,
+            decoration: const InputDecoration(
+              labelText: 'Fund address',
+              hintText: 'paste a receive address',
+              isDense: true,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              SizedBox(
+                width: 96,
+                child: TextField(
+                  controller: _amountController,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  style: theme.textTheme.bodySmall,
+                  decoration: const InputDecoration(
+                    labelText: 'Amount (BTC)',
+                    isDense: true,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: FilledButton(
+                  onPressed: _busy ? null : _fund,
+                  child: const Text('Fund'),
+                ),
+              ),
+            ],
+          ),
+          if (_fundResult != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                _fundResult!,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Sats as a fixed-precision BTC string (8 decimals collapsed to 4 for the tray).
+String _formatBtc(int sats) => (sats / 100000000).toStringAsFixed(4);
 
 Widget _denseIcon(IconData icon, String tooltip, VoidCallback? onPressed) {
   return IconButton(

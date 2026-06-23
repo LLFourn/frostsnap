@@ -1,5 +1,19 @@
+import 'package:flutter/services.dart';
 import 'package:flutter_driver/driver_extension.dart';
 import 'package:frostsnap/main.dart' as app;
+
+/// Driver data channel for values the harness can't read off the widget tree by semantic label.
+/// Today: `clipboard` returns the app clipboard (e.g. the wallet receive address after its Copy
+/// button is tapped). Test-only — reads the clipboard, never app internals.
+Future<String> _driverData(String? payload) async {
+  switch (payload) {
+    case 'clipboard':
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      return data?.text ?? '';
+    default:
+      throw 'sim_app: unknown driver data request "$payload"';
+  }
+}
 
 /// Instrumented SIM entrypoint (the app channel of the sim-8 harness).
 ///
@@ -20,6 +34,9 @@ Future<void> main() {
     'SIM_AGENT_OWNS_KEYBOARD',
     defaultValue: true,
   );
-  enableFlutterDriverExtension(enableTextEntryEmulation: agentOwnsKeyboard);
+  enableFlutterDriverExtension(
+    handler: _driverData,
+    enableTextEntryEmulation: agentOwnsKeyboard,
+  );
   return app.main();
 }
