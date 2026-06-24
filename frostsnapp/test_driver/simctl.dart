@@ -26,7 +26,8 @@ String get _socketPath => '${simTmpRoot().path}/control.sock';
 
 const _usage = '''
 simctl — drive the running sim app/devices through SimHarness.
-  simctl serve [--count N] [--platform <d>] [--agent-owns-keyboard] [--regtest]   launch app + listen
+  simctl serve [--count N] [--platform <d>] [--agent-owns-keyboard] [--no-regtest]   launch app + listen
+                                              (regtest is ON by default; --no-regtest = offline sim)
   simctl up [serve flags]                     idempotently bring the sim up + return once ready
                                               (no backgrounding/polling; reuses a matching live
                                               daemon, refuses a mismatched one — `down` first)
@@ -123,11 +124,10 @@ Future<void> _up(List<String> args) async {
   for (var i = 0; i < args.length - 1; i++) {
     if (args[i] == '--count') count = int.parse(args[i + 1]);
   }
-  // The shape `serve` WOULD launch — mirror its `withRegtest = --regtest || regtestLive()` so the
-  // exact compatibility check below stays consistent with what a fresh launch actually produces.
-  // (Otherwise a plain `up` against an already-live persistent backend launches a regtest-shaped
-  // daemon, and a second identical `up` then wrongly reports a mismatch.)
-  final wantRegtest = args.contains('--regtest') || await regtestLive();
+  // The shape `serve` WOULD launch — mirror its `withRegtest = !--no-regtest` so the exact
+  // compatibility check below stays consistent with what a fresh launch actually produces.
+  // Regtest is ON by default (the common case is a wallet that can receive); --no-regtest opts out.
+  final wantRegtest = !args.contains('--no-regtest');
   final wantKeyboard = args.contains('--agent-owns-keyboard');
 
   if (await _daemonAlive()) {
@@ -277,9 +277,9 @@ Future<void> _serve(List<String> args) async {
     if (args[i] == '--count') count = int.parse(args[i + 1]);
   }
 
-  // Spawn the regtest faucet when asked (`--regtest`), or attach to one already running so the
-  // wallet can receive — otherwise stay offline (no surprise bitcoind/electrs spawn).
-  final withRegtest = args.contains('--regtest') || await regtestLive();
+  // Spawn (or attach to) the regtest faucet by default so the wallet can receive; `--no-regtest`
+  // keeps the sim offline (no bitcoind/electrs).
+  final withRegtest = !args.contains('--no-regtest');
 
   // SELF-LOG: mirror our + the app's output to the session logfile, so a detached `up`-launched
   // daemon still produces a readable log without the caller redirecting stdout. `simTmpRoot()`
