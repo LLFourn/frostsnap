@@ -289,18 +289,10 @@ class SimHarness {
       // without an a11y client otherwise).
       await driver.setSemantics(true);
 
-      // load_sim creates device-<n>.sock (1-based) during startup; wait for each
-      // before connecting.
+      // load_sim creates device-<n>.sock (1-based) during startup; wait for each before
+      // connecting. (Runtime-added devices are picked up later by [ensureDevices].)
       for (var n = 1; n <= deviceCount; n++) {
-        final socketPath = '${appDir.path}/device-$n.sock';
-        final deadline = DateTime.now().add(const Duration(seconds: 30));
-        while (!await File(socketPath).exists()) {
-          if (DateTime.now().isAfter(deadline)) {
-            throw StateError('device socket never appeared at $socketPath');
-          }
-          await Future.delayed(const Duration(milliseconds: 100));
-        }
-        channels.add(await SimDeviceChannel.connect(socketPath));
+        channels.add(await _connectChannel(appDir, n));
       }
 
       return SimHarness._(proc, appDir, driver, channels, appLog);
@@ -314,6 +306,56 @@ class SimHarness {
       );
       rethrow;
     }
+  }
+
+  /// Wait for `device-<number>.sock` (created by `load_sim` at startup or `add_device` at
+  /// runtime) to appear, then connect a channel to it.
+  static Future<SimDeviceChannel> _connectChannel(
+    Directory appDir,
+    int number,
+  ) async {
+    final socketPath = '${appDir.path}/device-$number.sock';
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while (!await File(socketPath).exists()) {
+      if (DateTime.now().isAfter(deadline)) {
+        throw StateError('device socket never appeared at $socketPath');
+      }
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    return SimDeviceChannel.connect(socketPath);
+  }
+
+  /// Reconcile the local channel cache with the app-side fleet (the source of truth via the
+  /// `device-numbers` driver-data endpoint). Devices can be added by the TRAY + button too —
+  /// a writer this harness never observes — so we cannot just append one channel per our own
+  /// [addDevice]; instead we connect `device-<n>.sock` for every number the app reports that
+  /// we don't yet hold. Numbers are contiguous and append-only, so connecting the missing ones
+  /// in ascending order keeps `device(n) ↔ socket-n` aligned (no stale or misindexed cache).
+  Future<void> ensureDevices() async {
+    final csv = await driver.runUnsynchronized(
+      () => driver.requestData('device-numbers'),
+    );
+    final numbers = csv.isEmpty
+        ? <int>[]
+        : csv.split(',').map(int.parse).toList();
+    for (var i = 0; i < numbers.length; i++) {
+      final n = numbers[i];
+      if (n != i + 1) {
+        throw StateError('app device numbers not contiguous 1..N: $numbers');
+      }
+      if (n > devices.length) devices.add(await _connectChannel(appDir, n));
+    }
+  }
+
+  /// Add a virtual device to the fleet at runtime (CLI/harness parity with the tray + button)
+  /// and return its 1-based number. Triggers the app-side add via driver data, then resyncs the
+  /// channel cache so [device]`(n)` can drive the new device.
+  Future<int> addDevice() async {
+    final number = int.parse(
+      await driver.runUnsynchronized(() => driver.requestData('add-device')),
+    );
+    await ensureDevices();
+    return number;
   }
 
   /// Guarded best-effort teardown of any subset of the harness resources. Every step

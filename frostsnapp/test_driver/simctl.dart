@@ -8,7 +8,7 @@ import 'sim_harness.dart';
 // simctl: interactively drive the running sim app + devices through the SAME SimHarness
 // methods the keygen test uses — no second implementation that can drift.
 //
-//   simctl serve [--count N]      launch the app + N devices ONCE, listen for commands
+//   simctl serve [--devices N]    launch the app + N devices ONCE, listen for commands
 //   simctl <cmd> ...              run ONE command against the running daemon, exit
 //
 // Device commands take `--device N` (1-based, default 1) to pick which virtual device.
@@ -26,7 +26,7 @@ String get _socketPath => '${simTmpRoot().path}/control.sock';
 
 const _usage = '''
 simctl — drive the running sim app/devices through SimHarness.
-  simctl serve [--count N] [--platform <d>] [--agent-owns-keyboard] [--no-regtest]   launch app + listen
+  simctl serve [--devices N] [--platform <d>] [--agent-owns-keyboard] [--no-regtest]   launch app + listen
                                               (regtest is ON by default; --no-regtest = offline sim)
   simctl up [serve flags]                     idempotently bring the sim up + return once ready
                                               (no backgrounding/polling; reuses a matching live
@@ -45,6 +45,7 @@ simctl — drive the running sim app/devices through SimHarness.
   simctl exists <label> [--regex]             report whether a label is present
   simctl clipboard                            print the app clipboard text (e.g. a copied address)
   simctl devices                              list each device (number/id/connected)
+  simctl add-device                           add a device at runtime (joins the chain tail)
   simctl chain                                print the connected chain order
   simctl set-chain <n>...                     re-cable to exactly these devices, in order
   simctl connect <n>                          plug device n into the tail of the chain
@@ -122,7 +123,7 @@ Future<bool> _daemonAlive() async {
 Future<void> _up(List<String> args) async {
   var count = 1;
   for (var i = 0; i < args.length - 1; i++) {
-    if (args[i] == '--count') count = int.parse(args[i + 1]);
+    if (args[i] == '--devices') count = int.parse(args[i + 1]);
   }
   // The shape `serve` WOULD launch — mirror its `withRegtest = !--no-regtest` so the exact
   // compatibility check below stays consistent with what a fresh launch actually produces.
@@ -274,7 +275,7 @@ Future<void> _serve(List<String> args) async {
   final agentOwnsKeyboard = args.contains('--agent-owns-keyboard');
   for (var i = 0; i < args.length - 1; i++) {
     if (args[i] == '--platform') platform = args[i + 1];
-    if (args[i] == '--count') count = int.parse(args[i + 1]);
+    if (args[i] == '--devices') count = int.parse(args[i + 1]);
   }
 
   // Spawn (or attach to) the regtest faucet by default so the wallet can receive; `--no-regtest`
@@ -356,6 +357,7 @@ Future<void> _serve(List<String> args) async {
         harness,
         agentOwnsKeyboard,
         withRegtest,
+        count,
       );
       conn.write('${jsonEncode(reply)}\n');
       await conn.flush();
@@ -376,6 +378,7 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
   SimHarness h,
   bool agentOwnsKeyboard,
   bool withRegtest,
+  int launchDeviceCount,
 ) async {
   final Map<String, dynamic> req;
   try {
@@ -388,7 +391,27 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
   // Which virtual device a device-command targets (1-based, default 1).
   final dn = (req['device'] as int?) ?? 1;
 
+  // The fleet can GROW behind the daemon's back — the tray + button adds devices the daemon
+  // never issued — so before any command that reports or indexes devices, reconcile the
+  // harness channel cache with the app-side fleet. Otherwise device(n) for a tray-added n would
+  // be missing/misindexed. App-channel-only commands (tap/wait/…) don't touch the fleet.
+  const fleetCmds = {
+    'info',
+    'devices',
+    'chain',
+    'setChain',
+    'connect',
+    'disconnect',
+    'moveUp',
+    'moveDown',
+    'hold',
+    'swipe',
+    'touch',
+    'setConnected',
+    'screen',
+  };
   try {
+    if (fleetCmds.contains(req['cmd'])) await h.ensureDevices();
     switch (req['cmd']) {
       case 'tap':
         await h.tap(pat('label', 'regex'));
@@ -421,17 +444,22 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
       case 'clipboard':
         return ({'ok': true, 'text': await h.getClipboard()}, false);
       case 'info':
-        // The daemon's launch shape — `./simctl up` compares this against the requested flags to
-        // decide whether an already-live daemon satisfies the request.
+        // The daemon's LAUNCH shape — `./simctl up` compares `count` against the requested
+        // --devices to decide whether an already-live daemon satisfies the request. It's the
+        // launch count, NOT the live count, so runtime adds (tray / add-device) don't flip
+        // idempotence. `currentDevices` reports the live (resynced) fleet for introspection.
         return (
           {
             'ok': true,
-            'count': h.devices.length,
+            'count': launchDeviceCount,
+            'currentDevices': h.devices.length,
             'regtest': withRegtest,
             'keyboard': agentOwnsKeyboard,
           },
           false,
         );
+      case 'addDevice':
+        return ({'ok': true, 'device': await h.addDevice()}, false);
       case 'devices':
         final list = <Map<String, dynamic>>[];
         for (var n = 1; n <= h.devices.length; n++) {
@@ -614,6 +642,8 @@ Map<String, dynamic>? _argsToCommand(List<String> args) {
       return {'cmd': 'info'};
     case 'devices':
       return {'cmd': 'devices'};
+    case 'add-device':
+      return {'cmd': 'addDevice'};
     case 'chain':
       return {'cmd': 'chain'};
     case 'set-chain':

@@ -46,19 +46,26 @@ class SimDeviceTray extends StatefulWidget {
 }
 
 class _SimDeviceTrayState extends State<SimDeviceTray> {
-  late final Future<List<SimDevice>> _devices = widget.pool.devices();
-
-  // The chain config can change from OUTSIDE the tray (simctl / the device channel), and
-  // there is no change stream, so poll it: every build re-reads chain() and converges however
-  // it was changed (tray actions, plug-all, or an external set-chain).
+  // The fleet (which GROWS via the + button or an external simctl/driver-data add) and the
+  // chain config (mutable from outside the tray) have no change stream, so poll: every tick
+  // re-reads the device list into [_devices] and rebuilds (build() re-reads chain()), so the
+  // UI converges for EVERY writer — not just the tray's own mutations.
+  List<SimDevice>? _devices;
   Timer? _poll;
 
   @override
   void initState() {
     super.initState();
-    _poll = Timer.periodic(const Duration(milliseconds: 250), (_) {
-      if (mounted) setState(() {});
-    });
+    unawaited(_refresh());
+    _poll = Timer.periodic(
+      const Duration(milliseconds: 250),
+      (_) => unawaited(_refresh()),
+    );
+  }
+
+  Future<void> _refresh() async {
+    final devices = await widget.pool.devices();
+    if (mounted) setState(() => _devices = devices);
   }
 
   @override
@@ -70,6 +77,16 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
   void _apply(List<int> order) {
     widget.pool.setChain(order: order);
     setState(() {});
+  }
+
+  // Add a new virtual device to the fleet (it joins the chain tail). Refresh after so it
+  // shows immediately rather than waiting for the next poll tick.
+  Future<void> _addDevice() async {
+    try {
+      await widget.pool.addDevice();
+    } finally {
+      await _refresh();
+    }
   }
 
   // Connect/disconnect one device. Routes through the device's set_connected so the router
@@ -93,10 +110,9 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
           OverlayEntry(
             builder: (context) => Material(
               color: theme.colorScheme.surfaceContainerLowest,
-              child: FutureBuilder<List<SimDevice>>(
-                future: _devices,
-                builder: (context, snapshot) {
-                  final devices = snapshot.data;
+              child: Builder(
+                builder: (context) {
+                  final devices = _devices;
                   if (devices == null) {
                     return const Center(child: CircularProgressIndicator());
                   }
@@ -121,6 +137,7 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
                         deviceCount: devices.length,
                         connectedCount: connected.length,
                         allConnected: allConnected,
+                        onAddDevice: () => unawaited(_addDevice()),
                         onToggleAll: () => _apply(
                           allConnected
                               ? const []
@@ -199,12 +216,14 @@ class _TrayHeader extends StatelessWidget {
   final int deviceCount;
   final int connectedCount;
   final bool allConnected;
+  final VoidCallback onAddDevice;
   final VoidCallback onToggleAll;
 
   const _TrayHeader({
     required this.deviceCount,
     required this.connectedCount,
     required this.allConnected,
+    required this.onAddDevice,
     required this.onToggleAll,
   });
 
@@ -243,6 +262,19 @@ class _TrayHeader extends StatelessWidget {
               ],
             ),
           ),
+          IconButton.filledTonal(
+            onPressed: onAddDevice,
+            visualDensity: VisualDensity.compact,
+            tooltip: 'Add device',
+            // semanticLabel (not the tooltip) is what flutter_driver matches on, so the
+            // harness/e2e can drive this the same as a human.
+            icon: const Icon(
+              Icons.add_rounded,
+              size: 18,
+              semanticLabel: 'Add device',
+            ),
+          ),
+          const SizedBox(width: 8),
           FilledButton.tonalIcon(
             onPressed: onToggleAll,
             style: FilledButton.styleFrom(

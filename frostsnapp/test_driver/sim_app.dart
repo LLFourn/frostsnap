@@ -1,11 +1,16 @@
 import 'package:flutter/services.dart';
 import 'package:flutter_driver/driver_extension.dart';
+import 'package:frostsnap/global.dart';
 import 'package:frostsnap/main.dart' as app;
 
-/// Driver data channel for clipboard access the harness can't get off the widget tree by semantic
-/// label. `clipboard` reads the app clipboard (e.g. a wallet receive address after its Copy
-/// button); `setclip:<text>` writes it (e.g. to seed a recipient before a Paste button) — portably,
-/// via Flutter's own Clipboard, so scenarios don't shell out to pbcopy/xclip. Test-only.
+/// Driver data channel for things the harness can't get off the widget tree by semantic label.
+/// `clipboard` reads the app clipboard (e.g. a wallet receive address after its Copy button);
+/// `setclip:<text>` writes it (e.g. to seed a recipient before a Paste button) — portably, via
+/// Flutter's own Clipboard, so scenarios don't shell out to pbcopy/xclip. `add-device` grows the
+/// virtual fleet at runtime (CLI parity with the tray + button) and returns the new device number;
+/// `device-numbers` reports the app-side fleet (CSV of 1-based numbers) as the source of truth the
+/// harness reconciles its channel cache against — the tray can also add devices, so the harness
+/// can't just count its own adds. Test-only.
 Future<String> _driverData(String? payload) async {
   const setClipPrefix = 'setclip:';
   if (payload != null && payload.startsWith(setClipPrefix)) {
@@ -18,6 +23,16 @@ Future<String> _driverData(String? payload) async {
     case 'clipboard':
       final data = await Clipboard.getData(Clipboard.kTextPlain);
       return data?.text ?? '';
+    case 'add-device':
+      final pool = simDevicePool;
+      if (pool == null) throw 'sim_app: no device pool (not a sim build?)';
+      final device = await pool.addDevice();
+      return '${device.number()}';
+    case 'device-numbers':
+      final pool = simDevicePool;
+      if (pool == null) throw 'sim_app: no device pool (not a sim build?)';
+      final devices = await pool.devices();
+      return devices.map((d) => d.number()).join(',');
     default:
       throw 'sim_app: unknown driver data request "$payload"';
   }

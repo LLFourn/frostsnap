@@ -9,9 +9,10 @@ use flutter_rust_bridge::frb;
 use frostsnap_coordinator::{FirmwareBin, ValidatedFirmwareBin};
 use frostsnap_core::DeviceId;
 use frostsnap_virtual_device::{
-    ChainRouter, DeviceChannel, DeviceInput, Point, SharedFramebuffer, TouchEvent, TouchGesture,
-    TouchQueue,
+    ChainRouter, DeviceChannel, DeviceInput, FrameSink, Point, SharedFramebuffer, SlotSpec,
+    TouchEvent, TouchGesture, TouchQueue,
 };
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -118,35 +119,121 @@ impl SimDevice {
     }
 }
 
+/// The per-device frame plumbing: an `Arc` the device thread's `on_frame` pushes [`SimFrame`]s
+/// into, and the `on_frame` closure itself. [`SimDevice::frames`] later registers the Dart
+/// `StreamSink` into the same `Arc`. Shared by `load_sim` and [`DevicePool::add_device`].
+pub(crate) fn make_frame_sink() -> (Arc<Mutex<Option<StreamSink<SimFrame>>>>, FrameSink) {
+    let frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>> = Arc::new(Mutex::new(None));
+    let on_frame_sink = frames_sink.clone();
+    let on_frame: FrameSink = Arc::new(move |width, height, data| {
+        if let Some(sink) = &*on_frame_sink.lock().unwrap() {
+            let _ = sink.add(SimFrame {
+                width,
+                height,
+                data,
+            });
+        }
+    });
+    (frames_sink, on_frame)
+}
+
+/// Build the device-input socket channel + Dart [`SimDevice`] handle for the router slot at
+/// `index` (1-based device number = `index + 1`), wired to that slot's STABLE handles + the
+/// shared router. Shared by `load_sim` (initial fleet) and [`DevicePool::add_device`].
+pub(crate) fn build_device(
+    router: &Arc<ChainRouter>,
+    app_dir: &Path,
+    index: usize,
+    frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>>,
+) -> anyhow::Result<(DeviceChannel, SimDevice)> {
+    let number = (index + 1) as u32;
+    let device_id = router.device_id(index);
+    let socket = app_dir.join(format!("device-{number}.sock"));
+    let channel = DeviceChannel::serve(
+        socket,
+        router.touch(index),
+        router.framebuffer(index),
+        router.clone(),
+        index,
+        device_id,
+    )?;
+    let device = SimDevice::new(
+        number,
+        device_id,
+        router.touch(index),
+        router.framebuffer(index),
+        frames_sink,
+        router.clone(),
+    );
+    Ok((channel, device))
+}
+
 /// Owns the host virtual device fleet (via the [`ChainRouter`], which holds each device's
-/// power slot) and the Dart-facing [`SimDevice`] handles. Dropping the pool drops the last
-/// router reference, which stops the forwarding thread and powers off every device.
+/// power slot) and the Dart-facing [`SimDevice`] handles. The fleet is growable at runtime
+/// ([`add_device`](Self::add_device)). Dropping the pool drops the last router reference,
+/// which stops the forwarding thread and powers off every device.
 #[frb(opaque)]
 pub struct DevicePool {
-    // Kept alive so the device-input sockets stay served; dropping the pool stops the
-    // accept loops and removes the socket files (teardown leaves no residue).
-    _channels: Vec<DeviceChannel>,
-    devices: Vec<SimDevice>,
-    // The single source of truth: owns each device's power slot (flash + peripherals) and
-    // the chain order, where chain membership IS power.
+    // The base seed + app dir needed to mint the NEXT device: its seed is `seed + index` and
+    // its socket is `app_dir/device-<n>.sock`, so add_device builds one exactly as load_sim does.
+    seed: u64,
+    app_dir: PathBuf,
+    // The single source of truth: owns each device's power slot (flash + peripherals) and the
+    // chain order, where chain membership IS power. The fleet grows via ChainRouter::add_device.
     router: Arc<ChainRouter>,
+    // The kept-alive input sockets + the Dart handles, interior-mutable so add_device grows
+    // them in lockstep with the router. Dropping the pool stops the accept loops (no residue).
+    state: Mutex<PoolDevices>,
+}
+
+/// The pool's growable per-device resources, in 1-based device order: the served sockets
+/// (kept alive) and the Dart [`SimDevice`] handles.
+struct PoolDevices {
+    channels: Vec<DeviceChannel>,
+    handles: Vec<SimDevice>,
 }
 
 impl DevicePool {
     pub(crate) fn new(
-        channels: Vec<DeviceChannel>,
-        devices: Vec<SimDevice>,
+        seed: u64,
+        app_dir: PathBuf,
         router: Arc<ChainRouter>,
+        channels: Vec<DeviceChannel>,
+        handles: Vec<SimDevice>,
     ) -> Self {
         Self {
-            _channels: channels,
-            devices,
+            seed,
+            app_dir,
             router,
+            state: Mutex::new(PoolDevices { channels, handles }),
         }
     }
 
     pub fn devices(&self) -> Vec<SimDevice> {
-        self.devices.clone()
+        self.state.lock().unwrap().handles.clone()
+    }
+
+    /// Add a virtual device to the fleet at runtime and return its handle. Grows the router (a
+    /// new powered-off slot), serves its `device-<n>.sock`, then plugs it into the chain TAIL
+    /// via [`ChainRouter::connect`] so it enumerates to the coordinator like a real hot-plug.
+    /// The device number is the next contiguous value (the fleet only ever grows).
+    pub fn add_device(&self) -> anyhow::Result<SimDevice> {
+        let mut state = self.state.lock().unwrap();
+        let index = state.handles.len();
+        let (frames_sink, on_frame) = make_frame_sink();
+        let spec = SlotSpec {
+            seed: self.seed.wrapping_add(index as u64),
+            digest: sim_firmware_bin().digest(),
+            on_frame,
+        };
+        let router_index = self.router.add_device(spec);
+        debug_assert_eq!(router_index, index, "pool and router device counts agree");
+        let (channel, device) = build_device(&self.router, &self.app_dir, index, frames_sink)?;
+        state.channels.push(channel);
+        state.handles.push(device.clone());
+        // Plug the new device into the tail so it powers on and enumerates to the coordinator.
+        self.router.connect(index);
+        Ok(device)
     }
 
     /// The connected chain as 1-based device numbers, in order (first = the device on the

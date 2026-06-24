@@ -113,9 +113,9 @@ impl super::Api {
         seed: u64,
         device_count: u32,
     ) -> Result<(Coordinator, AppCtx, super::sim::DevicePool)> {
-        use super::sim::{sim_firmware_bin, DevicePool, SimDevice, SimFrame};
+        use super::sim::{build_device, make_frame_sink, sim_firmware_bin, DevicePool};
         use frostsnap_virtual_device::{
-            ByteChannel, ChainRouter, DeviceChannel, FrameSink, HostEnd, SlotSpec, VirtualSerial,
+            ByteChannel, ChainRouter, HostEnd, SlotSpec, VirtualSerial,
         };
 
         let app_dir = PathBuf::from_str(&app_dir)?;
@@ -142,17 +142,7 @@ impl super::Api {
         let mut specs = Vec::with_capacity(count);
         let mut frame_sinks = Vec::with_capacity(count);
         for i in 0..count {
-            let frames_sink: Arc<Mutex<Option<StreamSink<SimFrame>>>> = Arc::new(Mutex::new(None));
-            let on_frame_sink = frames_sink.clone();
-            let on_frame: FrameSink = Arc::new(move |width, height, data| {
-                if let Some(sink) = &*on_frame_sink.lock().unwrap() {
-                    let _ = sink.add(SimFrame {
-                        width,
-                        height,
-                        data,
-                    });
-                }
-            });
+            let (frames_sink, on_frame) = make_frame_sink();
             specs.push(SlotSpec {
                 seed: seed.wrapping_add(i as u64),
                 digest,
@@ -171,32 +161,17 @@ impl super::Api {
 
         // One device-input channel + Dart handle per device (numbered 1-based), each wired
         // to the slot's STABLE handles (so it keeps driving the device across power-cycles)
-        // plus the shared router (so connect/disconnect edits the one chain config).
+        // plus the shared router (so connect/disconnect edits the one chain config). The same
+        // build path `DevicePool::add_device` uses for a runtime-added device.
         let mut channels = Vec::with_capacity(count);
         let mut devices = Vec::with_capacity(count);
         for (i, frames_sink) in frame_sinks.into_iter().enumerate() {
-            let number = (i + 1) as u32;
-            let device_id = router.device_id(i);
-            let socket = app_dir.join(format!("device-{number}.sock"));
-            channels.push(DeviceChannel::serve(
-                socket,
-                router.touch(i),
-                router.framebuffer(i),
-                router.clone(),
-                i,
-                device_id,
-            )?);
-            devices.push(SimDevice::new(
-                number,
-                device_id,
-                router.touch(i),
-                router.framebuffer(i),
-                frames_sink,
-                router.clone(),
-            ));
+            let (channel, device) = build_device(&router, &app_dir, i, frames_sink)?;
+            channels.push(channel);
+            devices.push(device);
         }
 
-        let pool = DevicePool::new(channels, devices, router);
+        let pool = DevicePool::new(seed, app_dir, router, channels, devices);
 
         Ok((coordinator, app_state, pool))
     }

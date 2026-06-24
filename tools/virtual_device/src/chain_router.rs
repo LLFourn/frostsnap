@@ -304,33 +304,11 @@ impl ChainRouter {
         let mut slots = Vec::with_capacity(specs.len());
         let mut links = Vec::with_capacity(specs.len());
         for spec in specs {
-            let (up_io, up_host) = pipe();
-            let (down_io, down_host) = pipe();
-            let downstream_present = LinkGate::new(false);
-            let handles = DeviceHandles {
-                upstream_io: up_io,
-                downstream_io: down_io,
-                framebuffer: SharedFramebuffer::new(),
-                touch: TouchQueue::new(),
-                downstream_present: Some(downstream_present.clone()),
-                on_frame: spec.on_frame,
-            };
             // Boot once to learn the (stable) device id; `order` below powers off any
             // device that shouldn't start connected.
-            let (device_id, thread) =
-                spawn_device_thread(spec.seed, spec.digest, handles.clone(), RamFlash::new());
-            slots.push(DeviceSlot {
-                seed: spec.seed,
-                digest: spec.digest,
-                handles,
-                device_id,
-                power: Power::On(thread),
-            });
-            links.push(DeviceLink {
-                up: up_host,
-                down: down_host,
-                downstream_present,
-            });
+            let (slot, link) = Self::build_slot(spec);
+            slots.push(slot);
+            links.push(link);
         }
 
         // Devices not in the initial order start powered off (their flash is preserved).
@@ -380,6 +358,59 @@ impl ChainRouter {
             #[cfg(test)]
             publish_hook: Mutex::new(None),
         }
+    }
+
+    /// Build one device's power slot + its router-side link from a [`SlotSpec`]: allocate
+    /// the stable peripherals (screen/touch) and the upstream/downstream pipe pair, then
+    /// boot once to learn the (stable) device id. The device starts powered ON; the caller
+    /// decides final power (the constructor powers off any device not in the initial order;
+    /// [`add_device`](Self::add_device) powers a newly-added device off until it's connected).
+    fn build_slot(spec: SlotSpec) -> (DeviceSlot, DeviceLink) {
+        let (up_io, up_host) = pipe();
+        let (down_io, down_host) = pipe();
+        let downstream_present = LinkGate::new(false);
+        let handles = DeviceHandles {
+            upstream_io: up_io,
+            downstream_io: down_io,
+            framebuffer: SharedFramebuffer::new(),
+            touch: TouchQueue::new(),
+            downstream_present: Some(downstream_present.clone()),
+            on_frame: spec.on_frame,
+        };
+        let (device_id, thread) =
+            spawn_device_thread(spec.seed, spec.digest, handles.clone(), RamFlash::new());
+        let slot = DeviceSlot {
+            seed: spec.seed,
+            digest: spec.digest,
+            handles,
+            device_id,
+            power: Power::On(thread),
+        };
+        let link = DeviceLink {
+            up: up_host,
+            down: down_host,
+            downstream_present,
+        };
+        (slot, link)
+    }
+
+    /// Append a new device to the fleet at runtime and return its index (the new highest
+    /// index — the fleet only ever grows, so indices stay contiguous). The device starts
+    /// DISCONNECTED (powered off, not in the chain); plug it in with
+    /// [`connect`](Self::connect). The slot+link are built OUTSIDE the locks (the boot-for-id
+    /// is slow), then pushed while holding `slots` THEN `state` — the same lock order as
+    /// [`set_chain`](Self::set_chain), so a concurrent re-cable serializes here and the
+    /// `slots.len() == links.len()` invariant the forwarding loop relies on stays atomic. The
+    /// forwarding loop drains the new (off-chain) device's channels until it is connected.
+    pub fn add_device(&self, spec: SlotSpec) -> usize {
+        let (mut slot, link) = Self::build_slot(spec);
+        slot.power_off();
+        let mut slots = self.slots.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        let index = slots.len();
+        slots.push(slot);
+        state.links.push(link);
+        index
     }
 
     /// Re-cable the chain to `order` (device indices in chain order). Diffs membership
@@ -657,6 +688,93 @@ mod tests {
         assert!(
             pump(&mut manager, &mut live, &|s| *s == all),
             "set_chain([2,0,1]) re-registers all three over the reordered chain; saw {live:?}"
+        );
+    }
+
+    // Runtime growth (runtime-add-devices): add_device appends a device to a LIVE fleet
+    // without disturbing the running chain. The new device starts off-chain (powered off,
+    // not enumerated) with a fresh distinct id; connecting it plugs it into the TAIL, where
+    // it boots and registers over the existing chain while the head and the other devices
+    // keep their sessions — exactly the hot-plug a real daisy chain does.
+    #[test]
+    fn add_device_grows_fleet_and_connects_at_tail() {
+        let coord = host();
+        let serial = VirtualSerial::single("sim-device-0", coord.clone());
+        let port = serial.connection();
+
+        let router = ChainRouter::new(coord, port, specs(2, 60), vec![0, 1]);
+        let mut ids: Vec<DeviceId> = (0..2).map(|i| router.device_id(i)).collect();
+
+        let mut manager = UsbSerialManager::new(Box::new(serial));
+        let mut live: HashSet<DeviceId> = HashSet::new();
+        let pump = |manager: &mut UsbSerialManager,
+                    live: &mut HashSet<DeviceId>,
+                    pred: &dyn Fn(&HashSet<DeviceId>) -> bool|
+         -> bool {
+            let deadline = Instant::now() + Duration::from_secs(90);
+            while Instant::now() < deadline {
+                for change in manager.poll_ports() {
+                    match change {
+                        DeviceChange::NeedsName { id } => {
+                            manager.accept_device_name(id, "Sim".to_string());
+                        }
+                        DeviceChange::Registered { id, .. } => {
+                            live.insert(id);
+                        }
+                        DeviceChange::Disconnected { id } => {
+                            live.remove(&id);
+                        }
+                        _ => {}
+                    }
+                }
+                if pred(live) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
+        };
+
+        // The initial two-device chain registers.
+        let first_two: HashSet<DeviceId> = ids.iter().copied().collect();
+        assert!(
+            pump(&mut manager, &mut live, &|s| *s == first_two),
+            "initial chain registers; saw {live:?}"
+        );
+
+        // Grow the fleet: a third device appears off-chain (powered off, not enumerated)
+        // with a fresh distinct id, at the next contiguous index. The chain is untouched.
+        let new_index = router.add_device(SlotSpec {
+            seed: 99,
+            digest: SimFirmware::PLACEHOLDER_DIGEST,
+            on_frame: Arc::new(|_, _, _| {}),
+        });
+        assert_eq!(new_index, 2, "appended at the next contiguous index");
+        let new_id = router.device_id(new_index);
+        assert!(!ids.contains(&new_id), "added device has a distinct id");
+        assert_eq!(
+            router.chain(),
+            vec![0, 1],
+            "add does not connect the device"
+        );
+        assert!(
+            !router.is_powered(new_index),
+            "added device starts powered off"
+        );
+
+        // Plug it into the tail: it powers on and registers over the existing chain while
+        // devices 0 and 1 keep their sessions (head unchanged -> no port re-enumeration).
+        router.connect(new_index);
+        ids.push(new_id);
+        let all: HashSet<DeviceId> = ids.iter().copied().collect();
+        assert_eq!(router.chain(), vec![0, 1, 2], "connected at the tail");
+        assert!(
+            router.is_powered(new_index),
+            "connected device is powered on"
+        );
+        assert!(
+            pump(&mut manager, &mut live, &|s| *s == all),
+            "the added device registers at the tail without dropping the others; saw {live:?}"
         );
     }
 
