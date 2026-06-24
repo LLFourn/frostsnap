@@ -17,8 +17,7 @@ import 'dart:io';
 
 import 'package:flutter_driver/flutter_driver.dart';
 
-import 'regtest.dart'
-    show ensureRegtestBackend, stopRegtestBackend, regtestControlSocket;
+import 'regtest.dart' show ensureRegtestBackend, regtestControlSocket;
 
 /// Root for all sim temp artifacts — disposable app dirs, the simctl control socket,
 /// ad-hoc screenshots — grouped under one folder instead of loose in the system temp
@@ -144,21 +143,22 @@ class SimHarness {
   final List<String> _appLog;
   int _shotSeq = 0;
 
-  /// True if THIS session spawned the regtest backend (so tearDown stops it). False when it
-  /// attached to a pre-existing one (e.g. started by `./simctl regtest up`) — left running.
-  final bool _ownsRegtest;
-
   SimHarness._(
     this._appProcess,
     this.appDir,
     this.driver,
     this.devices,
     this._appLog,
-    this._ownsRegtest,
   );
 
   /// The device-input channel for device [number] (1-based; defaults to device 1).
   SimDeviceChannel device([int number = 1]) => devices[number - 1];
+
+  /// Resolves when the launched app process exits — e.g. its window was closed, which (with
+  /// `applicationShouldTerminateAfterLastWindowClosed`) terminates the app and exits `flutter run`.
+  /// `simctl serve` watches this so the daemon never outlives a dead app (a zombie daemon would
+  /// answer `up` with already:true against nothing).
+  Future<int> get appExitCode => _appProcess.exitCode;
 
   /// Run [body] against a fresh harness; on ANY failure capture diagnostics — a
   /// whole-app screenshot, the device framebuffer, the error+stack, and recent app
@@ -205,16 +205,19 @@ class SimHarness {
     String flutterDevice = 'macos',
     bool agentOwnsKeyboard = true,
     bool withRegtest = false,
+    // When set, the captured `[app]`/`[app:err]` lines are mirrored here (in addition to stderr +
+    // the failure ring buffer). `simctl serve` passes its own logfile so the daemon SELF-LOGS,
+    // rather than depending on the caller redirecting stdout — which lets it run detached and
+    // survives the session dir being recreated.
+    IOSink? logSink,
   }) async {
-    // Bring up (or attach to) the shared regtest backend BEFORE the app, so its electrum URL
-    // can be seeded into the app at launch. `owned` => we spawned it and must stop it on
-    // teardown; attaching to a pre-existing one leaves it running.
+    // Bring up (or attach to) the shared regtest backend BEFORE the app, so its electrum URL can
+    // be seeded into the app at launch.
     String? regtestElectrumUrl;
-    var ownsRegtest = false;
     if (withRegtest) {
-      final backend = await ensureRegtestBackend();
-      regtestElectrumUrl = backend.url;
-      ownsRegtest = backend.owned;
+      // Start the shared regtest node if it isn't up, else attach to it. Either way we never tear
+      // it down (see _cleanup) — it's a persistent shared resource reaped by `regtest down`/`clean`.
+      regtestElectrumUrl = (await ensureRegtestBackend()).url;
     }
 
     final appDir = await simTmpRoot().createTemp('app-');
@@ -223,6 +226,7 @@ class SimHarness {
     void log(String line) {
       appLog.add(line);
       if (appLog.length > 400) appLog.removeAt(0);
+      logSink?.writeln(line);
     }
 
     // Track partial resources so a failure anywhere in setup tears them all down
@@ -233,23 +237,29 @@ class SimHarness {
     try {
       await Directory('${appDir.path}/screenshots').create();
 
-      proc = await Process.start('flutter', [
-        'run',
-        '-t',
-        'test_driver/sim_app.dart',
-        '-d',
-        flutterDevice,
-        '--dart-define=SIM=true',
-        '--dart-define=SIM_APP_DIR=${appDir.path}',
-        '--dart-define=SIM_DEVICE_COUNT=$deviceCount',
-        '--dart-define=SIM_AGENT_OWNS_KEYBOARD=$agentOwnsKeyboard',
-        // main.dart points the regtest wallet at this electrs (regtest-only); empty = offline.
-        if (regtestElectrumUrl != null)
-          '--dart-define=SIM_REGTEST_ELECTRUM_URL=$regtestElectrumUrl',
-        // ...and gives the tray's "Test BTC" column the faucet control socket to drive.
-        if (regtestElectrumUrl != null)
-          '--dart-define=SIM_REGTEST_CONTROL_SOCKET=$regtestControlSocket',
-      ]);
+      proc = await Process.start(
+        'flutter',
+        [
+          'run',
+          '-t',
+          'test_driver/sim_app.dart',
+          '-d',
+          flutterDevice,
+          '--dart-define=SIM=true',
+          '--dart-define=SIM_APP_DIR=${appDir.path}',
+          '--dart-define=SIM_DEVICE_COUNT=$deviceCount',
+          '--dart-define=SIM_AGENT_OWNS_KEYBOARD=$agentOwnsKeyboard',
+          // main.dart points the regtest wallet at this electrs (regtest-only); empty = offline.
+          if (regtestElectrumUrl != null)
+            '--dart-define=SIM_REGTEST_ELECTRUM_URL=$regtestElectrumUrl',
+          // ...and gives the tray's "Test BTC" column the faucet control socket to drive.
+          if (regtestElectrumUrl != null)
+            '--dart-define=SIM_REGTEST_CONTROL_SOCKET=$regtestControlSocket',
+          // Tell the macOS app (AppDelegate) to launch as an accessory so it doesn't steal focus —
+          // it's driven over the VM service, not looked at. Sim-only: only this harness sets it.
+        ],
+        environment: {'FROSTSNAP_SIM_NO_ACTIVATE': '1'},
+      );
 
       // Capture the VM service URL from the run output (surface logs on stderr).
       final vmUrl = Completer<String>();
@@ -293,7 +303,7 @@ class SimHarness {
         channels.add(await SimDeviceChannel.connect(socketPath));
       }
 
-      return SimHarness._(proc, appDir, driver, channels, appLog, ownsRegtest);
+      return SimHarness._(proc, appDir, driver, channels, appLog);
     } catch (_) {
       // Tear down whatever got created, then rethrow the original setup error.
       await _cleanup(
@@ -301,7 +311,6 @@ class SimHarness {
         driver: driver,
         proc: proc,
         appDir: appDir,
-        ownsRegtest: ownsRegtest,
       );
       rethrow;
     }
@@ -314,7 +323,6 @@ class SimHarness {
     FlutterDriver? driver,
     Process? proc,
     Directory? appDir,
-    bool ownsRegtest = false,
   }) async {
     Object? firstError;
     Future<void> guard(Future<void> Function() step) async {
@@ -325,8 +333,9 @@ class SimHarness {
       }
     }
 
-    // Stop the regtest backend only if we started it; an attached (pre-existing) one stays up.
-    if (ownsRegtest) await guard(stopRegtestBackend);
+    // NB: the regtest backend is a DELIBERATELY PERSISTENT shared node — no test or serve tears it
+    // down, so sequential runs reuse it AND multiple app instances in one test share it (none pulls
+    // it out from under another). It's reaped only by `./simctl regtest down` / `./simctl clean`.
     if (channels != null) {
       for (final channel in channels) {
         await guard(channel.close);
@@ -584,7 +593,6 @@ class SimHarness {
       driver: driver,
       proc: _appProcess,
       appDir: appDir,
-      ownsRegtest: _ownsRegtest,
     );
     if (err != null) throw err;
   }

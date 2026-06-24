@@ -27,6 +27,10 @@ String get _socketPath => '${simTmpRoot().path}/control.sock';
 const _usage = '''
 simctl — drive the running sim app/devices through SimHarness.
   simctl serve [--count N] [--platform <d>] [--agent-owns-keyboard] [--regtest]   launch app + listen
+  simctl up [serve flags]                     idempotently bring the sim up + return once ready
+                                              (no backgrounding/polling; reuses a matching live
+                                              daemon, refuses a mismatched one — `down` first)
+  simctl info                                 print the running daemon's shape (count/regtest/keyboard)
   simctl test [NAME]                          run e2e driver test <NAME> (a *_drive.dart stem),
                                               or all of them with no NAME
   simctl regtest up|down|status               manage the shared regtest bitcoind+electrs+faucet
@@ -63,6 +67,8 @@ Future<void> main(List<String> args) async {
   }
   if (args.first == 'serve') {
     await _serve(args.skip(1).toList());
+  } else if (args.first == 'up') {
+    await _up(args.skip(1).toList());
   } else if (args.first == 'test') {
     await _runTests(args.skip(1).toList());
   } else if (args.first == 'regtest') {
@@ -103,6 +109,109 @@ Future<bool> _daemonAlive() async {
   } catch (_) {
     return false;
   }
+}
+
+// ---- up: one idempotent command that brings the sim up and returns only once ready ----
+
+/// `simctl up [serve flags]` — idempotent bring-up. If a live daemon already matches the requested
+/// shape (device count, regtest, keyboard mode) it's a no-op (`already:true`); on a MISMATCH it
+/// refuses with a clear "down first" error rather than reporting a wrong daemon ready; otherwise it
+/// launches `serve` DETACHED (which self-logs) and returns only once the control socket is live. The
+/// whole point: one command, no backgrounding or readiness polling by the caller.
+Future<void> _up(List<String> args) async {
+  var count = 1;
+  for (var i = 0; i < args.length - 1; i++) {
+    if (args[i] == '--count') count = int.parse(args[i + 1]);
+  }
+  // The shape `serve` WOULD launch — mirror its `withRegtest = --regtest || regtestLive()` so the
+  // exact compatibility check below stays consistent with what a fresh launch actually produces.
+  // (Otherwise a plain `up` against an already-live persistent backend launches a regtest-shaped
+  // daemon, and a second identical `up` then wrongly reports a mismatch.)
+  final wantRegtest = args.contains('--regtest') || await regtestLive();
+  final wantKeyboard = args.contains('--agent-owns-keyboard');
+
+  if (await _daemonAlive()) {
+    final info = await _query({'cmd': 'info'});
+    final live = (
+      count: info['count'] as int,
+      regtest: info['regtest'] as bool,
+      keyboard: info['keyboard'] as bool,
+    );
+    // Compatible iff the EXACT recorded shape matches the requested shape (what serve would launch)
+    // — same device count, keyboard mode, AND regtest on/off. A real mismatch fails (down first).
+    final compatible =
+        live.count == count &&
+        live.keyboard == wantKeyboard &&
+        live.regtest == wantRegtest;
+    if (compatible) {
+      stdout.writeln(
+        jsonEncode({'ok': true, 'already': true, 'socket': _socketPath}),
+      );
+      exit(0);
+    }
+    stderr.writeln(
+      jsonEncode({
+        'ok': false,
+        'error':
+            'a different-shape sim daemon is already running '
+            '(count=${live.count}, regtest=${live.regtest}, agentOwnsKeyboard=${live.keyboard}); '
+            'run `./simctl down` first',
+      }),
+    );
+    exit(1);
+  }
+
+  // No daemon: launch `serve` detached via the repo-root launcher (which runs `just maybe-gen`
+  // first, then self-logs), and wait for the control socket to come live.
+  simTmpRoot(); // ensure the session dir exists for the self-log
+  final launcher = '${Directory.current.parent.path}/simctl';
+  final serve = await Process.start(launcher, [
+    'serve',
+    ...args,
+  ], mode: ProcessStartMode.detached);
+
+  final deadline = DateTime.now().add(const Duration(minutes: 6));
+  while (!await _daemonAlive()) {
+    if (DateTime.now().isAfter(deadline)) {
+      stderr.writeln(
+        jsonEncode({
+          'ok': false,
+          'error':
+              'sim daemon did not come up within 6 minutes '
+              '(see ${simTmpRoot().path}/serve.log)',
+        }),
+      );
+      exit(1);
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+  }
+  stdout.writeln(
+    jsonEncode({
+      'ok': true,
+      'started': true,
+      'pid': serve.pid,
+      'socket': _socketPath,
+    }),
+  );
+  exit(0);
+}
+
+/// Connect to the live daemon, send one command, return its decoded reply (does NOT exit — used by
+/// `up` to query daemon `info`, unlike `_client` which prints + exits).
+Future<Map<String, dynamic>> _query(Map<String, dynamic> req) async {
+  final socket = await Socket.connect(
+    InternetAddress(_socketPath, type: InternetAddressType.unix),
+    0,
+  );
+  socket.write('${jsonEncode(req)}\n');
+  await socket.flush();
+  final reply = await socket
+      .cast<List<int>>()
+      .transform(utf8.decoder)
+      .transform(const LineSplitter())
+      .firstWhere((l) => l.trim().isNotEmpty);
+  await socket.close();
+  return jsonDecode(reply) as Map<String, dynamic>;
 }
 
 // ---- test runner: run the driver e2e tests (test_driver/*_drive.dart) ----
@@ -172,11 +281,21 @@ Future<void> _serve(List<String> args) async {
   // wallet can receive — otherwise stay offline (no surprise bitcoind/electrs spawn).
   final withRegtest = args.contains('--regtest') || await regtestLive();
 
+  // SELF-LOG: mirror our + the app's output to the session logfile, so a detached `up`-launched
+  // daemon still produces a readable log without the caller redirecting stdout. `simTmpRoot()`
+  // (re)creates the session dir, so the file can't be orphaned by an earlier teardown.
+  final logSink = File('${simTmpRoot().path}/serve.log').openWrite();
+  final flushTimer = Timer.periodic(
+    const Duration(seconds: 1),
+    (_) => unawaited(logSink.flush()),
+  );
+
   final harness = await SimHarness.launch(
     deviceCount: count,
     flutterDevice: platform,
     agentOwnsKeyboard: agentOwnsKeyboard,
     withRegtest: withRegtest,
+    logSink: logSink,
   );
 
   try {
@@ -187,13 +306,24 @@ Future<void> _serve(List<String> args) async {
     0,
   );
   stdout.writeln('SIMCTL_READY $_socketPath');
+  logSink.writeln('SIMCTL_READY $_socketPath');
 
-  Future<void> shutdown() async {
-    await server.close();
-    try {
-      File(_socketPath).deleteSync();
-    } catch (_) {}
-    await harness.tearDown();
+  // Idempotent AND awaitable: `down`, a signal, and the app-death watcher can all race in here;
+  // they share ONE cleanup future, so EVERY caller awaits the same cleanup to FINISH before its
+  // exit(0) runs. (A bare boolean guard would let a second caller return + exit mid-cleanup,
+  // killing the process before the first's app-dir delete / log flush completed.)
+  Future<void>? shutdownFuture;
+  Future<void> shutdown() {
+    return shutdownFuture ??= () async {
+      flushTimer.cancel();
+      await server.close();
+      try {
+        File(_socketPath).deleteSync();
+      } catch (_) {}
+      await harness.tearDown();
+      await logSink.flush();
+      await logSink.close();
+    }();
   }
 
   for (final sig in [ProcessSignal.sigint, ProcessSignal.sigterm]) {
@@ -203,6 +333,17 @@ Future<void> _serve(List<String> args) async {
     });
   }
 
+  // The daemon must not outlive its app: if the app dies (e.g. you close its window — the last
+  // window closing terminates it and exits `flutter run`), shut down so the control socket goes
+  // away and `./simctl up` RELAUNCHES instead of reporting already:true. (The captured app output
+  // already logs the app finishing; awaiting shutdown() shares the one cleanup before exit.)
+  unawaited(
+    harness.appExitCode.then((_) async {
+      await shutdown();
+      exit(0);
+    }),
+  );
+
   await for (final conn in server) {
     final lines = conn
         .cast<List<int>>()
@@ -210,7 +351,12 @@ Future<void> _serve(List<String> args) async {
         .transform(const LineSplitter());
     await for (final line in lines) {
       if (line.trim().isEmpty) continue;
-      final (reply, down) = await _dispatch(line, harness, agentOwnsKeyboard);
+      final (reply, down) = await _dispatch(
+        line,
+        harness,
+        agentOwnsKeyboard,
+        withRegtest,
+      );
       conn.write('${jsonEncode(reply)}\n');
       await conn.flush();
       if (down) {
@@ -229,6 +375,7 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
   String line,
   SimHarness h,
   bool agentOwnsKeyboard,
+  bool withRegtest,
 ) async {
   final Map<String, dynamic> req;
   try {
@@ -273,6 +420,18 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
         );
       case 'clipboard':
         return ({'ok': true, 'text': await h.getClipboard()}, false);
+      case 'info':
+        // The daemon's launch shape — `./simctl up` compares this against the requested flags to
+        // decide whether an already-live daemon satisfies the request.
+        return (
+          {
+            'ok': true,
+            'count': h.devices.length,
+            'regtest': withRegtest,
+            'keyboard': agentOwnsKeyboard,
+          },
+          false,
+        );
       case 'devices':
         final list = <Map<String, dynamic>>[];
         for (var n = 1; n <= h.devices.length; n++) {
@@ -451,6 +610,8 @@ Map<String, dynamic>? _argsToCommand(List<String> args) {
       return {'cmd': 'exists', 'label': pos[1], 'regex': flag('--regex')};
     case 'clipboard':
       return {'cmd': 'clipboard'};
+    case 'info':
+      return {'cmd': 'info'};
     case 'devices':
       return {'cmd': 'devices'};
     case 'chain':

@@ -117,10 +117,11 @@ Future<void> _withFaucet(Future<void> Function(SimFaucet) body) async {
 /// The repo root (the `./simctl` launcher cd's into `frostsnapp`, so the cwd's parent is root).
 String _repoRoot() => Directory.current.parent.path;
 
-/// Ensure a regtest backend is up and return its electrum URL plus whether WE started it.
-/// Attaches to an already-running backend (`owned: false` — leave it alone on teardown) or
-/// spawns one (`owned: true` — the caller must stop it). Shared by `./simctl regtest up` and
-/// `SimHarness.launch`. Throws on build/startup failure.
+/// Ensure a regtest backend is up and return its electrum URL plus whether THIS call started it
+/// (`owned: true`) or attached to a live one (`owned: false`). The node is a PERSISTENT shared
+/// resource: callers (`SimHarness.launch`, `./simctl regtest up`) only start-or-attach and NEVER
+/// stop it — it's reaped only by `./simctl regtest down` / `./simctl clean`. `owned` exists just so
+/// `./simctl regtest up` can report started-vs-attached. Throws on build/startup failure.
 Future<({String url, bool owned})> ensureRegtestBackend() async {
   if (await regtestLive()) {
     return (

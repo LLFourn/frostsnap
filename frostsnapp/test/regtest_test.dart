@@ -66,15 +66,16 @@ void main() {
     }
   });
 
-  // Regression for the ownership race codex flagged on M4a: `ensureRegtestBackend` used to return
-  // owned:true whenever it took the spawn branch, so two concurrent auto-starts could BOTH claim
-  // ownership though the Rust bind_control_socket singleton only lets one node serve — and the
-  // first teardown would then stop the backend the other session still relied on. The fix makes
-  // ownership authoritative: the live backend reports its PID (`ping`) and a caller owns it only
-  // if that PID is the child it spawned. This spawns REAL bitcoind+electrs (the race is decided by
-  // the OS socket bind + real PIDs, which a fake socket can't reproduce), so it is heavy.
+  // Two invariants of the SHARED PERSISTENT backend. (1) Ownership election: `ensureRegtestBackend`
+  // returns owned:true only for the caller whose spawned child actually won the Rust
+  // bind_control_socket singleton — the live backend reports its PID (`ping`) and a caller owns it
+  // only if that PID is the child it spawned, so concurrent auto-starts elect exactly ONE owner
+  // (used only to report started-vs-attached, NOT a teardown duty). (2) Persistence: the node is
+  // reaped ONLY by an explicit `./simctl regtest down` / `clean` — a session teardown NEVER stops
+  // it (SimHarness no longer reaps the backend). Spawns REAL bitcoind+electrs (the race is decided
+  // by the OS socket bind + real PIDs, which a fake socket can't reproduce), so it is heavy.
   test(
-    'concurrent ensureRegtestBackend elects exactly one owner; a non-owner teardown leaves the shared node up',
+    'concurrent ensureRegtestBackend elects exactly one owner; the shared node persists until an explicit reap',
     () async {
       final repoRoot = Directory.current.parent.path;
       final build = await Process.run('cargo', [
@@ -127,29 +128,25 @@ void main() {
         );
         expect(await regtestLive(), isTrue);
 
-        // Model SimHarness._cleanup: a session stops the backend ONLY if it owns it.
-        Future<void> tearDownSession(bool owned) async {
-          if (owned) await stopRegtestBackend();
-        }
-
-        final owner = results.firstWhere((r) => r.owned);
-        final attacher = results.firstWhere((r) => !r.owned);
-
-        await tearDownSession(attacher.owned);
+        // (2) Persistence: a session teardown NEVER reaps the node — SimHarness._cleanup no longer
+        // stops the backend, so `owned` carries no teardown duty and the node stays up regardless
+        // of which caller spawned it.
         expect(
           await regtestLive(),
           isTrue,
-          reason: 'a non-owner teardown must leave the shared backend running',
+          reason: 'the shared node stays up — sessions never reap it',
         );
 
-        await tearDownSession(owner.owned);
+        // It is reaped ONLY by an explicit `./simctl regtest down` / `clean`, modelled here by a
+        // direct stopRegtestBackend().
+        await stopRegtestBackend();
         for (var i = 0; i < 40 && await regtestLive(); i++) {
           await Future<void>.delayed(const Duration(milliseconds: 250));
         }
         expect(
           await regtestLive(),
           isFalse,
-          reason: 'the owner teardown stops the backend it started',
+          reason: 'an explicit regtest down / clean reaps the persistent node',
         );
       } finally {
         await stopRegtestBackend();
