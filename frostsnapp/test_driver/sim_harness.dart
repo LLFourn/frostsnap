@@ -169,17 +169,23 @@ class AppSession {
     Map<String, String> extraDartDefines = const {},
     IOSink? logSink,
   }) async {
+    // An AppSession holds no host device sockets, but the launch shape still depends on whether the
+    // target shares the host filesystem: a desktop host uses our disposable appDir (and has no build
+    // flavor); an emulator keeps its sandbox app-support dir (host paths are meaningless there) and
+    // needs the `direct` build flavor.
+    final hostPlatform = const {
+      'macos',
+      'linux',
+      'windows',
+    }.contains(flutterDevice);
     final (proc, dir, drv, log) = await _launchApp(
       deviceCount: deviceCount,
       flutterDevice: flutterDevice,
       agentOwnsKeyboard: agentOwnsKeyboard,
       withRegtest: withRegtest,
       extraDartDefines: extraDartDefines,
-      // App-only sessions are the Android shape: no host device sockets, so the app keeps its own
-      // app-support dir rather than a host path it can't use.
-      shareHostAppDir: false,
-      // The direct-distribution flavor (no Play-services dependency) — the natural sim build.
-      flavor: 'direct',
+      shareHostAppDir: hostPlatform,
+      flavor: hostPlatform ? null : 'direct',
       logSink: logSink,
     );
     return AppSession(proc, dir, drv, log);
@@ -284,13 +290,21 @@ class AppSession {
       final url = await vmUrl.future.timeout(const Duration(minutes: 5));
       driver = await FlutterDriver.connect(dartVmServiceUrl: url);
       // Build the semantics tree so find.bySemanticsLabel resolves (it isn't generated without an
-      // a11y client otherwise). Best-effort: on Android the driver extension throws an
-      // AssertionError here, and find-by-label commands are host-only anyway (a human drives an
-      // emulator session by hand) — so a failure must NOT tear down an otherwise-healthy session.
-      try {
-        await driver.setSemantics(true);
-      } catch (e) {
-        log('[harness] setSemantics unavailable (continuing): $e');
+      // a11y client otherwise). On Android setSemantics throws until runApp has attached the root
+      // widget (a startup race: "No root widget is attached"), so RETRY until it takes — find/tap/
+      // geometry all need it. Only give up (logged) after a generous window, so a genuinely broken
+      // app doesn't hang forever.
+      var semanticsOn = false;
+      for (var i = 0; i < 60 && !semanticsOn; i++) {
+        try {
+          await driver.setSemantics(true);
+          semanticsOn = true;
+        } catch (_) {
+          await Future<void>.delayed(const Duration(milliseconds: 500));
+        }
+      }
+      if (!semanticsOn) {
+        log('[harness] setSemantics never took — find-by-label will not work');
       }
 
       return (proc, appDir, driver, appLog);
@@ -362,6 +376,191 @@ class AppSession {
   Future<int> addDevice() async => int.parse(
     await driver.runUnsynchronized(() => driver.requestData('add-device')),
   );
+
+  // ---- device driving over the APP channel (FRB pool) ----
+  // These drive the in-process `simDevicePool` via driver-data, so a scenario drives a device the
+  // SAME way on host and emulator — unlike the host-only `SimDeviceChannel` sockets. Coordinates are
+  // device-framebuffer coords (240x280), same as the device channel.
+
+  Future<void> _device(String cmd) =>
+      driver.runUnsynchronized(() => driver.requestData(cmd));
+
+  /// Hold-to-confirm on device [n] at `(x,y)` for [duration] — the device integrates the elapsed
+  /// wall-clock between touch-down and -up and fires a hold-to-confirm control past its threshold.
+  Future<void> holdConfirm(
+    int n,
+    int x,
+    int y, [
+    Duration duration = const Duration(milliseconds: 2600),
+  ]) => _device('device-hold:$n:$x:$y:${duration.inMilliseconds}');
+
+  /// A predominantly-vertical swipe on device [n] (advances the device's review screens).
+  Future<void> swipeDevice(
+    int n,
+    int x1,
+    int y1,
+    int x2,
+    int y2, [
+    Duration duration = const Duration(milliseconds: 250),
+  ]) => _device('device-swipe:$n:$x1:$y1:$x2:$y2:${duration.inMilliseconds}');
+
+  /// Raw single touch on device [n] (press when `down`, release otherwise).
+  Future<void> touchDevice(int n, int x, int y, {required bool down}) =>
+      _device('device-touch:$n:$x:$y:${down ? 'down' : 'up'}');
+
+  /// Plug device [n] into / out of the chain (daisy-chain semantics applied by the router).
+  Future<void> connectDevice(int n) => _device('device-connect:$n');
+  Future<void> disconnectDevice(int n) => _device('device-disconnect:$n');
+
+  /// The app's FlutterView size + system insets (LOGICAL px) — for occlusion checks against a
+  /// widget's screen rect (e.g. is a button below `height - bottomInset`, i.e. behind the nav bar).
+  Future<({double width, double height, double topInset, double bottomInset})>
+  viewMetrics() async {
+    final m =
+        jsonDecode(
+              await driver.runUnsynchronized(
+                () => driver.requestData('metrics'),
+              ),
+            )
+            as Map<String, dynamic>;
+    return (
+      width: (m['width'] as num).toDouble(),
+      height: (m['height'] as num).toDouble(),
+      topInset: (m['topInset'] as num).toDouble(),
+      bottomInset: (m['bottomInset'] as num).toDouble(),
+    );
+  }
+
+  // ---- reusable flows (driven over the app channel, so they run on host AND emulator) ----
+
+  /// Run [body] against an [AppSession] (app channel only) on [flutterDevice] (or the
+  /// `SIM_FLUTTER_DEVICE` env, default macos). This is the emulator e2e runner: `./simctl test
+  /// <name> --android` boots the emulator and sets that env. Captures failure diagnostics and
+  /// asserts no residue, like [SimHarness.runScenario].
+  static Future<void> runScenario(
+    String name,
+    Future<void> Function(AppSession h) body, {
+    int deviceCount = 1,
+    String? flutterDevice,
+    Map<String, String> extraDartDefines = const {},
+  }) async {
+    final device =
+        flutterDevice ?? Platform.environment['SIM_FLUTTER_DEVICE'] ?? 'macos';
+    final h = await AppSession.launch(
+      deviceCount: deviceCount,
+      flutterDevice: device,
+      extraDartDefines: extraDartDefines,
+    );
+    try {
+      await body(h);
+    } catch (error, stack) {
+      await h._captureFailure(name, error, stack);
+      rethrow;
+    } finally {
+      await h.tearDown();
+    }
+    if (await h.appDir.exists()) {
+      throw StateError('teardown left residue: ${h.appDir.path}');
+    }
+  }
+
+  /// Device-screen point of the keygen security-code confirm button (the KeygenCheck screen, sim-3).
+  static const _keygenConfirmX = 120;
+  static const _keygenConfirmY = 215;
+
+  /// Drive a full keygen to a created wallet: create → name the wallet + [deviceCount] devices →
+  /// (threshold) → generate → each device hold-confirms the security code → unplug to finalize →
+  /// the wallet home. Devices are driven over the APP channel ([holdConfirm]/[disconnectDevice]),
+  /// so this runs unchanged on host and emulator.
+  Future<void> createWallet({
+    String name = 'SimTest',
+    int deviceCount = 1,
+    String devicePrefix = 'SimDev',
+  }) async {
+    await tapUntil(RegExp('Create a multi-sig wallet'), 'Wallet name');
+    await enterText('Wallet name', name);
+    await tapUntil('Next', 'Device name 1');
+    for (var i = 1; i <= deviceCount; i++) {
+      await enterText('Device name $i', '$devicePrefix$i');
+    }
+    if (deviceCount == 1) {
+      // 1-of-1 is below the recommended threshold, so it has an extra confirm dialog.
+      await tapUntil('Continue with 1 device', 'Continue anyway');
+      await tapUntil('Continue anyway', 'Generate keys');
+    } else {
+      // N devices: Continue → Choose threshold (defaults to recommended) → Generate keys.
+      await tapUntil('Continue with $deviceCount devices', 'Generate keys');
+    }
+    await tapUntil('Generate keys', RegExp('Security Check'));
+    // Each device confirms the security code via hold-to-confirm; the app reveals "Yes" at N/N.
+    // Re-assert (the device-render can lag the hold).
+    var confirmed = false;
+    for (var attempt = 0; attempt < 8 && !confirmed; attempt++) {
+      for (var n = 1; n <= deviceCount; n++) {
+        await holdConfirm(n, _keygenConfirmX, _keygenConfirmY);
+      }
+      confirmed = await exists('Yes');
+    }
+    if (!confirmed) {
+      throw StateError('devices never confirmed the security code');
+    }
+    await tapUntil('Yes', RegExp('Unplug devices to continue'));
+    for (var n = 1; n <= deviceCount; n++) {
+      await disconnectDevice(n);
+    }
+    await waitFor(RegExp('Receive'));
+  }
+
+  /// From a created wallet, open a device's "Record backup information" sheet: enter the backup
+  /// checklist (the wallet's unfinished-backups banner) → connect [device] → tap its Backup. Leaves
+  /// the sheet (with the "Show secret backup" action) on screen.
+  Future<void> openDeviceBackup({int device = 1}) async {
+    await tapUntil(RegExp('unfinished backups'), RegExp('Backup keys'));
+    await connectDevice(device);
+    await tapUntil('Backup', RegExp('Record backup information'));
+  }
+
+  /// Assert the widget [label] sits ABOVE the bottom system inset — i.e. is not occluded by the
+  /// navigation bar. Compares the widget's screen rect ([FlutterDriver.getBottomRight]) with
+  /// [viewMetrics]. Trivially true where there's no bottom inset (a desktop host); on the emulator
+  /// it catches a control rendered behind the nav bar.
+  Future<void> expectAboveBottomInset(Pattern label) async {
+    final m = await viewMetrics();
+    final safeBottom = m.height - m.bottomInset;
+    final br = await _settledBottomRight(label);
+    if (br.dy > safeBottom) {
+      throw StateError(
+        'widget "$label" is occluded by the ${m.bottomInset.toStringAsFixed(0)}px bottom '
+        'inset: its bottom is ${br.dy.toStringAsFixed(0)} but the safe area ends at '
+        '${safeBottom.toStringAsFixed(0)} (view height ${m.height.toStringAsFixed(0)})',
+      );
+    }
+  }
+
+  /// The on-screen bottom-right of [label] once it has stopped moving (e.g. a sheet has finished
+  /// sliding in). We can't use flutter_driver's frame-sync (`pumpAndSettle`'s out-of-process
+  /// equivalent) for this: the sim app never reaches frame-idle (a live tray/device keeps
+  /// repainting — the reason every other call here is `runUnsynchronized`), so a synchronized read
+  /// just times out. So we do what out-of-process drivers do when they can't hook the frame loop
+  /// (cf. Appium/Playwright explicit waits): sample the geometry until two reads agree, then use it.
+  Future<DriverOffset> _settledBottomRight(
+    Pattern label, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    final finder = find.bySemanticsLabel(label);
+    final deadline = DateTime.now().add(timeout);
+    var prev = double.nan;
+    while (true) {
+      final br = await driver.runUnsynchronized(
+        () => driver.getBottomRight(finder),
+      );
+      if ((br.dy - prev).abs() < 1.0 || DateTime.now().isAfter(deadline)) {
+        return br;
+      }
+      prev = br.dy;
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+    }
+  }
 
   // ---- app channel (widget tree, by semantic label) ----
   // `label` is a Pattern: a String matches the accessible name exactly; a RegExp

@@ -1,4 +1,7 @@
+import 'dart:convert';
+
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_driver/driver_extension.dart';
 import 'package:frostsnap/global.dart';
 import 'package:frostsnap/main.dart' as app;
@@ -19,6 +22,15 @@ Future<String> _driverData(String? payload) async {
     );
     return 'ok';
   }
+  // `device-<cmd>:<n>:…` drives a virtual device through the FRB `simDevicePool` IN-PROCESS — the
+  // same pool/router the tray drives, just a different transport. Reachable over the (adb-forwarded)
+  // VM service, so flows drive devices identically on host AND emulator, unlike the host-only
+  // `device-<n>.sock` channels.
+  if (payload != null &&
+      payload.startsWith('device-') &&
+      payload.contains(':')) {
+    return _driveDevice(payload.split(':'));
+  }
   switch (payload) {
     case 'clipboard':
       final data = await Clipboard.getData(Clipboard.kTextPlain);
@@ -33,8 +45,68 @@ Future<String> _driverData(String? payload) async {
       if (pool == null) throw 'sim_app: no device pool (not a sim build?)';
       final devices = await pool.devices();
       return devices.map((d) => d.number()).join(',');
+    case 'metrics':
+      // The app's FlutterView size + system insets in LOGICAL px — the truth the occlusion check
+      // compares a widget's screen rect against (e.g. the emulator's 3-button nav bar = bottomInset).
+      final view = WidgetsBinding.instance.platformDispatcher.views.first;
+      final dpr = view.devicePixelRatio;
+      final pad = view.viewPadding;
+      return jsonEncode({
+        'width': view.physicalSize.width / dpr,
+        'height': view.physicalSize.height / dpr,
+        'topInset': pad.top / dpr,
+        'bottomInset': pad.bottom / dpr,
+      });
     default:
       throw 'sim_app: unknown driver data request "$payload"';
+  }
+}
+
+/// Drive virtual device `parts[1]` (1-based) via the FRB pool. `device-hold` synthesises a hold
+/// (touch-down → wait ms → touch-up) since [SimDevice] has touch/swipe but no hold; the device
+/// integrates the elapsed wall-clock and fires a hold-to-confirm control.
+Future<String> _driveDevice(List<String> parts) async {
+  final pool = simDevicePool;
+  if (pool == null) throw 'sim_app: no device pool (not a sim build?)';
+  final n = int.parse(parts[1]);
+  final device = (await pool.devices()).firstWhere(
+    (d) => d.number() == n,
+    orElse: () => throw 'sim_app: no device $n',
+  );
+  switch (parts[0]) {
+    case 'device-hold':
+      final x = int.parse(parts[2]);
+      final y = int.parse(parts[3]);
+      device.touch(x: x, y: y, liftUp: false);
+      await Future<void>.delayed(Duration(milliseconds: int.parse(parts[4])));
+      device.touch(x: x, y: y, liftUp: true);
+      return 'ok';
+    case 'device-touch':
+      device.touch(
+        x: int.parse(parts[2]),
+        y: int.parse(parts[3]),
+        liftUp: parts[4] == 'up',
+      );
+      return 'ok';
+    case 'device-swipe':
+      // swipe is async (emits intermediate events over `ms`); AWAIT it so the harness only
+      // continues once the gesture has completed, not while it's still in flight.
+      await device.swipe(
+        x1: int.parse(parts[2]),
+        y1: int.parse(parts[3]),
+        x2: int.parse(parts[4]),
+        y2: int.parse(parts[5]),
+        ms: int.parse(parts[6]),
+      );
+      return 'ok';
+    case 'device-connect':
+      device.setConnected(connected: true);
+      return 'ok';
+    case 'device-disconnect':
+      device.setConnected(connected: false);
+      return 'ok';
+    default:
+      throw 'sim_app: unknown device request "${parts[0]}"';
   }
 }
 

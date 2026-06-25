@@ -41,8 +41,9 @@ simctl — drive the running sim app/devices through SimHarness.
                                               one if needed) with regtest bridged over adb; drive the
                                               devices via the in-app slide-in tray
   simctl info                                 print the running daemon's shape (platform/count/regtest)
-  simctl test [NAME]                          run e2e driver test <NAME> (a *_drive.dart stem),
-                                              or all of them with no NAME
+  simctl test [NAME] [--android]              run e2e driver test <NAME> (a *_drive.dart stem),
+                                              or all with no NAME; --android runs <NAME> on the
+                                              emulator (an AppSession) instead of the host
   simctl regtest up|down|status               manage the shared regtest bitcoind+electrs+faucet
   simctl regtest fund <addr> <sats> | mine [n] | balance | height | address | url   drive the faucet
   simctl clean                                remove sim temp artifacts + reap any backend
@@ -272,6 +273,13 @@ Future<Map<String, dynamic>> _query(Map<String, dynamic> req) async {
 /// fails the whole run. Replaces the per-test justfile recipes — a new test is just a new
 /// `*_drive.dart` file, discovered here automatically.
 Future<void> _runTests(List<String> args) async {
+  // `--android` runs the named test ON the emulator (an AppSession, not a host SimHarness): boot/
+  // reuse the emulator and pass its serial via SIM_FLUTTER_DEVICE, which the test's
+  // AppSession.runScenario reads. The test must name a single stem (running the whole host suite on
+  // the emulator makes no sense).
+  final android = args.contains('--android');
+  final positional = args.where((a) => !a.startsWith('--')).toList();
+
   final stems = <String, String>{}; // stem -> filename
   for (final entry in Directory('test_driver').listSync()) {
     final name = entry.uri.pathSegments.last;
@@ -282,26 +290,56 @@ Future<void> _runTests(List<String> args) async {
   final available = stems.keys.toList()..sort();
 
   final List<String> files;
-  if (args.isEmpty) {
+  if (positional.isEmpty) {
+    if (android) {
+      stderr.writeln(
+        'simctl test --android: name a test (e.g. android_safe_area)',
+      );
+      exit(2);
+    }
     files = available.map((s) => stems[s]!).toList();
   } else {
-    final file = stems[args.first];
+    final file = stems[positional.first];
     if (file == null) {
       stderr.writeln(
-        'simctl test: no test "${args.first}". Available: ${available.join(', ')}',
+        'simctl test: no test "${positional.first}". Available: ${available.join(', ')}',
       );
       exit(2);
     }
     files = [file];
   }
 
+  Map<String, String>? env;
+  if (android) {
+    final serial = await _ensureEmulatorBooted();
+    // Deterministic fresh app state EVERY run: an emulator AppSession keeps its sandbox app-support
+    // dir (no disposable SIM_APP_DIR like the host), and it survives tearDown + warm reuse — so
+    // without this a second run could start from an existing wallet instead of onboarding, breaking
+    // createWallet. `pm clear` wipes the app's data (best-effort; no-op if not yet installed) while
+    // leaving the system PIN/lock intact.
+    await Process.run('${_androidSdkRoot()}/platform-tools/adb', [
+      '-s',
+      serial,
+      'shell',
+      'pm',
+      'clear',
+      'com.frostsnap',
+    ]);
+    env = {'SIM_FLUTTER_DEVICE': serial};
+    stdout.writeln(
+      '=== simctl test: on Android emulator $serial (app data cleared) ===',
+    );
+  }
+
   final failed = <String>[];
   for (final file in files) {
     stdout.writeln('=== simctl test: $file ===');
-    final proc = await Process.start('dart', [
-      'run',
-      'test_driver/$file',
-    ], mode: ProcessStartMode.inheritStdio);
+    final proc = await Process.start(
+      'dart',
+      ['run', 'test_driver/$file'],
+      mode: ProcessStartMode.inheritStdio,
+      environment: env,
+    );
     if (await proc.exitCode != 0) failed.add(file);
   }
 
