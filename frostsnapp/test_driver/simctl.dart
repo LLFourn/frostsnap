@@ -185,38 +185,66 @@ Future<void> _up(List<String> args) async {
   }
 
   // No daemon: launch `serve` detached via the repo-root launcher (which runs `just maybe-gen`
-  // first, then self-logs), and wait for the control socket to come live.
-  simTmpRoot(); // ensure the session dir exists for the self-log
+  // first, then self-logs every startup step to serve.log). We TAIL that log straight to our stdout,
+  // so the caller watches the bring-up live (emulator boot, regtest bridge, gradle build, app
+  // launch) and we return the instant the serve writes its terminal SIMCTL_READY / SIMCTL_FAILED
+  // line — no socket polling, and a failure surfaces its real reason instead of a blank timeout.
+  final logPath = '${simTmpRoot().path}/serve.log';
+  try {
+    File(logPath).deleteSync(); // don't tail a stale prior-run log
+  } catch (_) {}
   final launcher = '${Directory.current.parent.path}/simctl';
   final serve = await Process.start(launcher, [
     'serve',
     ...args,
   ], mode: ProcessStartMode.detached);
 
-  final deadline = DateTime.now().add(const Duration(minutes: 6));
-  while (!await _daemonAlive()) {
-    if (DateTime.now().isAfter(deadline)) {
+  final logFile = File(logPath);
+  var shown = 0;
+  final deadline = DateTime.now().add(const Duration(minutes: 8));
+  while (true) {
+    final log = await logFile.exists() ? await logFile.readAsString() : '';
+    if (log.length > shown) {
+      stdout.write(log.substring(shown)); // stream new progress lines live
+      shown = log.length;
+    }
+    if (log.contains('SIMCTL_READY')) {
+      stdout.writeln(
+        jsonEncode({
+          'ok': true,
+          'started': true,
+          'pid': serve.pid,
+          'socket': _socketPath,
+        }),
+      );
+      exit(0);
+    }
+    final failAt = log.indexOf('SIMCTL_FAILED:');
+    if (failAt >= 0) {
+      final reason = log
+          .substring(failAt + 'SIMCTL_FAILED:'.length)
+          .split('\n')
+          .first
+          .trim();
       stderr.writeln(
         jsonEncode({
           'ok': false,
-          'error':
-              'sim daemon did not come up within 6 minutes '
-              '(see ${simTmpRoot().path}/serve.log)',
+          'error': 'sim daemon failed to start: $reason (see $logPath)',
         }),
       );
       exit(1);
     }
-    await Future<void>.delayed(const Duration(milliseconds: 500));
+    if (DateTime.now().isAfter(deadline)) {
+      stderr.writeln(
+        jsonEncode({
+          'ok': false,
+          'error': 'sim daemon did not come up within 8 minutes (see $logPath)',
+        }),
+      );
+      exit(1);
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 300));
   }
-  stdout.writeln(
-    jsonEncode({
-      'ok': true,
-      'started': true,
-      'pid': serve.pid,
-      'socket': _socketPath,
-    }),
-  );
-  exit(0);
 }
 
 /// Connect to the live daemon, send one command, return its decoded reply (does NOT exit — used by
@@ -378,11 +406,16 @@ Future<String> _ensureEmulatorBooted() async {
     return existing;
   }
   final avd = await _ensureAvd(sdk);
-  stderr.writeln('simctl: booting emulator AVD "$avd" …');
+  stderr.writeln('simctl: booting emulator AVD "$avd" (cold, clean state) …');
+  // `-wipe-data` cold-boots a CLEAN package DB. Repeated `flutter run` installs otherwise corrupt
+  // the package state on a long-lived emulator — the launcher activity stops resolving (am start ->
+  // -92), so the app never launches and bring-up dies on the VM-service timeout. A clean boot is
+  // reliable; a warm reuse (above) keeps later `up`s in the same session fast.
   await Process.start('$sdk/emulator/emulator', [
     '-avd',
     avd,
-    '-no-snapshot-save',
+    '-no-snapshot',
+    '-wipe-data',
     '-no-boot-anim',
     '-gpu',
     'auto',
@@ -533,84 +566,115 @@ Future<void> _serve(List<String> args) async {
   for (var i = 0; i < args.length - 1; i++) {
     if (args[i] == '--devices') count = int.parse(args[i + 1]);
   }
-  // `--android` boots/reuses an emulator and targets it; else --platform (default macos).
-  final platform = await _resolvePlatform(args);
-
-  // A desktop target shares the host filesystem, so its `device-<n>.sock`s are reachable and we run
-  // a full SimHarness. A non-desktop target (an Android emulator) does not: those sockets live in
-  // the app sandbox, so we run an AppSession (app channel only) and device-channel commands are
-  // rejected as host-only (see _dispatch). Drive an emulator session via the in-app slide-in tray.
-  final isHost = _hostPlatforms.contains(platform);
-
   // Regtest is ON by default (the common case is a wallet that can receive); `--no-regtest` opts out.
   final wantRegtest = !args.contains('--no-regtest');
 
-  // On the host the app reaches the backend's sockets directly (SimHarness wires them internally).
-  // On an emulator the electrum (TCP) and faucet control (unix) sockets live on the host, so we
-  // bridge them: adb-reverse the electrum port (the app reaches the host electrs at the same
-  // 127.0.0.1:port the URL already names) and proxy the unix control socket over an adb-reversed TCP
-  // port (SimFaucet speaks either). The app then runs regtest unaware it's remote.
-  final extraDefines = <String, String>{};
-  ServerSocket? controlProxy;
-  if (!isHost && wantRegtest) {
-    final backend = await ensureRegtestBackend();
-    final adb = '${_androidSdkRoot()}/platform-tools/adb';
-    final ePort = _electrumPort(backend.url);
-    await _run(adb, ['-s', platform, 'reverse', 'tcp:$ePort', 'tcp:$ePort']);
-    extraDefines['SIM_REGTEST_ELECTRUM_URL'] = backend.url;
-    controlProxy = await _bridgeUnixOverTcp(regtestControlSocket);
-    await _run(adb, [
-      '-s',
-      platform,
-      'reverse',
-      'tcp:${controlProxy.port}',
-      'tcp:${controlProxy.port}',
-    ]);
-    extraDefines['SIM_REGTEST_CONTROL_SOCKET'] =
-        '127.0.0.1:${controlProxy.port}';
-    stderr.writeln(
-      'simctl: regtest bridged to $platform — electrs adb-reverse tcp:$ePort, '
-      'faucet adb-reverse tcp:${controlProxy.port}',
-    );
-  }
-
-  // SELF-LOG: mirror our + the app's output to the session logfile, so a detached `up`-launched
-  // daemon still produces a readable log without the caller redirecting stdout. `simTmpRoot()`
-  // (re)creates the session dir, so the file can't be orphaned by an earlier teardown.
+  // SELF-LOG every startup step to serve.log from the very start, ending in a terminal
+  // `SIMCTL_READY` / `SIMCTL_FAILED` line. `up` launches us detached (our stdio -> /dev/null) and
+  // TAILS this file to stream progress to its own stdout and learn the real outcome — so no caller
+  // ever has to poll the socket or guess at liveness. `simTmpRoot()` (re)creates the session dir.
   final logSink = File('${simTmpRoot().path}/serve.log').openWrite();
   final flushTimer = Timer.periodic(
     const Duration(seconds: 1),
     (_) => unawaited(logSink.flush()),
   );
+  void serveLog(String s) {
+    stderr.writeln(s);
+    logSink.writeln(s);
+  }
 
-  final AppSession harness = isHost
-      ? await SimHarness.launch(
-          deviceCount: count,
-          flutterDevice: platform,
-          agentOwnsKeyboard: agentOwnsKeyboard,
-          withRegtest: wantRegtest,
-          logSink: logSink,
-        )
-      : await AppSession.launch(
-          deviceCount: count,
-          flutterDevice: platform,
-          agentOwnsKeyboard: agentOwnsKeyboard,
-          // An emulator's regtest is wired via the bridge above (extraDefines), not _launchApp's
-          // internal host-socket path.
-          withRegtest: false,
-          extraDartDefines: extraDefines,
-          logSink: logSink,
-        );
-
+  // A desktop target shares the host filesystem, so its `device-<n>.sock`s are reachable and we run
+  // a full SimHarness. A non-desktop target (an Android emulator) does not: those sockets live in
+  // the app sandbox, so we run an AppSession (app channel only) and device-channel commands are
+  // rejected as host-only (see _dispatch). Drive an emulator session via the in-app slide-in tray.
+  late final String platform;
+  late final bool isHost;
+  late final AppSession harness;
+  late final ServerSocket server;
+  // On an emulator the electrum (TCP) + faucet control (unix) sockets live on the host, so we bridge
+  // them: adb-reverse the electrum port (the app reaches the host electrs at the same 127.0.0.1:port
+  // the URL already names) and proxy the unix control socket over an adb-reversed TCP port (SimFaucet
+  // speaks either). The app then runs regtest unaware it's remote.
+  final extraDefines = <String, String>{};
+  ServerSocket? controlProxy;
   try {
-    File(_socketPath).deleteSync();
-  } catch (_) {}
-  final server = await ServerSocket.bind(
-    InternetAddress(_socketPath, type: InternetAddressType.unix),
-    0,
-  );
+    serveLog('simctl: resolving target …');
+    platform = await _resolvePlatform(args);
+    isHost = _hostPlatforms.contains(platform);
+    serveLog('simctl: target $platform (${isHost ? 'host' : 'emulator'})');
+
+    // Best-effort: a regtest-bridge failure degrades to an OFFLINE session (logged) rather than
+    // sinking the whole bring-up.
+    if (!isHost && wantRegtest) {
+      try {
+        serveLog('simctl: bridging regtest to $platform over adb …');
+        final backend = await ensureRegtestBackend();
+        final adb = '${_androidSdkRoot()}/platform-tools/adb';
+        final ePort = _electrumPort(backend.url);
+        await _run(adb, [
+          '-s',
+          platform,
+          'reverse',
+          'tcp:$ePort',
+          'tcp:$ePort',
+        ]);
+        extraDefines['SIM_REGTEST_ELECTRUM_URL'] = backend.url;
+        controlProxy = await _bridgeUnixOverTcp(regtestControlSocket);
+        await _run(adb, [
+          '-s',
+          platform,
+          'reverse',
+          'tcp:${controlProxy.port}',
+          'tcp:${controlProxy.port}',
+        ]);
+        extraDefines['SIM_REGTEST_CONTROL_SOCKET'] =
+            '127.0.0.1:${controlProxy.port}';
+        serveLog(
+          'simctl: regtest bridged — electrs tcp:$ePort, faucet tcp:${controlProxy.port}',
+        );
+      } catch (e) {
+        serveLog('simctl: regtest bridge failed, continuing OFFLINE: $e');
+        extraDefines.clear();
+        await controlProxy?.close();
+        controlProxy = null;
+      }
+    }
+
+    serveLog('simctl: launching the app on $platform (first build is slow) …');
+    harness = isHost
+        ? await SimHarness.launch(
+            deviceCount: count,
+            flutterDevice: platform,
+            agentOwnsKeyboard: agentOwnsKeyboard,
+            withRegtest: wantRegtest,
+            logSink: logSink,
+          )
+        : await AppSession.launch(
+            deviceCount: count,
+            flutterDevice: platform,
+            agentOwnsKeyboard: agentOwnsKeyboard,
+            // An emulator's regtest is wired via the bridge above (extraDefines), not _launchApp's
+            // internal host-socket path.
+            withRegtest: false,
+            extraDartDefines: extraDefines,
+            logSink: logSink,
+          );
+
+    try {
+      File(_socketPath).deleteSync();
+    } catch (_) {}
+    server = await ServerSocket.bind(
+      InternetAddress(_socketPath, type: InternetAddressType.unix),
+      0,
+    );
+  } catch (e, st) {
+    serveLog('SIMCTL_FAILED: $e');
+    logSink.writeln('$st');
+    await logSink.flush();
+    exit(1);
+  }
+  serveLog('SIMCTL_READY $_socketPath');
   stdout.writeln('SIMCTL_READY $_socketPath');
-  logSink.writeln('SIMCTL_READY $_socketPath');
 
   // Idempotent AND awaitable: `down`, a signal, and the app-death watcher can all race in here;
   // they share ONE cleanup future, so EVERY caller awaits the same cleanup to FINISH before its
