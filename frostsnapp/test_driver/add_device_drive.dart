@@ -4,12 +4,12 @@ import 'sim_harness.dart';
 
 // runtime-add-devices acceptance: the virtual fleet GROWS at runtime, and a device added by
 // EITHER writer — the harness/`./simctl add-device` OR the tray + button — joins the chain TAIL
-// and enumerates to the coordinator (real daisy-chain hot-plug, not a star). The harness keeps
-// its own device-channel cache, which the tray writer never touches; ensureDevices() reconciles
-// it against the app-side fleet so device(n) can never go stale or misindex.
+// and enumerates to the coordinator (real daisy-chain hot-plug, not a star). There is ONE source
+// of truth for the fleet (the app-side `simDevicePool`, read via `deviceNumbers()`), so a tray add
+// is visible to the harness immediately — no device-channel cache, no resync.
 //
 // Enumeration is proven via the wallet-create "Continue with N devices" button (the coordinator's
-// live connected count), not just socket existence — a green-but-wrong "socket appeared" check
+// live connected count), not just fleet membership — a green-but-wrong "device appeared" check
 // would not prove the device actually joined the bus. Run: `./simctl test add_device`. Needs a
 // display.
 
@@ -38,13 +38,13 @@ Future<void> _waitUntil(Future<bool> Function() cond, String what) async {
 Future<void> main() async {
   await SimHarness.runScenario('add-device', (h) async {
     // Start with a single device.
-    _expect(h.devices.length, 1, 'initial device channels');
+    _expect((await h.deviceNumbers()).length, 1, 'initial fleet');
     _expectChain(await h.chain(), [1]);
 
     // (1) CLI/harness add: addDevice() grows the fleet to three, each joining the chain tail.
     _expect(await h.addDevice(), 2, 'first add -> device 2');
     _expect(await h.addDevice(), 3, 'second add -> device 3');
-    _expect(h.devices.length, 3, 'harness cache grew with the adds');
+    _expect((await h.deviceNumbers()).length, 3, 'fleet grew with the adds');
     _expectChain(await h.chain(), [1, 2, 3]);
     _expect(await h.device(2).isConnected(), true, 'added device 2 connected');
     _expect(await h.device(3).isConnected(), true, 'added device 3 connected');
@@ -56,39 +56,38 @@ Future<void> main() async {
     await h.tapUntil('Next', RegExp('Continue with'));
     await h.waitFor('Continue with 3 devices', timeout: _settle);
 
-    // (2) Tray-side add (the resync case): the TRAY + button adds device 4, so the harness
-    // channel cache goes momentarily stale; ensureDevices() reconciles it without misindexing.
+    // (2) Tray-side add: the TRAY + button adds device 4. The fleet has ONE source of truth (the
+    // app-side simDevicePool), so the harness sees it immediately — no cache, no resync.
     await h.tap('Add device');
-    // The + handler is async; wait until the app's chain shows the new tail. chain() reads the
-    // shared ChainRouter over device(1)'s socket, so it sees the tray's add independent of the
-    // (stale) harness cache.
+    // The + handler is async; wait until the app's chain shows the new tail.
     await _waitUntil(
       () async => (await h.chain()).length == 4,
       'the tray add to land',
     );
     _expectChain(await h.chain(), [1, 2, 3, 4]);
-    _expect(h.devices.length, 3, 'harness cache stale before resync');
-    await h.ensureDevices();
-    _expect(h.devices.length, 4, 'resync picked up the tray-added device');
+    _expect(
+      (await h.deviceNumbers()).length,
+      4,
+      'fleet reflects the tray add directly (no resync)',
+    );
 
-    // device(n) addresses DISTINCT sockets (no misindex): four distinct device ids, and the
-    // tray-added device reports connected over its own resynced channel.
+    // device(n) addresses DISTINCT devices: four distinct device ids, device 4 connected.
     final ids = <String>{};
     for (var n = 1; n <= 4; n++) {
       ids.add(await h.device(n).deviceId());
     }
-    _expect(ids.length, 4, 'each device channel addresses a distinct device');
+    _expect(ids.length, 4, 'each device handle addresses a distinct device');
     _expect(
       await h.device(4).isConnected(),
       true,
-      'resynced device 4 connected',
+      'tray-added device 4 connected',
     );
 
     // The tray-added device also enumerated to the coordinator (the live count bumped).
     await h.waitFor('Continue with 4 devices', timeout: _settle);
 
     stdout.writeln(
-      'ADD_DEVICE_DRIVE_OK: runtime add via CLI + tray, harness resync, tail enumeration',
+      'ADD_DEVICE_DRIVE_OK: runtime add via CLI + tray, one fleet source, tail enumeration',
     );
   }, deviceCount: 1);
 }

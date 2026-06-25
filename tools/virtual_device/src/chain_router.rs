@@ -75,7 +75,7 @@ enum Power {
 
 /// Everything for one device that SURVIVES a power-cycle. The [`DeviceHandles`] (screen,
 /// touch surface, link channels, frame sink) are STABLE — handed unchanged to each
-/// freshly-spawned thread, so the long-lived `SimDevice`/`DeviceChannel` keep driving
+/// freshly-spawned thread, so the long-lived `SimDevice` handles keep driving
 /// whatever thread is powered; the flash is PRESERVED across the cycle; only the loop/UI/RAM
 /// is volatile (rebuilt each power-on). The device id is stable (seed + flash derived),
 /// captured on the first boot.
@@ -512,7 +512,7 @@ impl ChainRouter {
     }
 
     /// The stable id of device `index` (same across power-cycles). Used to build the
-    /// long-lived `SimDevice`/`DeviceChannel` handles at construction.
+    /// long-lived `SimDevice` handles at construction.
     pub fn device_id(&self, index: usize) -> DeviceId {
         self.slots.lock().unwrap()[index].device_id
     }
@@ -858,8 +858,8 @@ mod tests {
 
     // sim-13 acceptance: a disconnect powers the device off (screen dark, no new frames) and
     // a reconnect powers it back on, driven entirely through the handles captured ONCE up
-    // front — the same `framebuffer`/`touch` clones `load_sim` hands to `SimDevice` and
-    // `DeviceChannel`. This proves those long-lived handles keep driving the device across a
+    // front — the same `framebuffer`/`touch` clones `load_sim` hands to `SimDevice`. This proves
+    // those long-lived handles keep driving the device across a
     // power-cycle (no orphaning onto a dead thread): frames return on reconnect and a touch
     // pushed through the pre-existing queue reaches the freshly-booted thread.
     #[test]
@@ -883,7 +883,7 @@ mod tests {
         };
         let router = ChainRouter::new(coord, port, vec![spec], vec![0]);
 
-        // Capture the handles ONCE — exactly what SimDevice/DeviceChannel hold for the
+        // Capture the handles ONCE — exactly what SimDevice holds for the
         // device's whole life. Everything below drives the device through these, never
         // re-fetching after a power-cycle.
         let framebuffer = router.framebuffer(0);

@@ -7,7 +7,6 @@
 //! caller-owned [`VirtualDeviceSession`] holding one persistent loop).
 
 mod chain_router;
-mod channel;
 mod clock;
 mod device;
 mod display;
@@ -23,7 +22,6 @@ mod touch;
 mod virtual_serial;
 
 pub use chain_router::{ChainRouter, SlotSpec};
-pub use channel::DeviceChannel;
 pub use clock::SimClock;
 pub use device::{SimUi, VirtualDevice, VirtualDeviceSession};
 pub use display::{FramebufferDisplay, SharedFramebuffer, HEIGHT, WIDTH};

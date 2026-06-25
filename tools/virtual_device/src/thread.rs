@@ -44,7 +44,7 @@ pub type FrameSink = Arc<dyn Fn(u32, u32, Vec<u8>) + Send + Sync + 'static>;
 /// The power-cycle-stable handles a device thread runs on: its link channels, screen,
 /// touch surface, downstream-detect, and frame sink. The slot owns these and clones a set
 /// into each freshly-spawned thread, so a re-boot resumes on the same surfaces and the
-/// long-lived `SimDevice`/`DeviceChannel` keep driving whatever thread is currently powered.
+/// long-lived `SimDevice` handles keep driving whatever thread is currently powered.
 #[derive(Clone)]
 pub struct DeviceHandles {
     pub upstream_io: PipeByteIo,

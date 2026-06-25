@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
@@ -11,9 +13,9 @@ import 'package:frostsnap/main.dart' as app;
 /// `setclip:<text>` writes it (e.g. to seed a recipient before a Paste button) — portably, via
 /// Flutter's own Clipboard, so scenarios don't shell out to pbcopy/xclip. `add-device` grows the
 /// virtual fleet at runtime (CLI parity with the tray + button) and returns the new device number;
-/// `device-numbers` reports the app-side fleet (CSV of 1-based numbers) as the source of truth the
-/// harness reconciles its channel cache against — the tray can also add devices, so the harness
-/// can't just count its own adds. Test-only.
+/// `device-numbers` reports the app-side fleet (CSV of 1-based numbers) — the SINGLE source of truth
+/// for which devices exist (the harness has no separate cache; the tray, button, and CLI all grow
+/// this one pool). Test-only.
 Future<String> _driverData(String? payload) async {
   const setClipPrefix = 'setclip:';
   if (payload != null && payload.startsWith(setClipPrefix)) {
@@ -22,10 +24,22 @@ Future<String> _driverData(String? payload) async {
     );
     return 'ok';
   }
+  // `device-set-chain:<csv>` is POOL-level (re-cable the whole chain), not per-device, so it's
+  // matched here before the per-device `device-<cmd>:<n>` dispatch below. Empty csv = empty chain.
+  const setChainPrefix = 'device-set-chain:';
+  if (payload != null && payload.startsWith(setChainPrefix)) {
+    final pool = simDevicePool;
+    if (pool == null) throw 'sim_app: no device pool (not a sim build?)';
+    final csv = payload.substring(setChainPrefix.length);
+    pool.setChain(
+      order: csv.isEmpty ? <int>[] : csv.split(',').map(int.parse).toList(),
+    );
+    return 'ok';
+  }
   // `device-<cmd>:<n>:…` drives a virtual device through the FRB `simDevicePool` IN-PROCESS — the
-  // same pool/router the tray drives, just a different transport. Reachable over the (adb-forwarded)
-  // VM service, so flows drive devices identically on host AND emulator, unlike the host-only
-  // `device-<n>.sock` channels.
+  // same pool/router the tray drives. Reachable over the (adb-forwarded) VM service, so flows drive
+  // devices identically on host AND emulator. This is the ONE device transport (the host-only
+  // `device-<n>.sock` channels are gone — app-channel-only-device-driving).
   if (payload != null &&
       payload.startsWith('device-') &&
       payload.contains(':')) {
@@ -45,6 +59,11 @@ Future<String> _driverData(String? payload) async {
       if (pool == null) throw 'sim_app: no device pool (not a sim build?)';
       final devices = await pool.devices();
       return devices.map((d) => d.number()).join(',');
+    case 'device-chain':
+      // The connected daisy chain (1-based, in order) — the pool's single source of truth.
+      final pool = simDevicePool;
+      if (pool == null) throw 'sim_app: no device pool (not a sim build?)';
+      return pool.chain().join(',');
     case 'metrics':
       // The app's FlutterView size + system insets in LOGICAL px — the truth the occlusion check
       // compares a widget's screen rect against (e.g. the emulator's 3-button nav bar = bottomInset).
@@ -105,6 +124,34 @@ Future<String> _driveDevice(List<String> parts) async {
     case 'device-disconnect':
       device.setConnected(connected: false);
       return 'ok';
+    case 'device-tap':
+      // A tap is a touch-down + touch-up at the same point (the SimDevice has no `tap` primitive).
+      final x = int.parse(parts[2]);
+      final y = int.parse(parts[3]);
+      device.touch(x: x, y: y, liftUp: false);
+      device.touch(x: x, y: y, liftUp: true);
+      return 'ok';
+    case 'device-id':
+      return device.id();
+    case 'device-is-connected':
+      // Connected == this device's number is in the chain (the pool's single source of truth).
+      return pool.chain().contains(n) ? 'true' : 'false';
+    case 'device-screen':
+      // The current framebuffer (RGBA8888) PNG-encoded + base64'd over the String channel — the
+      // app-channel equivalent of the socket's `screen`. `snapshot()` reads the framebuffer DIRECTLY
+      // (not via `frames()`, which would steal the live tray subscriber). Diagnostics path, not hot.
+      final frame = device.snapshot();
+      final decoded = Completer<ui.Image>();
+      ui.decodeImageFromPixels(
+        frame.data,
+        frame.width,
+        frame.height,
+        ui.PixelFormat.rgba8888,
+        decoded.complete,
+      );
+      final image = await decoded.future;
+      final png = await image.toByteData(format: ui.ImageByteFormat.png);
+      return base64Encode(png!.buffer.asUint8List());
     default:
       throw 'sim_app: unknown device request "${parts[0]}"';
   }

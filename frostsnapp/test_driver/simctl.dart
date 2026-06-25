@@ -39,7 +39,7 @@ simctl — drive the running sim app/devices through SimHarness.
                                               daemon, refuses a mismatched one — `down` first)
   simctl up --android [--devices N]           bring the sim up on an Android emulator (boot/provision
                                               one if needed) with regtest bridged over adb; drive the
-                                              devices via the in-app slide-in tray
+                                              devices via `./simctl` (below) or the in-app tray
   simctl info                                 print the running daemon's shape (platform/count/regtest)
   simctl test [NAME] [--android]              run e2e driver test <NAME> (a *_drive.dart stem),
                                               or all with no NAME; --android runs <NAME> on the
@@ -56,7 +56,7 @@ simctl — drive the running sim app/devices through SimHarness.
   simctl clipboard                            print the app clipboard text (e.g. a copied address)
   simctl shot [path]                          whole-app screenshot (incl. tray)
   simctl down                                 tear down (quit app, clean up)
- device-channel commands (HOST-only; on an Android (`--android`) session drive these via the tray):
+ device commands (over the app channel — work on host AND emulator):
   simctl devices                              list each device (number/id/connected)
   simctl add-device                           add a device at runtime (joins the chain tail)
   simctl chain                                print the connected chain order
@@ -679,8 +679,11 @@ Future<void> _serve(List<String> args) async {
     }
 
     serveLog('simctl: launching the app on $platform (first build is slow) …');
+    // One session shape now (devices drive over the app channel everywhere); the host/emulator
+    // branch is only about regtest — a host session uses _launchApp's shared node directly, an
+    // emulator gets regtest via the adb bridge above (extraDefines) with _launchApp's regtest off.
     harness = isHost
-        ? await SimHarness.launch(
+        ? await AppSession.launch(
             deviceCount: count,
             flutterDevice: platform,
             agentOwnsKeyboard: agentOwnsKeyboard,
@@ -799,39 +802,11 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
   // Which virtual device a device-command targets (1-based, default 1).
   final dn = (req['device'] as int?) ?? 1;
 
-  // device-channel commands need the host `device-<n>.sock`s; on an AppSession (an Android session)
-  // they are rejected as host-only — drive those via the in-app tray instead. App-channel commands
-  // (tap/wait/info/add-device/shot) work on either session over the (possibly adb-forwarded) VM
-  // service.
-  const deviceCmds = {
-    'devices',
-    'chain',
-    'setChain',
-    'connect',
-    'disconnect',
-    'moveUp',
-    'moveDown',
-    'hold',
-    'swipe',
-    'touch',
-    'setConnected',
-    'screen',
-  };
+  // Every command — device driving included — runs over the app channel (driver-data → the in-process
+  // simDevicePool), so it works on host AND emulator. No host-only device sockets, no SimHarness vs
+  // AppSession split, and no channel-cache to reconcile: the app-side fleet is the only source.
   final cmd = req['cmd'];
-  final sim = h is SimHarness ? h : null;
-  if (sim == null && deviceCmds.contains(cmd)) {
-    return (
-      {'ok': false, 'error': 'host-only on Android; drive via the in-app tray'},
-      false,
-    );
-  }
   try {
-    // The fleet can GROW behind the daemon's back — the tray + button adds devices the daemon
-    // never issued — so before any command that reports or indexes devices, reconcile the channel
-    // cache with the app-side fleet. An AppSession holds no device channels: nothing to resync.
-    if (sim != null && (deviceCmds.contains(cmd) || cmd == 'info')) {
-      await sim.ensureDevices();
-    }
     switch (cmd) {
       case 'tap':
         await h.tap(pat('label', 'regex'));
@@ -867,11 +842,9 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
         // The daemon's LAUNCH shape — `./simctl up` compares `count` against the requested
         // --devices to decide whether an already-live daemon satisfies the request. It's the
         // launch count, NOT the live count, so runtime adds (tray / add-device) don't flip
-        // idempotence. `currentDevices` reports the live (resynced) fleet for introspection —
-        // from the host channels, or the app-side count on an Android AppSession.
-        final current = sim != null
-            ? sim.devices.length
-            : (await h.deviceNumbers()).length;
+        // idempotence. `currentDevices` reports the live fleet (the app-side source of truth) for
+        // introspection.
+        final current = (await h.deviceNumbers()).length;
         return (
           {
             'ok': true,
@@ -889,34 +862,34 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
         return ({'ok': true, 'device': await h.addDevice()}, false);
       case 'devices':
         final list = <Map<String, dynamic>>[];
-        for (var n = 1; n <= sim!.devices.length; n++) {
+        for (final n in await h.deviceNumbers()) {
           list.add({
             'number': n,
-            'id': await sim.device(n).deviceId(),
-            'connected': await sim.device(n).isConnected(),
+            'id': await h.device(n).deviceId(),
+            'connected': await h.device(n).isConnected(),
           });
         }
         return ({'ok': true, 'devices': list}, false);
       case 'chain':
-        return ({'ok': true, 'chain': await sim!.chain()}, false);
+        return ({'ok': true, 'chain': await h.chain()}, false);
       case 'setChain':
-        await sim!.setChain((req['order'] as List).cast<int>());
+        await h.setChain((req['order'] as List).cast<int>());
         return ({'ok': true}, false);
       case 'connect':
-        await sim!.connect(req['device'] as int);
+        await h.connect(req['device'] as int);
         return ({'ok': true}, false);
       case 'disconnect':
-        await sim!.disconnect(req['device'] as int);
+        await h.disconnect(req['device'] as int);
         return ({'ok': true}, false);
       case 'moveUp':
-        await sim!.moveUp(req['device'] as int);
+        await h.moveUp(req['device'] as int);
         return ({'ok': true}, false);
       case 'moveDown':
-        await sim!.moveDown(req['device'] as int);
+        await h.moveDown(req['device'] as int);
         return ({'ok': true}, false);
       case 'hold':
         final ms = req['ms'] as int?;
-        await sim!
+        await h
             .device(dn)
             .holdConfirm(
               req['x'] as int,
@@ -927,7 +900,7 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
             );
         return ({'ok': true}, false);
       case 'swipe':
-        await sim!
+        await h
             .device(dn)
             .swipe(
               req['x1'] as int,
@@ -938,7 +911,7 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
             );
         return ({'ok': true}, false);
       case 'touch':
-        await sim!
+        await h
             .device(dn)
             .touch(
               req['x'] as int,
@@ -947,10 +920,10 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
             );
         return ({'ok': true}, false);
       case 'setConnected':
-        await sim!.device(dn).setConnected(req['connected'] as bool);
+        await h.device(dn).setConnected(req['connected'] as bool);
         return ({'ok': true}, false);
       case 'screen':
-        await sim!.device(dn).screen(req['path'] as String);
+        await h.device(dn).screen(req['path'] as String);
         return ({'ok': true, 'path': req['path']}, false);
       case 'shot':
         // No path -> the session dir (cleaned up on teardown); an explicit path is kept.

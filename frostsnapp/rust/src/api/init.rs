@@ -159,19 +159,16 @@ impl super::Api {
             (0..count).collect(),
         ));
 
-        // One device-input channel + Dart handle per device (numbered 1-based), each wired
-        // to the slot's STABLE handles (so it keeps driving the device across power-cycles)
-        // plus the shared router (so connect/disconnect edits the one chain config). The same
-        // build path `DevicePool::add_device` uses for a runtime-added device.
-        let mut channels = Vec::with_capacity(count);
+        // One Dart [`SimDevice`] handle per device (numbered 1-based), each wired to the slot's
+        // STABLE handles (so it keeps driving the device across power-cycles) plus the shared router
+        // (so connect/disconnect edits the one chain config). The harness drives these over the app
+        // channel (FRB) — no host socket. Same build path `DevicePool::add_device` uses.
         let mut devices = Vec::with_capacity(count);
         for (i, frames_sink) in frame_sinks.into_iter().enumerate() {
-            let (channel, device) = build_device(&router, &app_dir, i, frames_sink)?;
-            channels.push(channel);
-            devices.push(device);
+            devices.push(build_device(&router, i, frames_sink));
         }
 
-        let pool = DevicePool::new(seed, app_dir, router, channels, devices);
+        let pool = DevicePool::new(seed, router, devices);
 
         Ok((coordinator, app_state, pool))
     }

@@ -1,23 +1,21 @@
-// The sim-8 dual-channel harness: one object that brings up the sim app + virtual
-// device, drives BOTH through one ergonomic API, and tears everything down (app
-// process, both channels, the disposable app dir, and all screenshots) as a unit.
+// The sim harness: one object ([AppSession]) that brings up the sim app + virtual devices, drives
+// BOTH the app widget tree and the devices through one ergonomic API, and tears everything down (app
+// process, the disposable app dir, all screenshots) as a unit.
 //
-//   - app (Flutter widget tree): driven by semantic label over flutter_driver / the VM
-//     service. `app.*` + `screenshot()`.
-//   - device (a framebuffer + touchscreen): driven by hardware gestures over the
-//     device-channel unix socket. `device.*`.
+//   - app (Flutter widget tree): driven by semantic label over flutter_driver / the VM service.
+//     `app.*` + `screenshot()`.
+//   - device (a framebuffer + touchscreen): driven via [AppDevice] (`device(n).*`) over the SAME app
+//     channel — driver-data → the in-process `simDevicePool`.
 //
-// The two transports split along a platform seam (sim-android-tray): the app channel works
-// wherever flutter_driver can reach the VM service (incl. an adb-forwarded Android emulator), but
-// the device channels need the `device-<n>.sock` files, which live in the app's private storage and
-// are host-unreachable on an emulator. So [AppSession] owns the app channel alone (the Android
-// session shape) and [SimHarness] extends it with the host device channels (the desktop sim).
+// ONE transport (the app channel) on every platform: it works wherever flutter_driver can reach the
+// VM service, including an adb-forwarded Android emulator. (Devices were once ALSO reachable over
+// host `device-<n>.sock` sockets — a second transport that only worked on desktop; that split, and
+// the [SimHarness] vs [AppSession] shapes it forced, are gone — see app-channel-only-device-driving.)
 //
-// Lives in test_driver/ so flutter_driver stays a dev dependency. Used by the keygen
-// driver test and by `simctl`. See `.clank/plans/sim-8-dual-channel-harness.md`.
+// Lives in test_driver/ so flutter_driver stays a dev dependency. Used by the e2e driver tests and
+// by `simctl`.
 
 import 'dart:async';
-import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 
@@ -34,114 +32,10 @@ Directory simTmpRoot() {
   return dir;
 }
 
-/// The device-input channel client: JSON request/reply lines over the device's unix
-/// socket. Replies arrive in request order on the single connection, so a FIFO of
-/// completers correlates them.
-class SimDeviceChannel {
-  final Socket _socket;
-  final Queue<Completer<Map<String, dynamic>>> _pending = Queue();
-  late final StreamSubscription<String> _sub;
-
-  SimDeviceChannel._(this._socket) {
-    _sub = _socket
-        .cast<List<int>>()
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())
-        .listen((line) {
-          if (line.trim().isEmpty) return;
-          final reply = jsonDecode(line) as Map<String, dynamic>;
-          if (_pending.isNotEmpty) _pending.removeFirst().complete(reply);
-        });
-  }
-
-  static Future<SimDeviceChannel> connect(String socketPath) async {
-    final socket = await Socket.connect(
-      InternetAddress(socketPath, type: InternetAddressType.unix),
-      0,
-    );
-    return SimDeviceChannel._(socket);
-  }
-
-  Future<Map<String, dynamic>> _send(Map<String, dynamic> req) {
-    final completer = Completer<Map<String, dynamic>>();
-    _pending.add(completer);
-    _socket.write('${jsonEncode(req)}\n');
-    return completer.future;
-  }
-
-  /// Send a command and throw if the server reports `ok:false`.
-  Future<Map<String, dynamic>> _ok(Map<String, dynamic> req) async {
-    final reply = await _send(req);
-    if (reply['ok'] != true) {
-      throw StateError(
-        'device command ${req['cmd']} failed: ${reply['error']}',
-      );
-    }
-    return reply;
-  }
-
-  Future<void> tap(int x, int y) => _ok({'cmd': 'tap', 'x': x, 'y': y});
-
-  /// Press and hold at `(x,y)` for `duration` (the device integrates the elapsed
-  /// wall-clock; a hold-to-confirm control fires once past its threshold).
-  Future<void> hold(int x, int y, Duration duration) =>
-      _ok({'cmd': 'hold', 'x': x, 'y': y, 'ms': duration.inMilliseconds});
-
-  /// Hold a hold-to-confirm button at `(x,y)` long enough to fire it. Hold-to-confirm
-  /// is a device-wide pattern; the caller supplies the per-screen button point, so this
-  /// is generic (not specific to any flow).
-  Future<void> holdConfirm(
-    int x,
-    int y, [
-    Duration duration = const Duration(milliseconds: 2600),
-  ]) => hold(x, y, duration);
-
-  Future<void> swipe(int x1, int y1, int x2, int y2, Duration duration) => _ok({
-    'cmd': 'swipe',
-    'x1': x1,
-    'y1': y1,
-    'x2': x2,
-    'y2': y2,
-    'ms': duration.inMilliseconds,
-  });
-
-  /// Raw single touch event (press/move when `liftUp` false, release when true).
-  Future<void> touch(int x, int y, {required bool liftUp}) =>
-      _ok({'cmd': 'touch', 'x': x, 'y': y, 'lift_up': liftUp});
-
-  /// Write the exact device framebuffer to `path` as a PNG.
-  Future<void> screen(String path) => _ok({'cmd': 'screen', 'path': path});
-
-  Future<void> setConnected(bool connected) =>
-      _ok({'cmd': 'set_connected', 'connected': connected});
-
-  Future<bool> isConnected() async =>
-      (await _ok({'cmd': 'is_connected'}))['connected'] as bool;
-
-  /// The connected chain as 1-based device numbers, in order (pool-level — the router is
-  /// shared, so any device socket answers it).
-  Future<List<int>> chain() async =>
-      ((await _ok({'cmd': 'chain'}))['chain'] as List).cast<int>();
-
-  /// Re-cable the chain to exactly these 1-based numbers, in order (pool-level).
-  Future<void> setChain(List<int> order) =>
-      _ok({'cmd': 'set_chain', 'order': order});
-
-  Future<String> deviceId() async =>
-      (await _ok({'cmd': 'device_id'}))['device_id'] as String;
-
-  Future<void> close() async {
-    await _sub.cancel();
-    await _socket.close();
-    _socket.destroy();
-  }
-}
-
-/// A launched sim app driven over the APP channel only: the Flutter process + FlutterDriver over the
-/// (possibly adb-forwarded) VM service — `app.*` widget-tree methods + `screenshot()`. It holds NO
-/// device-input sockets, because those (`device-<n>.sock`) live in the app's private storage and are
-/// unreachable from the host when the app runs on an emulator. This is the session shape that works
-/// on Android; [SimHarness] extends it with the host device channels for the desktop sim.
+/// A launched sim app: the Flutter process + FlutterDriver over the (possibly adb-forwarded) VM
+/// service. Drives the app widget tree by semantic label (`app.*` + `screenshot()`) AND the virtual
+/// devices ([device] → [AppDevice]) over the SAME app channel, so it's the ONE session shape for host
+/// and emulator alike (`SimHarness` is now an alias for it).
 class AppSession {
   final Process _appProcess;
   final Directory appDir;
@@ -157,10 +51,9 @@ class AppSession {
   /// answer `up` with already:true against nothing).
   Future<int> get appExitCode => _appProcess.exitCode;
 
-  /// Launch the instrumented sim app over the app channel ALONE (no device sockets). This is the
-  /// Android serve shape; [SimHarness.launch] reuses [_launchApp] and then connects the host
-  /// channels. [agentOwnsKeyboard] true routes text through the driver's mock input so
-  /// [enterText] works but the real keyboard is blocked; false hands the keyboard to a human.
+  /// Launch the instrumented sim app and return a session that drives the app + devices over the app
+  /// channel. [agentOwnsKeyboard] true routes text through the driver's mock input so [enterText]
+  /// works but the real keyboard is blocked; false hands the keyboard to a human.
   static Future<AppSession> launch({
     int deviceCount = 1,
     String flutterDevice = 'macos',
@@ -318,7 +211,6 @@ class AppSession {
   /// Guarded best-effort teardown of any subset of the session resources. Every step
   /// runs even if an earlier one throws; returns the first error seen (or null).
   static Future<Object?> _cleanup({
-    List<SimDeviceChannel>? channels,
     FlutterDriver? driver,
     Process? proc,
     Directory? appDir,
@@ -335,11 +227,6 @@ class AppSession {
     // NB: the regtest backend is a DELIBERATELY PERSISTENT shared node — no test or serve tears it
     // down, so sequential runs reuse it AND multiple app instances in one test share it (none pulls
     // it out from under another). It's reaped only by `./simctl regtest down` / `./simctl clean`.
-    if (channels != null) {
-      for (final channel in channels) {
-        await guard(channel.close);
-      }
-    }
     if (driver != null) await guard(driver.close);
     if (proc != null) {
       final p = proc;
@@ -379,38 +266,67 @@ class AppSession {
 
   // ---- device driving over the APP channel (FRB pool) ----
   // These drive the in-process `simDevicePool` via driver-data, so a scenario drives a device the
-  // SAME way on host and emulator — unlike the host-only `SimDeviceChannel` sockets. Coordinates are
+  // SAME way on host and emulator — the one device transport. Coordinates are
   // device-framebuffer coords (240x280), same as the device channel.
 
-  Future<void> _device(String cmd) =>
+  Future<void> _device(String cmd) async {
+    await _deviceQuery(cmd);
+  }
+
+  /// Drive a device endpoint and return its reply — for the query endpoints (chain/id/is-connected/
+  /// screen) that return data, not just an ack.
+  Future<String> _deviceQuery(String cmd) =>
       driver.runUnsynchronized(() => driver.requestData(cmd));
 
-  /// Hold-to-confirm on device [n] at `(x,y)` for [duration] — the device integrates the elapsed
-  /// wall-clock between touch-down and -up and fires a hold-to-confirm control past its threshold.
-  Future<void> holdConfirm(
-    int n,
-    int x,
-    int y, [
-    Duration duration = const Duration(milliseconds: 2600),
-  ]) => _device('device-hold:$n:$x:$y:${duration.inMilliseconds}');
+  /// An app-channel handle to virtual device [number] (1-based, default 1): the same method surface
+  /// the host socket had, but every call goes over the app channel (driver-data → the in-process
+  /// `simDevicePool`), so it drives a device IDENTICALLY on host and emulator.
+  AppDevice device([int number = 1]) => AppDevice(this, number);
 
-  /// A predominantly-vertical swipe on device [n] (advances the device's review screens).
-  Future<void> swipeDevice(
-    int n,
-    int x1,
-    int y1,
-    int x2,
-    int y2, [
-    Duration duration = const Duration(milliseconds: 250),
-  ]) => _device('device-swipe:$n:$x1:$y1:$x2:$y2:${duration.inMilliseconds}');
+  // ---- chain composition (pool-level; one source of truth via setChain), over the app channel ----
+  // The connected chain is an ordered list of 1-based device numbers (first = the device on the
+  // coordinator USB port). connect/disconnect/reorder all funnel through setChain.
 
-  /// Raw single touch on device [n] (press when `down`, release otherwise).
-  Future<void> touchDevice(int n, int x, int y, {required bool down}) =>
-      _device('device-touch:$n:$x:$y:${down ? 'down' : 'up'}');
+  /// The connected chain, in order.
+  Future<List<int>> chain() => device(1).chain();
 
-  /// Plug device [n] into / out of the chain (daisy-chain semantics applied by the router).
-  Future<void> connectDevice(int n) => _device('device-connect:$n');
-  Future<void> disconnectDevice(int n) => _device('device-disconnect:$n');
+  /// Re-cable the chain to exactly [order] (1-based numbers, in order).
+  Future<void> setChain(List<int> order) => device(1).setChain(order);
+
+  /// Connect [number] by plugging it into the tail of the chain (the router applies the daisy-chain
+  /// semantics — the single source of truth, same as the tray).
+  Future<void> connect(int number) => device(number).setConnected(true);
+
+  /// Disconnect [number] AND everything downstream (pulling a daisy-chain device cuts those below).
+  Future<void> disconnect(int number) => device(number).setConnected(false);
+
+  /// Move [number] one position toward the head (the coordinator end).
+  Future<void> moveUp(int number) async {
+    final order = await chain();
+    final i = order.indexOf(number);
+    if (i > 0) {
+      order
+        ..removeAt(i)
+        ..insert(i - 1, number);
+      await setChain(order);
+    }
+  }
+
+  /// Move [number] one position toward the tail.
+  Future<void> moveDown(int number) async {
+    final order = await chain();
+    final i = order.indexOf(number);
+    if (i >= 0 && i < order.length - 1) {
+      order
+        ..removeAt(i)
+        ..insert(i + 1, number);
+      await setChain(order);
+    }
+  }
+
+  /// Disconnect/connect [number] (the keygen driver's post-keygen unplug).
+  Future<void> unplug([int number = 1]) => disconnect(number);
+  Future<void> plug([int number = 1]) => connect(number);
 
   /// The app's FlutterView size + system insets (LOGICAL px) — for occlusion checks against a
   /// widget's screen rect (e.g. is a button below `height - bottomInset`, i.e. behind the nav bar).
@@ -433,15 +349,16 @@ class AppSession {
 
   // ---- reusable flows (driven over the app channel, so they run on host AND emulator) ----
 
-  /// Run [body] against an [AppSession] (app channel only) on [flutterDevice] (or the
-  /// `SIM_FLUTTER_DEVICE` env, default macos). This is the emulator e2e runner: `./simctl test
-  /// <name> --android` boots the emulator and sets that env. Captures failure diagnostics and
-  /// asserts no residue, like [SimHarness.runScenario].
+  /// Run [body] against an [AppSession] on [flutterDevice] (or the `SIM_FLUTTER_DEVICE` env, default
+  /// macos) — the single session shape for host AND emulator (devices drive over the app channel).
+  /// `./simctl test <name> --android` boots the emulator and sets that env. [withRegtest] brings up
+  /// (or attaches to) the shared regtest backend. Captures failure diagnostics and asserts no residue.
   static Future<void> runScenario(
     String name,
     Future<void> Function(AppSession h) body, {
     int deviceCount = 1,
     String? flutterDevice,
+    bool withRegtest = false,
     Map<String, String> extraDartDefines = const {},
   }) async {
     final device =
@@ -449,6 +366,7 @@ class AppSession {
     final h = await AppSession.launch(
       deviceCount: deviceCount,
       flutterDevice: device,
+      withRegtest: withRegtest,
       extraDartDefines: extraDartDefines,
     );
     try {
@@ -497,7 +415,7 @@ class AppSession {
     var confirmed = false;
     for (var attempt = 0; attempt < 8 && !confirmed; attempt++) {
       for (var n = 1; n <= deviceCount; n++) {
-        await holdConfirm(n, _keygenConfirmX, _keygenConfirmY);
+        await device(n).holdConfirm(_keygenConfirmX, _keygenConfirmY);
       }
       confirmed = await exists('Yes');
     }
@@ -506,7 +424,7 @@ class AppSession {
     }
     await tapUntil('Yes', RegExp('Unplug devices to continue'));
     for (var n = 1; n <= deviceCount; n++) {
-      await disconnectDevice(n);
+      await device(n).setConnected(false);
     }
     await waitFor(RegExp('Receive'));
   }
@@ -516,7 +434,7 @@ class AppSession {
   /// the sheet (with the "Show secret backup" action) on screen.
   Future<void> openDeviceBackup({int device = 1}) async {
     await tapUntil(RegExp('unfinished backups'), RegExp('Backup keys'));
-    await connectDevice(device);
+    await this.device(device).setConnected(true);
     await tapUntil('Backup', RegExp('Record backup information'));
   }
 
@@ -733,8 +651,15 @@ class AppSession {
     }
   }
 
-  /// Hook for subclasses to add session-specific failure artifacts into [dir]. No-op here.
-  Future<void> _captureExtra(Directory dir) async {}
+  /// Each virtual device's framebuffer PNG into the failure-diagnostics [dir], over the app channel
+  /// (so it works on host AND emulator). Best-effort per device.
+  Future<void> _captureExtra(Directory dir) async {
+    for (final n in await deviceNumbers()) {
+      try {
+        await device(n).screen('${dir.path}/device-$n.png');
+      } catch (_) {}
+    }
+  }
 
   /// Quit the app and delete the disposable app dir (which holds all harness
   /// screenshots) — no residue. The first cleanup error (if any) is rethrown once
@@ -749,213 +674,70 @@ class AppSession {
   }
 }
 
-/// The desktop sim: an [AppSession] plus the host device-input channels (one `device-<n>.sock` per
-/// virtual device). Driving devices over those sockets is what `./simctl` and the e2e tests use; it
-/// works only when the app shares the host filesystem (a desktop platform), not on an emulator.
-class SimHarness extends AppSession {
-  /// One device-input channel per virtual device, in 1-based order; index with
-  /// [device]. A single-device session has just `devices[0]` (i.e. `device(1)`).
-  final List<SimDeviceChannel> devices;
+/// An app-channel handle to one virtual device (1-based [_number]): the same method surface the
+/// host-only `device-<n>.sock` client had, but every call goes over the app channel (driver-data → the
+/// in-process `simDevicePool`) — so a scenario drives a device IDENTICALLY on host and emulator, and
+/// `./simctl` device commands are no longer host-only. Returned by [AppSession.device].
+class AppDevice {
+  final AppSession _session;
+  final int _number;
+  AppDevice(this._session, this._number);
 
-  SimHarness._(
-    super.appProcess,
-    super.appDir,
-    super.driver,
-    super.appLog,
-    this.devices,
+  /// Tap (touch down then up) at `(x,y)`.
+  Future<void> tap(int x, int y) =>
+      _session._device('device-tap:$_number:$x:$y');
+
+  /// Press and hold at `(x,y)` for [duration] — the device integrates the elapsed wall-clock and a
+  /// hold-to-confirm control fires past its threshold.
+  Future<void> hold(int x, int y, Duration duration) =>
+      _session._device('device-hold:$_number:$x:$y:${duration.inMilliseconds}');
+
+  /// Hold a hold-to-confirm button at `(x,y)` long enough to fire it.
+  Future<void> holdConfirm(
+    int x,
+    int y, [
+    Duration duration = const Duration(milliseconds: 2600),
+  ]) => hold(x, y, duration);
+
+  /// Swipe from `(x1,y1)` to `(x2,y2)` over [duration] (advances the device's review screens).
+  Future<void> swipe(int x1, int y1, int x2, int y2, Duration duration) =>
+      _session._device(
+        'device-swipe:$_number:$x1:$y1:$x2:$y2:${duration.inMilliseconds}',
+      );
+
+  /// Raw single touch (press when `liftUp` false, release when true).
+  Future<void> touch(int x, int y, {required bool liftUp}) =>
+      _session._device('device-touch:$_number:$x:$y:${liftUp ? 'up' : 'down'}');
+
+  /// Plug this device into / out of the chain (the router applies daisy-chain semantics).
+  Future<void> setConnected(bool connected) => _session._device(
+    'device-${connected ? 'connect' : 'disconnect'}:$_number',
   );
 
-  /// The device-input channel for device [number] (1-based; defaults to device 1).
-  SimDeviceChannel device([int number = 1]) => devices[number - 1];
+  /// Whether this device is connected (its number is in the chain).
+  Future<bool> isConnected() async =>
+      (await _session._deviceQuery('device-is-connected:$_number')) == 'true';
 
-  /// Run [body] against a fresh harness; on ANY failure capture diagnostics — a
-  /// whole-app screenshot, the device framebuffer, the error+stack, and recent app
-  /// logs — to a persistent dir, then always tear down. Rethrows so the run still
-  /// fails. This is the supported way to drive a scenario: a failure leaves you a
-  /// picture of where it stopped plus the logs, instead of a bare stack trace.
-  ///
-  /// On success it also enforces the no-residue invariant: the disposable app dir (and
-  /// thus the device socket + all screenshots) must be gone after teardown.
-  static Future<void> runScenario(
-    String name,
-    Future<void> Function(SimHarness h) body, {
-    int deviceCount = 1,
-    String flutterDevice = 'macos',
-    bool withRegtest = false,
-    Map<String, String> extraDartDefines = const {},
-  }) async {
-    final h = await SimHarness.launch(
-      deviceCount: deviceCount,
-      flutterDevice: flutterDevice,
-      withRegtest: withRegtest,
-      extraDartDefines: extraDartDefines,
-    );
-    try {
-      await body(h);
-    } catch (error, stack) {
-      await h._captureFailure(name, error, stack);
-      rethrow;
-    } finally {
-      await h.tearDown();
-    }
-    // Reached only when [body] succeeded: assert teardown left nothing behind.
-    if (await h.appDir.exists()) {
-      throw StateError('teardown left residue: ${h.appDir.path}');
-    }
+  /// The connected chain as 1-based device numbers, in order (pool-level — any device answers it).
+  Future<List<int>> chain() async {
+    final csv = await _session._deviceQuery('device-chain');
+    return csv.isEmpty ? <int>[] : csv.split(',').map(int.parse).toList();
   }
 
-  /// Launch the instrumented sim app, then connect the app channel (flutter_driver) AND a device
-  /// channel per `device-<n>.sock`. Host platforms only — the sockets must be reachable.
-  static Future<SimHarness> launch({
-    int deviceCount = 1,
-    String flutterDevice = 'macos',
-    bool agentOwnsKeyboard = true,
-    bool withRegtest = false,
-    Map<String, String> extraDartDefines = const {},
-    IOSink? logSink,
-  }) async {
-    final (proc, appDir, driver, appLog) = await AppSession._launchApp(
-      deviceCount: deviceCount,
-      flutterDevice: flutterDevice,
-      agentOwnsKeyboard: agentOwnsKeyboard,
-      withRegtest: withRegtest,
-      extraDartDefines: extraDartDefines,
-      // The host shares the filesystem with the app, so point it at our appDir — that's where its
-      // device-<n>.sock files must land for [_connectChannel] below to reach them.
-      shareHostAppDir: true,
-      logSink: logSink,
-    );
+  /// Re-cable the chain to exactly these 1-based numbers, in order (pool-level).
+  Future<void> setChain(List<int> order) =>
+      _session._device('device-set-chain:${order.join(',')}');
 
-    final channels = <SimDeviceChannel>[];
-    try {
-      // load_sim creates device-<n>.sock (1-based) during startup; wait for each before
-      // connecting. (Runtime-added devices are picked up later by [ensureDevices].)
-      for (var n = 1; n <= deviceCount; n++) {
-        channels.add(await _connectChannel(appDir, n));
-      }
-      return SimHarness._(proc, appDir, driver, appLog, channels);
-    } catch (_) {
-      await AppSession._cleanup(
-        channels: channels,
-        driver: driver,
-        proc: proc,
-        appDir: appDir,
-      );
-      rethrow;
-    }
-  }
+  Future<String> deviceId() => _session._deviceQuery('device-id:$_number');
 
-  /// Wait for `device-<number>.sock` (created by `load_sim` at startup or `add_device` at
-  /// runtime) to appear, then connect a channel to it.
-  static Future<SimDeviceChannel> _connectChannel(
-    Directory appDir,
-    int number,
-  ) async {
-    final socketPath = '${appDir.path}/device-$number.sock';
-    final deadline = DateTime.now().add(const Duration(seconds: 30));
-    while (!await File(socketPath).exists()) {
-      if (DateTime.now().isAfter(deadline)) {
-        throw StateError('device socket never appeared at $socketPath');
-      }
-      await Future.delayed(const Duration(milliseconds: 100));
-    }
-    return SimDeviceChannel.connect(socketPath);
-  }
-
-  /// Reconcile the local channel cache with the app-side fleet (the source of truth via
-  /// [deviceNumbers]). Devices can be added by the TRAY + button too — a writer this harness never
-  /// observes — so we cannot just append one channel per our own [addDevice]; instead we connect
-  /// `device-<n>.sock` for every number the app reports that we don't yet hold. Numbers are
-  /// contiguous and append-only, so connecting the missing ones in ascending order keeps
-  /// `device(n) ↔ socket-n` aligned (no stale or misindexed cache).
-  Future<void> ensureDevices() async {
-    final numbers = await deviceNumbers();
-    for (var i = 0; i < numbers.length; i++) {
-      final n = numbers[i];
-      if (n != i + 1) {
-        throw StateError('app device numbers not contiguous 1..N: $numbers');
-      }
-      if (n > devices.length) devices.add(await _connectChannel(appDir, n));
-    }
-  }
-
-  /// Add a device (via the app channel) AND connect its new host socket, so [device]`(n)` can drive
-  /// it. Returns the new 1-based number.
-  @override
-  Future<int> addDevice() async {
-    final number = await super.addDevice();
-    await ensureDevices();
-    return number;
-  }
-
-  @override
-  Future<void> _captureExtra(Directory dir) async {
-    for (var n = 1; n <= devices.length; n++) {
-      try {
-        await device(n).screen('${dir.path}/device-$n.png');
-      } catch (_) {}
-    }
-  }
-
-  // ---- chain composition (pool-level; one source of truth via setChain) ----
-  // The connected chain is an ordered list of 1-based device numbers (first = the device
-  // on the coordinator USB port). connect/disconnect/reorder all funnel through setChain.
-
-  /// The connected chain, in order.
-  Future<List<int>> chain() => device(1).chain();
-
-  /// Re-cable the chain to exactly [order] (1-based numbers, in order).
-  Future<void> setChain(List<int> order) => device(1).setChain(order);
-
-  /// Connect [number] by plugging it into the tail of the chain (no-op if already
-  /// connected). Routes through the device's `set_connected` so the router applies the
-  /// daisy-chain semantics (the single source of truth), same as the tray.
-  Future<void> connect(int number) => device(number).setConnected(true);
-
-  /// Disconnect [number] AND everything downstream of it — pulling a device from a daisy
-  /// chain cuts power/comms to every device below it.
-  Future<void> disconnect(int number) => device(number).setConnected(false);
-
-  /// Move [number] one position toward the head (the coordinator end).
-  Future<void> moveUp(int number) async {
-    final order = await chain();
-    final i = order.indexOf(number);
-    if (i > 0) {
-      order
-        ..removeAt(i)
-        ..insert(i - 1, number);
-      await setChain(order);
-    }
-  }
-
-  /// Move [number] one position toward the tail.
-  Future<void> moveDown(int number) async {
-    final order = await chain();
-    final i = order.indexOf(number);
-    if (i >= 0 && i < order.length - 1) {
-      order
-        ..removeAt(i)
-        ..insert(i + 1, number);
-      await setChain(order);
-    }
-  }
-
-  /// Disconnect/connect [number] (kept for the keygen driver's post-keygen unplug).
-  Future<void> unplug([int number = 1]) => disconnect(number);
-  Future<void> plug([int number = 1]) => connect(number);
-
-  /// Close both channels, quit the app, and delete the disposable app dir (which
-  /// holds the device socket and all harness screenshots) — no residue. App
-  /// termination and dir deletion run even if a client close fails; the first
-  /// cleanup error (if any) is rethrown once everything has been torn down.
-  @override
-  Future<void> tearDown() async {
-    final err = await AppSession._cleanup(
-      channels: devices,
-      driver: driver,
-      proc: _appProcess,
-      appDir: appDir,
-    );
-    if (err != null) throw err;
+  /// Write the device framebuffer to [path] as a PNG (the endpoint returns a base64 PNG).
+  Future<void> screen(String path) async {
+    final b64 = await _session._deviceQuery('device-screen:$_number');
+    await File(path).writeAsBytes(base64Decode(b64));
   }
 }
+
+/// `SimHarness` was the desktop session shape — an [AppSession] plus host `device-<n>.sock` channels.
+/// Now that devices drive over the app channel on every platform (see [AppDevice]), the two shapes
+/// are one; this alias keeps existing callers compiling.
+typedef SimHarness = AppSession;

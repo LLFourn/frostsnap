@@ -1,6 +1,7 @@
 //! The faucet control socket: a unix-socket server that exposes the [`Regtest`] faucet over a
 //! JSON line protocol, so the Dart `./simctl` layer can drive it (fund the app's wallet, mine,
-//! query balance) — the same pattern as the device-input channel (`SimDeviceChannel`).
+//! query balance). The regtest faucet keeps its own control socket (it is NOT a device transport —
+//! the device-input sockets were retired in app-channel-only-device-driving).
 //!
 //! Protocol: one JSON request object per line, one JSON reply object per line.
 //! ```text

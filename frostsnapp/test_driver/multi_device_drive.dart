@@ -24,15 +24,13 @@ void _expectChain(List<int> actual, List<int> want) {
 
 Future<void> main() async {
   await SimHarness.runScenario('multi-device', (h) async {
-    // Three device channels over 1-based sockets, with distinct ids (distinct seeds).
-    if (h.devices.length != 3) {
-      throw StateError('expected 3 device channels, got ${h.devices.length}');
+    // Three devices in the fleet (1-based), with distinct ids (distinct seeds).
+    final numbers = await h.deviceNumbers();
+    if (numbers.length != 3) {
+      throw StateError('expected 3 devices, got ${numbers.length}');
     }
     final ids = <String>{};
-    for (var n = 1; n <= 3; n++) {
-      if (!await File('${h.appDir.path}/device-$n.sock').exists()) {
-        throw StateError('missing socket for device $n');
-      }
+    for (final n in numbers) {
       ids.add(await h.device(n).deviceId());
     }
     if (ids.length != 3) {
