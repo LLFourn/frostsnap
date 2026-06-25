@@ -1,13 +1,24 @@
 import 'dart:async';
 import 'dart:ui' as ui;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:frostsnap/copy_feedback.dart';
 import 'package:frostsnap/sim_faucet.dart';
 import 'package:frostsnap/src/rust/api/sim.dart';
 import 'package:frostsnap/wallet.dart' show SatoshiText;
 
 const double _trayWidth = 384;
+
+/// Below this width (e.g. a phone) the console can't dock beside the app without crushing it, so
+/// [SimTrayShell] presents it as a slide-in panel instead. Roughly the Material compact/expanded
+/// line.
+const double _narrowBreakpoint = 900;
+
+/// Force the narrow (slide-in) presentation regardless of width — lets the slide-in be driven on a
+/// wide desktop host (the narrow-tray e2e passes this), so it needs no emulator to test.
+const bool _kForceNarrow = bool.fromEnvironment('SIM_FORCE_NARROW');
 
 /// Device dimensions of the virtual device framebuffer (sim-1). Pointer coords
 /// are scaled back to this range before being injected via [SimDevice.touch].
@@ -24,28 +35,36 @@ const double _offScreenWidth = 69;
 const Color _liveColor = Color(0xFF3DDC97);
 const Color _pendingColor = Color(0xFFE0A458);
 
-/// Docked debug console for the SIM entrypoint (`kSim`). A faucet card ("Test BTC", when a
-/// regtest backend is wired) sits above the device manager: the connected daisy chain in order
-/// (top = the device on the coordinator USB port) and the disconnected devices. Every device
-/// action recomputes the ordered list and calls [DevicePool.setChain], the single source of truth.
-class SimDeviceTray extends StatefulWidget {
+/// The SIM debug console content (`kSim`): a faucet card ("Test BTC", when a regtest backend is
+/// wired) above the device manager — the connected daisy chain in order (top = the device on the
+/// coordinator USB port) and the disconnected devices. Every device action recomputes the ordered
+/// list and calls [DevicePool.setChain], the single source of truth.
+///
+/// This is the pure content — it makes NO width/dock assumption. [SimTrayShell] presents it either
+/// docked beside the app (wide) or as a slide-in panel (narrow). When [onClose] is set (slide-in
+/// mode) the header shows a close affordance.
+class SimTrayContent extends StatefulWidget {
   final DevicePool pool;
 
   /// The faucet control socket, when the session was launched with a regtest backend; enables
   /// the "Test BTC" card. Null in an offline sim — the card is hidden.
   final String? regtestControlSocket;
 
-  const SimDeviceTray({
+  /// When set, the header shows a close button (the slide-in shell wires it to dismiss the panel).
+  final VoidCallback? onClose;
+
+  const SimTrayContent({
     super.key,
     required this.pool,
     this.regtestControlSocket,
+    this.onClose,
   });
 
   @override
-  State<SimDeviceTray> createState() => _SimDeviceTrayState();
+  State<SimTrayContent> createState() => _SimTrayContentState();
 }
 
-class _SimDeviceTrayState extends State<SimDeviceTray> {
+class _SimTrayContentState extends State<SimTrayContent> {
   // The fleet (which GROWS via the + button or an external simctl/driver-data add) and the
   // chain config (mutable from outside the tray) have no change stream, so poll: every tick
   // re-reads the device list into [_devices] and rebuilds (build() re-reads chain()), so the
@@ -100,113 +119,373 @@ class _SimDeviceTrayState extends State<SimDeviceTray> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    // The tray docks BESIDE the app's Navigator (so dialogs can't cover it), which puts it
-    // outside the Navigator's Overlay/Material. Give it its own Overlay + Material so Material
-    // widgets (ink, fields, tooltips) work in here.
-    return SizedBox(
-      width: _trayWidth,
-      child: Overlay(
-        initialEntries: [
-          OverlayEntry(
-            builder: (context) => Material(
-              color: theme.colorScheme.surfaceContainerLowest,
-              child: Builder(
-                builder: (context) {
-                  final devices = _devices;
-                  if (devices == null) {
-                    return const Center(child: CircularProgressIndicator());
-                  }
-                  final chain = widget.pool.chain();
-                  final byNumber = {for (final d in devices) d.number(): d};
-                  // Connected devices in chain order (skip any number the pool no longer knows,
-                  // defensively); everything else is disconnected, in number order.
-                  final connected = [
-                    for (final n in chain)
-                      if (byNumber[n] != null) byNumber[n]!,
-                  ];
-                  final disconnected = [
-                    for (final d in devices)
-                      if (!chain.contains(d.number())) d,
-                  ];
-                  final allConnected = disconnected.isEmpty;
+    // The console renders OUTSIDE the app's Navigator (the shell mounts it above the app, so
+    // dialogs can't cover it). That puts it outside the Navigator's Overlay/Material, so give it
+    // its own Overlay + Material so Material widgets (ink, fields, tooltips) work in here.
+    return Overlay(
+      initialEntries: [
+        OverlayEntry(
+          builder: (context) => Material(
+            color: theme.colorScheme.surfaceContainerLowest,
+            child: Builder(
+              builder: (context) {
+                final devices = _devices;
+                if (devices == null) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                final chain = widget.pool.chain();
+                final byNumber = {for (final d in devices) d.number(): d};
+                // Connected devices in chain order (skip any number the pool no longer knows,
+                // defensively); everything else is disconnected, in number order.
+                final connected = [
+                  for (final n in chain)
+                    if (byNumber[n] != null) byNumber[n]!,
+                ];
+                final disconnected = [
+                  for (final d in devices)
+                    if (!chain.contains(d.number())) d,
+                ];
+                final allConnected = disconnected.isEmpty;
 
-                  return Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _TrayHeader(
-                        deviceCount: devices.length,
-                        connectedCount: connected.length,
-                        allConnected: allConnected,
-                        onAddDevice: () => unawaited(_addDevice()),
-                        onToggleAll: () => _apply(
-                          allConnected
-                              ? const []
-                              : [for (final d in devices) d.number()],
-                        ),
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _TrayHeader(
+                      deviceCount: devices.length,
+                      connectedCount: connected.length,
+                      allConnected: allConnected,
+                      onClose: widget.onClose,
+                      onAddDevice: () => unawaited(_addDevice()),
+                      onToggleAll: () => _apply(
+                        allConnected
+                            ? const []
+                            : [for (final d in devices) d.number()],
                       ),
-                      Expanded(
-                        child: ListView(
-                          padding: const EdgeInsets.fromLTRB(12, 4, 12, 16),
-                          children: [
-                            if (widget.regtestControlSocket != null) ...[
-                              _FaucetCard(
-                                socketPath: widget.regtestControlSocket!,
+                    ),
+                    Expanded(
+                      child: ListView(
+                        // Clear the bottom system inset (Android gesture/nav bar) so the last card
+                        // isn't hidden behind it.
+                        padding: EdgeInsets.fromLTRB(
+                          12,
+                          4,
+                          12,
+                          16 + MediaQuery.paddingOf(context).bottom,
+                        ),
+                        children: [
+                          if (widget.regtestControlSocket != null) ...[
+                            _FaucetCard(
+                              socketPath: widget.regtestControlSocket!,
+                            ),
+                            const SizedBox(height: 16),
+                          ],
+                          _SectionLabel(
+                            'Chain',
+                            trailing: connected.isEmpty
+                                ? null
+                                : '${connected.length}',
+                          ),
+                          const SizedBox(height: 8),
+                          if (connected.isEmpty)
+                            const _EmptyHint(
+                              icon: Icons.power_off_rounded,
+                              text: 'No devices connected',
+                            )
+                          else
+                            for (var i = 0; i < connected.length; i++)
+                              Padding(
+                                key: ValueKey(connected[i].number()),
+                                padding: const EdgeInsets.only(bottom: 8),
+                                child: _ChainCard(
+                                  device: connected[i],
+                                  position: i + 1,
+                                  isHead: i == 0,
+                                  onDisconnect: () =>
+                                      _setConnected(connected[i], false),
+                                ),
                               ),
-                              const SizedBox(height: 16),
-                            ],
+                          if (disconnected.isNotEmpty) ...[
+                            const SizedBox(height: 16),
                             _SectionLabel(
-                              'Chain',
-                              trailing: connected.isEmpty
-                                  ? null
-                                  : '${connected.length}',
+                              'Disconnected',
+                              trailing: '${disconnected.length}',
                             ),
                             const SizedBox(height: 8),
-                            if (connected.isEmpty)
-                              const _EmptyHint(
-                                icon: Icons.power_off_rounded,
-                                text: 'No devices connected',
-                              )
-                            else
-                              for (var i = 0; i < connected.length; i++)
-                                Padding(
-                                  key: ValueKey(connected[i].number()),
-                                  padding: const EdgeInsets.only(bottom: 8),
-                                  child: _ChainCard(
-                                    device: connected[i],
-                                    position: i + 1,
-                                    isHead: i == 0,
-                                    onDisconnect: () =>
-                                        _setConnected(connected[i], false),
-                                  ),
+                            for (final device in disconnected)
+                              Padding(
+                                key: ValueKey(device.number()),
+                                padding: const EdgeInsets.only(bottom: 8),
+                                child: _OffCard(
+                                  device: device,
+                                  onConnect: () => _setConnected(device, true),
                                 ),
-                            if (disconnected.isNotEmpty) ...[
-                              const SizedBox(height: 16),
-                              _SectionLabel(
-                                'Disconnected',
-                                trailing: '${disconnected.length}',
                               ),
-                              const SizedBox(height: 8),
-                              for (final device in disconnected)
-                                Padding(
-                                  key: ValueKey(device.number()),
-                                  padding: const EdgeInsets.only(bottom: 8),
-                                  child: _OffCard(
-                                    device: device,
-                                    onConnect: () =>
-                                        _setConnected(device, true),
-                                  ),
-                                ),
-                            ],
                           ],
-                        ),
+                        ],
                       ),
-                    ],
-                  );
-                },
-              ),
+                    ),
+                  ],
+                );
+              },
             ),
           ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Presents [SimTrayContent] responsively over the app. On a WIDE surface the console docks beside
+/// the app in a fixed-width column (desktop ergonomics: drive a device while a dialog is up). On a
+/// NARROW surface (a phone) the app is full-bleed and the console slides in from the right over a
+/// scrim, opened by a right-edge handle. In BOTH modes the console renders ABOVE the app's
+/// Navigator (the shell is mounted by `MaterialApp.builder`), so it overlays in-app dialogs and
+/// stays interactable while one is up.
+class SimTrayShell extends StatefulWidget {
+  final Widget app;
+  final DevicePool pool;
+  final String? regtestControlSocket;
+
+  const SimTrayShell({
+    super.key,
+    required this.app,
+    required this.pool,
+    this.regtestControlSocket,
+  });
+
+  @override
+  State<SimTrayShell> createState() => _SimTrayShellState();
+}
+
+class _SimTrayShellState extends State<SimTrayShell>
+    with SingleTickerProviderStateMixin {
+  // 0 = closed (off-screen right), 1 = fully open. Position/scrim/handle all read this RAW value
+  // so a drag tracks the finger 1:1; the eased curve is applied by animateTo/animateBack (open/
+  // close) and the spring by fling — none of which a CurvedAnimation wrapper would allow mid-drag.
+  late final AnimationController _anim = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 300),
+  );
+
+  // The edge handle shows the live device count. The console polls its own (richer) list, but it
+  // is only mounted while the panel is open, so the shell keeps a light count poll of its own.
+  int _deviceCount = 0;
+  Timer? _countPoll;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_refreshCount());
+    _countPoll = Timer.periodic(
+      const Duration(milliseconds: 500),
+      (_) => unawaited(_refreshCount()),
+    );
+  }
+
+  Future<void> _refreshCount() async {
+    final n = (await widget.pool.devices()).length;
+    if (mounted && n != _deviceCount) setState(() => _deviceCount = n);
+  }
+
+  @override
+  void dispose() {
+    _countPoll?.cancel();
+    _anim.dispose();
+    super.dispose();
+  }
+
+  void _open() => _anim.animateTo(1, curve: Curves.easeOutCubic);
+  void _close() => _anim.animateBack(
+    0,
+    duration: const Duration(milliseconds: 250),
+    curve: Curves.easeInCubic,
+  );
+
+  // Drag the handle/panel horizontally: leftward opens, rightward closes, 1:1 with the finger.
+  void _onDrag(DragUpdateDetails d, double panelWidth) {
+    _anim.value = (_anim.value - d.primaryDelta! / panelWidth).clamp(0.0, 1.0);
+  }
+
+  // On release a decisive flick wins (velocity in controller units/sec); otherwise settle to
+  // whichever side the panel is nearer.
+  void _onDragEnd(DragEndDetails d, double panelWidth) {
+    final v = -d.velocity.pixelsPerSecond.dx / panelWidth;
+    if (v.abs() >= 0.5) {
+      _anim.fling(velocity: v);
+    } else if (_anim.value >= 0.5) {
+      _open();
+    } else {
+      _close();
+    }
+  }
+
+  Widget _content({VoidCallback? onClose}) => SimTrayContent(
+    pool: widget.pool,
+    regtestControlSocket: widget.regtestControlSocket,
+    onClose: onClose,
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    final width = MediaQuery.sizeOf(context).width;
+    final narrow = _kForceNarrow || width < _narrowBreakpoint;
+
+    if (!narrow) {
+      return Row(
+        textDirection: TextDirection.ltr,
+        children: [
+          Expanded(child: widget.app),
+          SizedBox(width: _trayWidth, child: _content()),
         ],
+      );
+    }
+
+    // Narrow: app full-bleed; the console slides in from the right over a scrim. The panel is only
+    // in the tree while open/animating, so a closed tray streams no device frames.
+    final panelWidth = (width * 0.88).clamp(0.0, _trayWidth + 24).toDouble();
+    return Stack(
+      textDirection: TextDirection.ltr,
+      children: [
+        widget.app,
+        AnimatedBuilder(
+          animation: _anim,
+          builder: (context, _) {
+            final t = _anim.value;
+            return Stack(
+              children: [
+                if (t > 0)
+                  Positioned.fill(
+                    key: const ValueKey('sim-tray-scrim'),
+                    child: GestureDetector(
+                      onTap: _close,
+                      child: ColoredBox(
+                        color: Colors.black.withValues(alpha: 0.5 * t),
+                      ),
+                    ),
+                  ),
+                if (t < 1)
+                  Positioned(
+                    key: const ValueKey('sim-tray-handle'),
+                    top: 0,
+                    bottom: 0,
+                    right: 0,
+                    child: Center(
+                      // Tap the handle to open, or drag it inward (from the edge) to pull the
+                      // panel in with your finger.
+                      child: GestureDetector(
+                        onHorizontalDragUpdate: (d) => _onDrag(d, panelWidth),
+                        onHorizontalDragEnd: (d) => _onDragEnd(d, panelWidth),
+                        child: Opacity(
+                          opacity: 1 - t,
+                          child: _EdgeHandle(
+                            deviceCount: _deviceCount,
+                            onOpen: _open,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                if (t > 0)
+                  Positioned(
+                    key: const ValueKey('sim-tray-panel'),
+                    top: 0,
+                    bottom: 0,
+                    right: (t - 1) * panelWidth,
+                    width: panelWidth,
+                    // Swipe the panel right to dismiss it (a horizontal drag; the content's own
+                    // vertical scroll and taps are a different gesture axis, so they don't clash).
+                    child: GestureDetector(
+                      onHorizontalDragUpdate: (d) => _onDrag(d, panelWidth),
+                      onHorizontalDragEnd: (d) => _onDragEnd(d, panelWidth),
+                      child: Material(
+                        elevation: 16,
+                        child: _content(onClose: _close),
+                      ),
+                    ),
+                  ),
+              ],
+            );
+          },
+        ),
+      ],
+    );
+  }
+}
+
+/// The right-edge affordance that opens the slide-in console on a narrow screen: a frosted,
+/// primary-tinted pill hugging the edge with the live device count and a grip — it reads as "pull
+/// me in". `semanticLabel: 'Open simulator'` so flutter_driver opens it the same as a human.
+class _EdgeHandle extends StatelessWidget {
+  final int deviceCount;
+  final VoidCallback onOpen;
+
+  const _EdgeHandle({required this.deviceCount, required this.onOpen});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    // container + ExcludeSemantics so this exposes EXACTLY one node labelled 'Open simulator' — the
+    // inner count Text would otherwise merge in ("Open simulator\n$n") and break the exact-label
+    // match flutter_driver / the e2e use. The real pointer tap still reaches the GestureDetector.
+    return Semantics(
+      button: true,
+      container: true,
+      label: 'Open simulator',
+      child: ExcludeSemantics(
+        child: GestureDetector(
+          onTap: onOpen,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 14),
+            decoration: BoxDecoration(
+              color: cs.surfaceContainerHighest.withValues(alpha: 0.97),
+              borderRadius: const BorderRadius.horizontal(
+                left: Radius.circular(16),
+              ),
+              border: Border.all(color: cs.outlineVariant),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.28),
+                  blurRadius: 12,
+                  offset: const Offset(-3, 0),
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.developer_board_rounded,
+                  size: 16,
+                  color: cs.primary,
+                ),
+                const SizedBox(height: 8),
+                Container(
+                  width: 20,
+                  height: 20,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: cs.primary.withValues(alpha: 0.18),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Text(
+                    '$deviceCount',
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: cs.primary,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Icon(
+                  Icons.drag_indicator_rounded,
+                  size: 16,
+                  color: cs.onSurfaceVariant,
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -219,26 +498,51 @@ class _TrayHeader extends StatelessWidget {
   final VoidCallback onAddDevice;
   final VoidCallback onToggleAll;
 
+  /// Slide-in mode only: dismiss the panel. Null when docked (no close affordance).
+  final VoidCallback? onClose;
+
   const _TrayHeader({
     required this.deviceCount,
     required this.connectedCount,
     required this.allConnected,
     required this.onAddDevice,
     required this.onToggleAll,
+    this.onClose,
   });
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
+    // The console renders edge-to-edge (it's mounted outside the app's Scaffold), so on a phone the
+    // system status bar overlaps the top. Let the header's coloured bar fill to the top edge, but
+    // pad its content down past the status bar so the buttons stay tappable (app-bar style).
+    final topInset = MediaQuery.paddingOf(context).top;
     return Container(
       decoration: BoxDecoration(
         color: cs.surfaceContainerLow,
         border: Border(bottom: BorderSide(color: cs.outlineVariant)),
       ),
-      padding: const EdgeInsets.fromLTRB(16, 14, 12, 14),
+      padding: EdgeInsets.fromLTRB(
+        onClose != null ? 6 : 16,
+        14 + topInset,
+        12,
+        14,
+      ),
       child: Row(
         children: [
+          if (onClose != null) ...[
+            IconButton(
+              onPressed: onClose,
+              visualDensity: VisualDensity.compact,
+              tooltip: 'Close simulator',
+              icon: const Icon(
+                Icons.chevron_right_rounded,
+                semanticLabel: 'Close simulator',
+              ),
+            ),
+            const SizedBox(width: 2),
+          ],
           Icon(Icons.developer_board_rounded, size: 20, color: cs.primary),
           const SizedBox(width: 10),
           Expanded(
@@ -491,6 +795,13 @@ class _FaucetCardState extends State<_FaucetCard> {
     return 'Mined 1 block';
   });
 
+  /// Paste the clipboard into the fund-address field (the prefix-icon button).
+  Future<void> _pasteAddress() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final text = data?.text?.trim();
+    if (text != null && text.isNotEmpty) _addressController.text = text;
+  }
+
   Future<void> _fund() {
     final address = _addressController.text.trim();
     final btc = double.tryParse(_amountController.text.trim());
@@ -658,7 +969,11 @@ class _FaucetCardState extends State<_FaucetCard> {
               isDense: true,
               filled: true,
               fillColor: cs.surfaceContainerHighest,
-              prefixIcon: const Icon(Icons.content_paste_rounded, size: 18),
+              prefixIcon: IconButton(
+                icon: const Icon(Icons.content_paste_rounded, size: 18),
+                tooltip: 'Paste address',
+                onPressed: () => unawaited(_pasteAddress()),
+              ),
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(12),
                 borderSide: BorderSide.none,
@@ -1090,11 +1405,24 @@ class _DeviceScreenState extends State<_DeviceScreen> {
     if (!widget.interactive) {
       return screen;
     }
-    return Listener(
-      onPointerDown: (e) => _pointerDown(e.localPosition, rendered),
-      onPointerUp: (e) => _pointerUp(e.localPosition, rendered),
-      onPointerCancel: (e) => _pointerCancel(e.localPosition, rendered),
-      child: screen,
+    // The device screen is a touchscreen: it must "suck in" every gesture so the enclosing
+    // scrolling list (and the slide-in panel's drag-to-close) can't steal a swipe meant for the
+    // device. An EagerGestureRecognizer wins the gesture arena immediately, so neither the ListView
+    // nor the panel ever claims a drag that started here; the Listener still injects the raw touch.
+    return RawGestureDetector(
+      gestures: {
+        EagerGestureRecognizer:
+            GestureRecognizerFactoryWithHandlers<EagerGestureRecognizer>(
+              EagerGestureRecognizer.new,
+              (_) {},
+            ),
+      },
+      child: Listener(
+        onPointerDown: (e) => _pointerDown(e.localPosition, rendered),
+        onPointerUp: (e) => _pointerUp(e.localPosition, rendered),
+        onPointerCancel: (e) => _pointerCancel(e.localPosition, rendered),
+        child: screen,
+      ),
     );
   }
 }

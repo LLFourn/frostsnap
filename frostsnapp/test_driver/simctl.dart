@@ -24,14 +24,23 @@ import 'sim_harness.dart';
 
 String get _socketPath => '${simTmpRoot().path}/control.sock';
 
+/// flutter device ids whose app shares the host filesystem — so the device-input `device-<n>.sock`s
+/// are reachable and a full [SimHarness] (with device channels) can run. Anything else (an Android
+/// emulator) runs an app-channel-only [AppSession].
+const _hostPlatforms = {'macos', 'linux', 'windows'};
+
 const _usage = '''
 simctl — drive the running sim app/devices through SimHarness.
-  simctl serve [--devices N] [--platform <d>] [--agent-owns-keyboard] [--no-regtest]   launch app + listen
-                                              (regtest is ON by default; --no-regtest = offline sim)
+  simctl serve [--devices N] [--android] [--platform <d>] [--agent-owns-keyboard] [--no-regtest]
+                                              launch app + listen (regtest ON by default;
+                                              --no-regtest = offline)
   simctl up [serve flags]                     idempotently bring the sim up + return once ready
                                               (no backgrounding/polling; reuses a matching live
                                               daemon, refuses a mismatched one — `down` first)
-  simctl info                                 print the running daemon's shape (count/regtest/keyboard)
+  simctl up --android [--devices N]           bring the sim up on an Android emulator (boot/provision
+                                              one if needed) with regtest bridged over adb; drive the
+                                              devices via the in-app slide-in tray
+  simctl info                                 print the running daemon's shape (platform/count/regtest)
   simctl test [NAME]                          run e2e driver test <NAME> (a *_drive.dart stem),
                                               or all of them with no NAME
   simctl regtest up|down|status               manage the shared regtest bitcoind+electrs+faucet
@@ -44,6 +53,9 @@ simctl — drive the running sim app/devices through SimHarness.
   simctl wait <label> [--regex]               wait for a label to appear
   simctl exists <label> [--regex]             report whether a label is present
   simctl clipboard                            print the app clipboard text (e.g. a copied address)
+  simctl shot [path]                          whole-app screenshot (incl. tray)
+  simctl down                                 tear down (quit app, clean up)
+ device-channel commands (HOST-only; on an Android (`--android`) session drive these via the tray):
   simctl devices                              list each device (number/id/connected)
   simctl add-device                           add a device at runtime (joins the chain tail)
   simctl chain                                print the connected chain order
@@ -56,8 +68,6 @@ simctl — drive the running sim app/devices through SimHarness.
   simctl touch <x> <y> <down|up> [--device N]          device raw touch
   simctl set-connected <true|false> [--device N]       plug/unplug a device
   simctl screen <path> [--device N]           write the device framebuffer PNG
-  simctl shot [path]                          whole-app screenshot (incl. tray)
-  simctl down                                 tear down (quit app, clean up)
 (--regex matches the label as a substring; default is exact. --device selects the
  virtual device, 1-based, default 1. `serve` gives the keyboard to a human unless
  --agent-owns-keyboard is passed, which the driver needs for `enter`.)''';
@@ -122,12 +132,16 @@ Future<bool> _daemonAlive() async {
 /// whole point: one command, no backgrounding or readiness polling by the caller.
 Future<void> _up(List<String> args) async {
   var count = 1;
+  var wantPlatform = 'macos';
   for (var i = 0; i < args.length - 1; i++) {
     if (args[i] == '--devices') count = int.parse(args[i + 1]);
+    if (args[i] == '--platform') wantPlatform = args[i + 1];
   }
-  // The shape `serve` WOULD launch — mirror its `withRegtest = !--no-regtest` so the exact
-  // compatibility check below stays consistent with what a fresh launch actually produces.
-  // Regtest is ON by default (the common case is a wallet that can receive); --no-regtest opts out.
+  // `--android` targets an emulator (the exact serial is resolved by the launched `serve`, so the
+  // compatibility check below matches on "is an emulator" rather than a specific serial).
+  final wantAndroid = args.contains('--android');
+  // The shape `serve` WOULD launch — mirror its `withRegtest = !--no-regtest`. Regtest is ON by
+  // default (on the host directly, on an emulator bridged over adb); --no-regtest opts out.
   final wantRegtest = !args.contains('--no-regtest');
   final wantKeyboard = args.contains('--agent-owns-keyboard');
 
@@ -137,10 +151,18 @@ Future<void> _up(List<String> args) async {
       count: info['count'] as int,
       regtest: info['regtest'] as bool,
       keyboard: info['keyboard'] as bool,
+      platform: info['platform'] as String? ?? 'macos',
     );
-    // Compatible iff the EXACT recorded shape matches the requested shape (what serve would launch)
-    // — same device count, keyboard mode, AND regtest on/off. A real mismatch fails (down first).
+    // Compatible iff the recorded shape matches what serve would launch — same platform kind (an
+    // emulator for --android, else the exact desktop platform), device count, keyboard mode, AND
+    // regtest. A real mismatch fails (down first) rather than reporting a wrong daemon ready (e.g. an
+    // Android AppSession that can't serve host device commands against a desktop request).
+    final liveIsAndroid = !_hostPlatforms.contains(live.platform);
+    final platformOk = wantAndroid
+        ? liveIsAndroid
+        : live.platform == wantPlatform;
     final compatible =
+        platformOk &&
         live.count == count &&
         live.keyboard == wantKeyboard &&
         live.regtest == wantRegtest;
@@ -155,8 +177,8 @@ Future<void> _up(List<String> args) async {
         'ok': false,
         'error':
             'a different-shape sim daemon is already running '
-            '(count=${live.count}, regtest=${live.regtest}, agentOwnsKeyboard=${live.keyboard}); '
-            'run `./simctl down` first',
+            '(platform=${live.platform}, count=${live.count}, regtest=${live.regtest}, '
+            'agentOwnsKeyboard=${live.keyboard}); run `./simctl down` first',
       }),
     );
     exit(1);
@@ -264,23 +286,293 @@ Future<void> _runTests(List<String> args) async {
   exit(failed.isEmpty ? 0 : 1);
 }
 
+// ---- platform resolution: --android boots/reuses an emulator ----
+
+/// The flutter device a launch targets. `--android` boots (or reuses) an emulator and returns its
+/// serial — so the sim runs on a phone, driven via the slide-in tray; device-channel CLI commands
+/// are then host-only. Otherwise `--platform <d>` (default macos), the desktop sim.
+Future<String> _resolvePlatform(List<String> args) async {
+  if (args.contains('--android')) return _ensureEmulatorBooted();
+  var platform = 'macos';
+  for (var i = 0; i < args.length - 1; i++) {
+    if (args[i] == '--platform') platform = args[i + 1];
+  }
+  return platform;
+}
+
+/// The TCP port from an electrum URL (`tcp://host:port`, `ssl://host:port`, or `host:port`).
+int _electrumPort(String url) {
+  final u = Uri.parse(url.contains('://') ? url : 'tcp://$url');
+  if (u.port == 0) throw StateError('cannot parse electrum port from "$url"');
+  return u.port;
+}
+
+/// Proxy a host unix socket over a loopback TCP port so an adb-reversed emulator can reach it. Each
+/// TCP connection opens a fresh unix connection and pipes both ways (the faucet protocol is short
+/// connect→request→close exchanges). Returns the listening server — close it to stop the bridge.
+Future<ServerSocket> _bridgeUnixOverTcp(String unixPath) async {
+  final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((client) async {
+    final Socket upstream;
+    try {
+      upstream = await Socket.connect(
+        InternetAddress(unixPath, type: InternetAddressType.unix),
+        0,
+      );
+    } catch (_) {
+      client.destroy();
+      return;
+    }
+    unawaited(client.cast<List<int>>().pipe(upstream).catchError((_) {}));
+    unawaited(upstream.cast<List<int>>().pipe(client).catchError((_) {}));
+  });
+  return server;
+}
+
+/// The simctl-managed AVD; created on first use, reused after.
+const _avdName = 'frostsnap_sim';
+
+/// The Android SDK root from ANDROID_HOME / ANDROID_SDK_ROOT / android/local.properties / the macOS
+/// default. Throws a clear error if none resolves.
+String _androidSdkRoot() {
+  for (final v in [
+    Platform.environment['ANDROID_HOME'],
+    Platform.environment['ANDROID_SDK_ROOT'],
+  ]) {
+    if (v != null && v.isNotEmpty && Directory(v).existsSync()) return v;
+  }
+  final lp = File('android/local.properties');
+  if (lp.existsSync()) {
+    for (final line in lp.readAsLinesSync()) {
+      final m = RegExp(r'^\s*sdk\.dir\s*=\s*(.+)$').firstMatch(line);
+      if (m != null && Directory(m.group(1)!.trim()).existsSync()) {
+        return m.group(1)!.trim();
+      }
+    }
+  }
+  final fallback = '${Platform.environment['HOME']}/Library/Android/sdk';
+  if (Directory(fallback).existsSync()) return fallback;
+  throw StateError(
+    'Android SDK not found — set ANDROID_HOME or android/local.properties sdk.dir',
+  );
+}
+
+/// The serial of a running emulator (e.g. `emulator-5554`), or null if none is up.
+Future<String?> _runningEmulatorSerial(String sdk) async {
+  final res = await Process.run('$sdk/platform-tools/adb', ['devices']);
+  for (final line in (res.stdout as String).split('\n')) {
+    final m = RegExp(r'^(emulator-\d+)\s+device$').firstMatch(line.trim());
+    if (m != null) return m.group(1);
+  }
+  return null;
+}
+
+/// Boot an emulator (reusing a running one, else provisioning + booting [_avdName]) and return its
+/// serial once `sys.boot_completed` is set.
+Future<String> _ensureEmulatorBooted() async {
+  final sdk = _androidSdkRoot();
+  final existing = await _runningEmulatorSerial(sdk);
+  if (existing != null) {
+    stderr.writeln('simctl: reusing the running emulator $existing');
+    await _provisionEmulator(sdk, existing);
+    return existing;
+  }
+  final avd = await _ensureAvd(sdk);
+  stderr.writeln('simctl: booting emulator AVD "$avd" …');
+  await Process.start('$sdk/emulator/emulator', [
+    '-avd',
+    avd,
+    '-no-snapshot-save',
+    '-no-boot-anim',
+    '-gpu',
+    'auto',
+  ], mode: ProcessStartMode.detached);
+  final serial = await _waitForBoot(sdk);
+  await _provisionEmulator(sdk, serial);
+  return serial;
+}
+
+/// Put a booted emulator into the state the sim needs, BEFORE the app launches. Best-effort and
+/// idempotent (it runs on every bring-up, reused emulator or fresh boot):
+///   - a secure lock-screen PIN (0000) — Frostsnap requires a secure lock, as it keystores secrets
+///     behind device authentication;
+///   - the device left UNLOCKED and kept awake — a locked device gives the app no focused window,
+///     which ANRs it on launch ("Input dispatching timed out"); `stayon` stops it re-locking during
+///     the slow build/launch;
+///   - 3-button navigation — the app draws edge-to-edge, so the nav bar overlapping content is
+///     exactly the case we want exercised (a common source of safe-area bugs).
+Future<void> _provisionEmulator(String sdk, String serial) async {
+  final adb = '$sdk/platform-tools/adb';
+  Future<void> sh(List<String> cmd) =>
+      Process.run(adb, ['-s', serial, 'shell', ...cmd]);
+
+  // Keep the screen awake so the device can't sleep + re-lock during the build/launch.
+  await sh(['svc', 'power', 'stayon', 'true']);
+  await sh(['input', 'keyevent', 'KEYCODE_WAKEUP']);
+  // Unlock: dismiss the keyguard, entering the PIN if one is already set (harmless otherwise).
+  await sh(['wm', 'dismiss-keyguard']);
+  await sh(['input', 'text', '0000']);
+  await sh(['input', 'keyevent', 'KEYCODE_ENTER']);
+  // Set the PIN while unlocked + awake, so it's configured but the session stays unlocked (a no-op
+  // exit if one already exists).
+  await sh(['locksettings', 'set-pin', '0000']);
+  // enable-exclusive --category disables the other nav-bar overlays (gestural/two-button) so we
+  // land on three-button cleanly rather than leaving several enabled.
+  await sh([
+    'cmd',
+    'overlay',
+    'enable-exclusive',
+    '--category',
+    'com.android.internal.systemui.navbar.threebutton',
+  ]);
+}
+
+/// Ensure [_avdName] exists, provisioning the emulator package + a host-matching system image and
+/// creating it if missing. Idempotent; the first run is a large download (logged).
+Future<String> _ensureAvd(String sdk) async {
+  final avdIni = '${Platform.environment['HOME']}/.android/avd/$_avdName.ini';
+  if (File(avdIni).existsSync()) return _avdName;
+
+  final abi = _hostArchIsArm() ? 'arm64-v8a' : 'x86_64';
+  final image = 'system-images;android-34;google_apis;$abi';
+  final sdkmanager = '$sdk/cmdline-tools/latest/bin/sdkmanager';
+  final avdmanager = '$sdk/cmdline-tools/latest/bin/avdmanager';
+
+  stderr.writeln(
+    'simctl: provisioning emulator + $image (one-time, large download) …',
+  );
+  // Accept any pending licenses, then install (feeding "y" covers per-package license prompts).
+  await _runFeeding(sdkmanager, ['--licenses'], 'y\n' * 50);
+  await _runFeeding(sdkmanager, [
+    '--install',
+    'emulator',
+    'platform-tools',
+    image,
+  ], 'y\n' * 50);
+
+  stderr.writeln('simctl: creating AVD "$_avdName" …');
+  // "no" declines the custom-hardware-profile prompt.
+  await _runFeeding(avdmanager, [
+    'create',
+    'avd',
+    '-n',
+    _avdName,
+    '-k',
+    image,
+    '--device',
+    'pixel_6',
+    '--force',
+  ], 'no\n');
+  return _avdName;
+}
+
+bool _hostArchIsArm() {
+  try {
+    return (Process.runSync('uname', ['-m']).stdout as String).trim() ==
+        'arm64';
+  } catch (_) {
+    return false;
+  }
+}
+
+/// adb wait-for-device + poll `sys.boot_completed`; return the emulator serial.
+Future<String> _waitForBoot(String sdk) async {
+  final adb = '$sdk/platform-tools/adb';
+  await _run(adb, ['wait-for-device']);
+  final deadline = DateTime.now().add(const Duration(minutes: 5));
+  while (DateTime.now().isBefore(deadline)) {
+    final r = await Process.run(adb, [
+      'shell',
+      'getprop',
+      'sys.boot_completed',
+    ]);
+    if ((r.stdout as String).trim() == '1') {
+      final serial = await _runningEmulatorSerial(sdk);
+      if (serial != null) return serial;
+    }
+    await Future<void>.delayed(const Duration(seconds: 2));
+  }
+  throw StateError('emulator did not finish booting within 5 minutes');
+}
+
+/// Run a command, streaming its output; throw on non-zero exit.
+Future<void> _run(String exe, List<String> args) async {
+  final p = await Process.start(exe, args, mode: ProcessStartMode.inheritStdio);
+  if (await p.exitCode != 0) {
+    throw StateError('command failed: $exe ${args.join(' ')}');
+  }
+}
+
+/// Run a command, feeding [stdinText] to its stdin (for license/prompt acceptance), streaming its
+/// output. Best-effort: a non-zero exit logs but does not throw (e.g. `--licenses` exits non-zero
+/// when there is nothing to accept).
+Future<void> _runFeeding(
+  String exe,
+  List<String> args,
+  String stdinText,
+) async {
+  final p = await Process.start(exe, args);
+  p.stdin.write(stdinText);
+  await p.stdin.close();
+  unawaited(stdout.addStream(p.stdout));
+  unawaited(stderr.addStream(p.stderr));
+  final code = await p.exitCode;
+  if (code != 0) {
+    stderr.writeln('simctl: `$exe ${args.first}` exited $code (continuing)');
+  }
+}
+
 // ---- daemon: holds one SimHarness, forwards commands to it ----
 
 Future<void> _serve(List<String> args) async {
-  var platform = 'macos';
   var count = 1;
   // Default: a human owns the keyboard (real typing works, `enter` is rejected). Pass
   // --agent-owns-keyboard for the driver to own text input instead (enables `enter`,
   // blocks the physical keyboard). One mode for the session — no hybrid.
   final agentOwnsKeyboard = args.contains('--agent-owns-keyboard');
   for (var i = 0; i < args.length - 1; i++) {
-    if (args[i] == '--platform') platform = args[i + 1];
     if (args[i] == '--devices') count = int.parse(args[i + 1]);
   }
+  // `--android` boots/reuses an emulator and targets it; else --platform (default macos).
+  final platform = await _resolvePlatform(args);
 
-  // Spawn (or attach to) the regtest faucet by default so the wallet can receive; `--no-regtest`
-  // keeps the sim offline (no bitcoind/electrs).
-  final withRegtest = !args.contains('--no-regtest');
+  // A desktop target shares the host filesystem, so its `device-<n>.sock`s are reachable and we run
+  // a full SimHarness. A non-desktop target (an Android emulator) does not: those sockets live in
+  // the app sandbox, so we run an AppSession (app channel only) and device-channel commands are
+  // rejected as host-only (see _dispatch). Drive an emulator session via the in-app slide-in tray.
+  final isHost = _hostPlatforms.contains(platform);
+
+  // Regtest is ON by default (the common case is a wallet that can receive); `--no-regtest` opts out.
+  final wantRegtest = !args.contains('--no-regtest');
+
+  // On the host the app reaches the backend's sockets directly (SimHarness wires them internally).
+  // On an emulator the electrum (TCP) and faucet control (unix) sockets live on the host, so we
+  // bridge them: adb-reverse the electrum port (the app reaches the host electrs at the same
+  // 127.0.0.1:port the URL already names) and proxy the unix control socket over an adb-reversed TCP
+  // port (SimFaucet speaks either). The app then runs regtest unaware it's remote.
+  final extraDefines = <String, String>{};
+  ServerSocket? controlProxy;
+  if (!isHost && wantRegtest) {
+    final backend = await ensureRegtestBackend();
+    final adb = '${_androidSdkRoot()}/platform-tools/adb';
+    final ePort = _electrumPort(backend.url);
+    await _run(adb, ['-s', platform, 'reverse', 'tcp:$ePort', 'tcp:$ePort']);
+    extraDefines['SIM_REGTEST_ELECTRUM_URL'] = backend.url;
+    controlProxy = await _bridgeUnixOverTcp(regtestControlSocket);
+    await _run(adb, [
+      '-s',
+      platform,
+      'reverse',
+      'tcp:${controlProxy.port}',
+      'tcp:${controlProxy.port}',
+    ]);
+    extraDefines['SIM_REGTEST_CONTROL_SOCKET'] =
+        '127.0.0.1:${controlProxy.port}';
+    stderr.writeln(
+      'simctl: regtest bridged to $platform — electrs adb-reverse tcp:$ePort, '
+      'faucet adb-reverse tcp:${controlProxy.port}',
+    );
+  }
 
   // SELF-LOG: mirror our + the app's output to the session logfile, so a detached `up`-launched
   // daemon still produces a readable log without the caller redirecting stdout. `simTmpRoot()`
@@ -291,13 +583,24 @@ Future<void> _serve(List<String> args) async {
     (_) => unawaited(logSink.flush()),
   );
 
-  final harness = await SimHarness.launch(
-    deviceCount: count,
-    flutterDevice: platform,
-    agentOwnsKeyboard: agentOwnsKeyboard,
-    withRegtest: withRegtest,
-    logSink: logSink,
-  );
+  final AppSession harness = isHost
+      ? await SimHarness.launch(
+          deviceCount: count,
+          flutterDevice: platform,
+          agentOwnsKeyboard: agentOwnsKeyboard,
+          withRegtest: wantRegtest,
+          logSink: logSink,
+        )
+      : await AppSession.launch(
+          deviceCount: count,
+          flutterDevice: platform,
+          agentOwnsKeyboard: agentOwnsKeyboard,
+          // An emulator's regtest is wired via the bridge above (extraDefines), not _launchApp's
+          // internal host-socket path.
+          withRegtest: false,
+          extraDartDefines: extraDefines,
+          logSink: logSink,
+        );
 
   try {
     File(_socketPath).deleteSync();
@@ -318,6 +621,7 @@ Future<void> _serve(List<String> args) async {
     return shutdownFuture ??= () async {
       flushTimer.cancel();
       await server.close();
+      await controlProxy?.close();
       try {
         File(_socketPath).deleteSync();
       } catch (_) {}
@@ -356,8 +660,9 @@ Future<void> _serve(List<String> args) async {
         line,
         harness,
         agentOwnsKeyboard,
-        withRegtest,
+        wantRegtest,
         count,
+        platform,
       );
       conn.write('${jsonEncode(reply)}\n');
       await conn.flush();
@@ -375,10 +680,11 @@ Future<void> _serve(List<String> args) async {
 /// app) alive, so the next command can try something else.
 Future<(Map<String, dynamic>, bool)> _dispatch(
   String line,
-  SimHarness h,
+  AppSession h,
   bool agentOwnsKeyboard,
   bool withRegtest,
   int launchDeviceCount,
+  String platform,
 ) async {
   final Map<String, dynamic> req;
   try {
@@ -391,12 +697,11 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
   // Which virtual device a device-command targets (1-based, default 1).
   final dn = (req['device'] as int?) ?? 1;
 
-  // The fleet can GROW behind the daemon's back — the tray + button adds devices the daemon
-  // never issued — so before any command that reports or indexes devices, reconcile the
-  // harness channel cache with the app-side fleet. Otherwise device(n) for a tray-added n would
-  // be missing/misindexed. App-channel-only commands (tap/wait/…) don't touch the fleet.
-  const fleetCmds = {
-    'info',
+  // device-channel commands need the host `device-<n>.sock`s; on an AppSession (an Android session)
+  // they are rejected as host-only — drive those via the in-app tray instead. App-channel commands
+  // (tap/wait/info/add-device/shot) work on either session over the (possibly adb-forwarded) VM
+  // service.
+  const deviceCmds = {
     'devices',
     'chain',
     'setChain',
@@ -410,9 +715,22 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
     'setConnected',
     'screen',
   };
+  final cmd = req['cmd'];
+  final sim = h is SimHarness ? h : null;
+  if (sim == null && deviceCmds.contains(cmd)) {
+    return (
+      {'ok': false, 'error': 'host-only on Android; drive via the in-app tray'},
+      false,
+    );
+  }
   try {
-    if (fleetCmds.contains(req['cmd'])) await h.ensureDevices();
-    switch (req['cmd']) {
+    // The fleet can GROW behind the daemon's back — the tray + button adds devices the daemon
+    // never issued — so before any command that reports or indexes devices, reconcile the channel
+    // cache with the app-side fleet. An AppSession holds no device channels: nothing to resync.
+    if (sim != null && (deviceCmds.contains(cmd) || cmd == 'info')) {
+      await sim.ensureDevices();
+    }
+    switch (cmd) {
       case 'tap':
         await h.tap(pat('label', 'regex'));
         return ({'ok': true}, false);
@@ -447,14 +765,21 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
         // The daemon's LAUNCH shape — `./simctl up` compares `count` against the requested
         // --devices to decide whether an already-live daemon satisfies the request. It's the
         // launch count, NOT the live count, so runtime adds (tray / add-device) don't flip
-        // idempotence. `currentDevices` reports the live (resynced) fleet for introspection.
+        // idempotence. `currentDevices` reports the live (resynced) fleet for introspection —
+        // from the host channels, or the app-side count on an Android AppSession.
+        final current = sim != null
+            ? sim.devices.length
+            : (await h.deviceNumbers()).length;
         return (
           {
             'ok': true,
             'count': launchDeviceCount,
-            'currentDevices': h.devices.length,
+            'currentDevices': current,
             'regtest': withRegtest,
             'keyboard': agentOwnsKeyboard,
+            // The launch platform is part of the observable shape so `up` won't treat an Android
+            // (AppSession) daemon and a desktop request as interchangeable.
+            'platform': platform,
           },
           false,
         );
@@ -462,34 +787,34 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
         return ({'ok': true, 'device': await h.addDevice()}, false);
       case 'devices':
         final list = <Map<String, dynamic>>[];
-        for (var n = 1; n <= h.devices.length; n++) {
+        for (var n = 1; n <= sim!.devices.length; n++) {
           list.add({
             'number': n,
-            'id': await h.device(n).deviceId(),
-            'connected': await h.device(n).isConnected(),
+            'id': await sim.device(n).deviceId(),
+            'connected': await sim.device(n).isConnected(),
           });
         }
         return ({'ok': true, 'devices': list}, false);
       case 'chain':
-        return ({'ok': true, 'chain': await h.chain()}, false);
+        return ({'ok': true, 'chain': await sim!.chain()}, false);
       case 'setChain':
-        await h.setChain((req['order'] as List).cast<int>());
+        await sim!.setChain((req['order'] as List).cast<int>());
         return ({'ok': true}, false);
       case 'connect':
-        await h.connect(req['device'] as int);
+        await sim!.connect(req['device'] as int);
         return ({'ok': true}, false);
       case 'disconnect':
-        await h.disconnect(req['device'] as int);
+        await sim!.disconnect(req['device'] as int);
         return ({'ok': true}, false);
       case 'moveUp':
-        await h.moveUp(req['device'] as int);
+        await sim!.moveUp(req['device'] as int);
         return ({'ok': true}, false);
       case 'moveDown':
-        await h.moveDown(req['device'] as int);
+        await sim!.moveDown(req['device'] as int);
         return ({'ok': true}, false);
       case 'hold':
         final ms = req['ms'] as int?;
-        await h
+        await sim!
             .device(dn)
             .holdConfirm(
               req['x'] as int,
@@ -500,7 +825,7 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
             );
         return ({'ok': true}, false);
       case 'swipe':
-        await h
+        await sim!
             .device(dn)
             .swipe(
               req['x1'] as int,
@@ -511,7 +836,7 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
             );
         return ({'ok': true}, false);
       case 'touch':
-        await h
+        await sim!
             .device(dn)
             .touch(
               req['x'] as int,
@@ -520,10 +845,10 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
             );
         return ({'ok': true}, false);
       case 'setConnected':
-        await h.device(dn).setConnected(req['connected'] as bool);
+        await sim!.device(dn).setConnected(req['connected'] as bool);
         return ({'ok': true}, false);
       case 'screen':
-        await h.device(dn).screen(req['path'] as String);
+        await sim!.device(dn).screen(req['path'] as String);
         return ({'ok': true, 'path': req['path']}, false);
       case 'shot':
         // No path -> the session dir (cleaned up on teardown); an explicit path is kept.

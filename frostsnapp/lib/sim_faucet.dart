@@ -26,11 +26,17 @@ class SimFaucet {
         });
   }
 
-  static Future<SimFaucet> connect(String socketPath) async {
-    final socket = await Socket.connect(
-      InternetAddress(socketPath, type: InternetAddressType.unix),
-      0,
-    );
+  /// Connect to the faucet control endpoint: a unix socket PATH (the host), or a `host:port` TCP
+  /// endpoint (the sim bridges the host control socket over TCP so an Android emulator can reach it).
+  static Future<SimFaucet> connect(String endpoint) async {
+    final colon = endpoint.lastIndexOf(':');
+    final port = colon > 0 ? int.tryParse(endpoint.substring(colon + 1)) : null;
+    final socket = port != null
+        ? await Socket.connect(endpoint.substring(0, colon), port)
+        : await Socket.connect(
+            InternetAddress(endpoint, type: InternetAddressType.unix),
+            0,
+          );
     return SimFaucet._(socket);
   }
 

@@ -1,7 +1,8 @@
 #!/bin/sh
 # simctl — the app-simulator CLI (sim-14). The single entrypoint for the Frostsnap app sim:
 #
-#   ./simctl serve [--devices N] [--agent-owns-keyboard]   launch the session, keep it alive
+#   ./simctl serve [--devices N] [--android] [--agent-owns-keyboard]   launch the session, keep it
+#                                                        alive (--android runs on an emulator)
 #   ./simctl <cmd> ...                                   drive the running session (chain,
 #                                                        disconnect, tap, shot, down, …)
 #   ./simctl test [NAME]                                 run e2e driver test NAME (a

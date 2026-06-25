@@ -264,24 +264,19 @@ class _MyAppState extends State<MyApp> {
             colorScheme: colorScheme,
             textTheme: textTheme,
           ),
-          // The sim device tray docks BESIDE the app's Navigator (not inside it),
-          // so the app's fullscreen dialogs/overlays — which render in the
-          // Navigator's own Overlay (the `child`) — stay confined to the app pane
-          // and never cover the tray. The tray must always be interactable so the
-          // device can be driven while a dialog (e.g. the keygen Security Check) is up.
+          // The sim console is mounted by SimTrayShell ABOVE the app's Navigator (not inside it),
+          // so the app's fullscreen dialogs/overlays — which render in the Navigator's own Overlay
+          // (the `child`) — never cover it and it stays interactable while a dialog (e.g. the
+          // keygen Security Check) is up. The shell presents it responsively: docked beside the app
+          // on a wide screen, or a slide-in panel on a narrow one (a phone).
           builder: (context, child) {
             final app = child ?? const SizedBox.shrink();
             final pool = simDevicePool;
             if (!kSim || pool == null) return app;
-            return Row(
-              textDirection: TextDirection.ltr,
-              children: [
-                Expanded(child: app),
-                SimDeviceTray(
-                  pool: pool,
-                  regtestControlSocket: simRegtestControlSocket,
-                ),
-              ],
+            return SimTrayShell(
+              app: app,
+              pool: pool,
+              regtestControlSocket: simRegtestControlSocket,
             );
           },
           home: widget.startupError == null

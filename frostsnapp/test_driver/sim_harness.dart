@@ -7,6 +7,12 @@
 //   - device (a framebuffer + touchscreen): driven by hardware gestures over the
 //     device-channel unix socket. `device.*`.
 //
+// The two transports split along a platform seam (sim-android-tray): the app channel works
+// wherever flutter_driver can reach the VM service (incl. an adb-forwarded Android emulator), but
+// the device channels need the `device-<n>.sock` files, which live in the app's private storage and
+// are host-unreachable on an emulator. So [AppSession] owns the app channel alone (the Android
+// session shape) and [SimHarness] extends it with the host device channels (the desktop sim).
+//
 // Lives in test_driver/ so flutter_driver stays a dev dependency. Used by the keygen
 // driver test and by `simctl`. See `.clank/plans/sim-8-dual-channel-harness.md`.
 
@@ -131,28 +137,19 @@ class SimDeviceChannel {
   }
 }
 
-/// One launched sim app + virtual device, with both channels connected.
-class SimHarness {
+/// A launched sim app driven over the APP channel only: the Flutter process + FlutterDriver over the
+/// (possibly adb-forwarded) VM service — `app.*` widget-tree methods + `screenshot()`. It holds NO
+/// device-input sockets, because those (`device-<n>.sock`) live in the app's private storage and are
+/// unreachable from the host when the app runs on an emulator. This is the session shape that works
+/// on Android; [SimHarness] extends it with the host device channels for the desktop sim.
+class AppSession {
   final Process _appProcess;
   final Directory appDir;
   final FlutterDriver driver;
-
-  /// One device-input channel per virtual device, in 1-based order; index with
-  /// [device]. A single-device session has just `devices[0]` (i.e. `device(1)`).
-  final List<SimDeviceChannel> devices;
   final List<String> _appLog;
   int _shotSeq = 0;
 
-  SimHarness._(
-    this._appProcess,
-    this.appDir,
-    this.driver,
-    this.devices,
-    this._appLog,
-  );
-
-  /// The device-input channel for device [number] (1-based; defaults to device 1).
-  SimDeviceChannel device([int number = 1]) => devices[number - 1];
+  AppSession(this._appProcess, this.appDir, this.driver, this._appLog);
 
   /// Resolves when the launched app process exits — e.g. its window was closed, which (with
   /// `applicationShouldTerminateAfterLastWindowClosed`) terminates the app and exits `flutter run`.
@@ -160,55 +157,52 @@ class SimHarness {
   /// answer `up` with already:true against nothing).
   Future<int> get appExitCode => _appProcess.exitCode;
 
-  /// Run [body] against a fresh harness; on ANY failure capture diagnostics — a
-  /// whole-app screenshot, the device framebuffer, the error+stack, and recent app
-  /// logs — to a persistent dir, then always tear down. Rethrows so the run still
-  /// fails. This is the supported way to drive a scenario: a failure leaves you a
-  /// picture of where it stopped plus the logs, instead of a bare stack trace.
-  ///
-  /// On success it also enforces the no-residue invariant: the disposable app dir (and
-  /// thus the device socket + all screenshots) must be gone after teardown.
-  static Future<void> runScenario(
-    String name,
-    Future<void> Function(SimHarness h) body, {
-    int deviceCount = 1,
-    String flutterDevice = 'macos',
-    bool withRegtest = false,
-  }) async {
-    final h = await SimHarness.launch(
-      deviceCount: deviceCount,
-      flutterDevice: flutterDevice,
-      withRegtest: withRegtest,
-    );
-    try {
-      await body(h);
-    } catch (error, stack) {
-      await h._captureFailure(name, error, stack);
-      rethrow;
-    } finally {
-      await h.tearDown();
-    }
-    // Reached only when [body] succeeded: assert teardown left nothing behind.
-    if (await h.appDir.exists()) {
-      throw StateError('teardown left residue: ${h.appDir.path}');
-    }
-  }
-
-  /// Launch the instrumented sim app on a fresh disposable app dir, then connect the
-  /// app channel (flutter_driver) and the device channel (socket).
-  /// [agentOwnsKeyboard] true (the default, for tests) routes text through the driver's
-  /// mock input so [driver.enterText] works but the real keyboard is blocked; pass false
-  /// to hand the keyboard to a human (then `enterText` is unavailable). One mode per
-  /// session — see `sim_app.dart`.
-  static Future<SimHarness> launch({
+  /// Launch the instrumented sim app over the app channel ALONE (no device sockets). This is the
+  /// Android serve shape; [SimHarness.launch] reuses [_launchApp] and then connects the host
+  /// channels. [agentOwnsKeyboard] true routes text through the driver's mock input so
+  /// [enterText] works but the real keyboard is blocked; false hands the keyboard to a human.
+  static Future<AppSession> launch({
     int deviceCount = 1,
     String flutterDevice = 'macos',
     bool agentOwnsKeyboard = true,
     bool withRegtest = false,
-    // When set, the captured `[app]`/`[app:err]` lines are mirrored here (in addition to stderr +
-    // the failure ring buffer). `simctl serve` passes its own logfile so the daemon SELF-LOGS,
-    // rather than depending on the caller redirecting stdout — which lets it run detached and
-    // survives the session dir being recreated.
+    Map<String, String> extraDartDefines = const {},
+    IOSink? logSink,
+  }) async {
+    final (proc, dir, drv, log) = await _launchApp(
+      deviceCount: deviceCount,
+      flutterDevice: flutterDevice,
+      agentOwnsKeyboard: agentOwnsKeyboard,
+      withRegtest: withRegtest,
+      extraDartDefines: extraDartDefines,
+      // App-only sessions are the Android shape: no host device sockets, so the app keeps its own
+      // app-support dir rather than a host path it can't use.
+      shareHostAppDir: false,
+      // The direct-distribution flavor (no Play-services dependency) — the natural sim build.
+      flavor: 'direct',
+      logSink: logSink,
+    );
+    return AppSession(proc, dir, drv, log);
+  }
+
+  /// Start `flutter run` for the sim target, connect FlutterDriver, enable semantics, and return the
+  /// pieces both session shapes need. On any setup failure tears down whatever got created and
+  /// rethrows (so a timed-out connect can't leak the flutter process + the app dir).
+  static Future<(Process, Directory, FlutterDriver, List<String>)> _launchApp({
+    required int deviceCount,
+    required String flutterDevice,
+    required bool agentOwnsKeyboard,
+    required bool withRegtest,
+    required Map<String, String> extraDartDefines,
+    // Whether the app shares the host filesystem (a desktop platform). When true the app is pointed
+    // at the host [appDir] via SIM_APP_DIR so its `device-<n>.sock`s land where [SimHarness] can
+    // connect them. When false (an Android emulator) that host path is invalid INSIDE the sandbox,
+    // so SIM_APP_DIR is omitted and the app falls back to its own app-support dir (main.dart); the
+    // host [appDir] is then used only for screenshots/diagnostics.
+    required bool shareHostAppDir,
+    // Android build flavor (the app defines `direct`/`playstore` product flavors, so `flutter run`
+    // needs one to pick the APK). Null on desktop, which has no flavors.
+    String? flavor,
     IOSink? logSink,
   }) async {
     // Bring up (or attach to) the shared regtest backend BEFORE the app, so its electrum URL can
@@ -229,11 +223,9 @@ class SimHarness {
       logSink?.writeln(line);
     }
 
-    // Track partial resources so a failure anywhere in setup tears them all down
-    // (otherwise a timed-out connect would leak the flutter process + the app dir).
+    // Track partial resources so a failure anywhere in setup tears them all down.
     Process? proc;
     FlutterDriver? driver;
-    final channels = <SimDeviceChannel>[];
     try {
       await Directory('${appDir.path}/screenshots').create();
 
@@ -245,8 +237,11 @@ class SimHarness {
           'test_driver/sim_app.dart',
           '-d',
           flutterDevice,
+          if (flavor != null) ...['--flavor', flavor],
           '--dart-define=SIM=true',
-          '--dart-define=SIM_APP_DIR=${appDir.path}',
+          // Omitted on Android — a host path is meaningless in the sandbox (the app uses its own
+          // app-support dir). On desktop it puts the device sockets where SimHarness connects them.
+          if (shareHostAppDir) '--dart-define=SIM_APP_DIR=${appDir.path}',
           '--dart-define=SIM_DEVICE_COUNT=$deviceCount',
           '--dart-define=SIM_AGENT_OWNS_KEYBOARD=$agentOwnsKeyboard',
           // main.dart points the regtest wallet at this electrs (regtest-only); empty = offline.
@@ -255,13 +250,16 @@ class SimHarness {
           // ...and gives the tray's "Test BTC" column the faucet control socket to drive.
           if (regtestElectrumUrl != null)
             '--dart-define=SIM_REGTEST_CONTROL_SOCKET=$regtestControlSocket',
+          for (final e in extraDartDefines.entries)
+            '--dart-define=${e.key}=${e.value}',
           // Tell the macOS app (AppDelegate) to launch as an accessory so it doesn't steal focus —
           // it's driven over the VM service, not looked at. Sim-only: only this harness sets it.
         ],
         environment: {'FROSTSNAP_SIM_NO_ACTIVATE': '1'},
       );
 
-      // Capture the VM service URL from the run output (surface logs on stderr).
+      // Capture the VM service URL from the run output (surface logs on stderr). flutter forwards
+      // the emulator's VM service to 127.0.0.1 too, so this regex matches on Android as well.
       final vmUrl = Completer<String>();
       final urlRe = RegExp(r'(http://127\.0\.0\.1:\d+/[^\s]+)');
       proc.stdout
@@ -285,80 +283,25 @@ class SimHarness {
 
       final url = await vmUrl.future.timeout(const Duration(minutes: 5));
       driver = await FlutterDriver.connect(dartVmServiceUrl: url);
-      // Build the semantics tree so find.bySemanticsLabel resolves (it isn't generated
-      // without an a11y client otherwise).
-      await driver.setSemantics(true);
-
-      // load_sim creates device-<n>.sock (1-based) during startup; wait for each before
-      // connecting. (Runtime-added devices are picked up later by [ensureDevices].)
-      for (var n = 1; n <= deviceCount; n++) {
-        channels.add(await _connectChannel(appDir, n));
+      // Build the semantics tree so find.bySemanticsLabel resolves (it isn't generated without an
+      // a11y client otherwise). Best-effort: on Android the driver extension throws an
+      // AssertionError here, and find-by-label commands are host-only anyway (a human drives an
+      // emulator session by hand) — so a failure must NOT tear down an otherwise-healthy session.
+      try {
+        await driver.setSemantics(true);
+      } catch (e) {
+        log('[harness] setSemantics unavailable (continuing): $e');
       }
 
-      return SimHarness._(proc, appDir, driver, channels, appLog);
+      return (proc, appDir, driver, appLog);
     } catch (_) {
       // Tear down whatever got created, then rethrow the original setup error.
-      await _cleanup(
-        channels: channels,
-        driver: driver,
-        proc: proc,
-        appDir: appDir,
-      );
+      await _cleanup(driver: driver, proc: proc, appDir: appDir);
       rethrow;
     }
   }
 
-  /// Wait for `device-<number>.sock` (created by `load_sim` at startup or `add_device` at
-  /// runtime) to appear, then connect a channel to it.
-  static Future<SimDeviceChannel> _connectChannel(
-    Directory appDir,
-    int number,
-  ) async {
-    final socketPath = '${appDir.path}/device-$number.sock';
-    final deadline = DateTime.now().add(const Duration(seconds: 30));
-    while (!await File(socketPath).exists()) {
-      if (DateTime.now().isAfter(deadline)) {
-        throw StateError('device socket never appeared at $socketPath');
-      }
-      await Future.delayed(const Duration(milliseconds: 100));
-    }
-    return SimDeviceChannel.connect(socketPath);
-  }
-
-  /// Reconcile the local channel cache with the app-side fleet (the source of truth via the
-  /// `device-numbers` driver-data endpoint). Devices can be added by the TRAY + button too —
-  /// a writer this harness never observes — so we cannot just append one channel per our own
-  /// [addDevice]; instead we connect `device-<n>.sock` for every number the app reports that
-  /// we don't yet hold. Numbers are contiguous and append-only, so connecting the missing ones
-  /// in ascending order keeps `device(n) ↔ socket-n` aligned (no stale or misindexed cache).
-  Future<void> ensureDevices() async {
-    final csv = await driver.runUnsynchronized(
-      () => driver.requestData('device-numbers'),
-    );
-    final numbers = csv.isEmpty
-        ? <int>[]
-        : csv.split(',').map(int.parse).toList();
-    for (var i = 0; i < numbers.length; i++) {
-      final n = numbers[i];
-      if (n != i + 1) {
-        throw StateError('app device numbers not contiguous 1..N: $numbers');
-      }
-      if (n > devices.length) devices.add(await _connectChannel(appDir, n));
-    }
-  }
-
-  /// Add a virtual device to the fleet at runtime (CLI/harness parity with the tray + button)
-  /// and return its 1-based number. Triggers the app-side add via driver data, then resyncs the
-  /// channel cache so [device]`(n)` can drive the new device.
-  Future<int> addDevice() async {
-    final number = int.parse(
-      await driver.runUnsynchronized(() => driver.requestData('add-device')),
-    );
-    await ensureDevices();
-    return number;
-  }
-
-  /// Guarded best-effort teardown of any subset of the harness resources. Every step
+  /// Guarded best-effort teardown of any subset of the session resources. Every step
   /// runs even if an earlier one throws; returns the first error seen (or null).
   static Future<Object?> _cleanup({
     List<SimDeviceChannel>? channels,
@@ -402,6 +345,23 @@ class SimHarness {
     }
     return firstError;
   }
+
+  /// The app's live device numbers (1..N), via the `device-numbers` driver-data endpoint — the
+  /// app-side source of truth that BOTH the tray + button and `./simctl add-device` grow. App
+  /// channel only, so it works on an emulator (no host sockets involved).
+  Future<List<int>> deviceNumbers() async {
+    final csv = await driver.runUnsynchronized(
+      () => driver.requestData('device-numbers'),
+    );
+    return csv.isEmpty ? <int>[] : csv.split(',').map(int.parse).toList();
+  }
+
+  /// Add a virtual device to the fleet at runtime (CLI/harness parity with the tray + button) and
+  /// return its 1-based number. App channel only — triggers the in-app pool add via driver data.
+  /// [SimHarness] overrides this to also connect the new device's host socket.
+  Future<int> addDevice() async => int.parse(
+    await driver.runUnsynchronized(() => driver.requestData('add-device')),
+  );
 
   // ---- app channel (widget tree, by semantic label) ----
   // `label` is a Pattern: a String matches the accessible name exactly; a RegExp
@@ -512,6 +472,232 @@ class SimHarness {
     }
   }
 
+  // ---- whole-app screenshot (incl. the tray) ----
+
+  /// Capture the whole Flutter surface (app + tray) to `<appDir>/screenshots/`. The
+  /// file is removed with everything else on [tearDown]; pass [keep] for a path
+  /// outside the app dir to retain a shot. Returns the written path.
+  ///
+  /// Brings the app window to the foreground first: macOS pauses a backgrounded window's
+  /// render loop, so `driver.screenshot()` would otherwise return the last on-screen frame
+  /// (e.g. a chain edit made via the socket would not appear, even though the tray's widget
+  /// tree already reflects it). Foregrounding resumes rendering so the shot is current.
+  Future<String> screenshot(String name, {String? keep}) async {
+    await _bringAppToFront();
+    final png = await driver.runUnsynchronized(() => driver.screenshot());
+    final path = keep ?? '${appDir.path}/screenshots/${_shotSeq++}-$name.png';
+    await File(path).writeAsBytes(png);
+    return path;
+  }
+
+  /// Best-effort: raise the macOS app window so its render loop resumes and the next
+  /// screenshot is a fresh frame. A no-op (silently) off macOS or if osascript is absent.
+  Future<void> _bringAppToFront() async {
+    if (!Platform.isMacOS) return;
+    try {
+      await Process.run('osascript', [
+        '-e',
+        'tell application "Frostsnap" to activate',
+      ]);
+      // Give the embedder a moment to resume and render a frame before capturing.
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+    } catch (_) {
+      // Foregrounding is a convenience; never fail a screenshot over it.
+    }
+  }
+
+  // ---- failure diagnostics ----
+
+  /// On a scenario failure, dump where it stopped to `build/sim-failures/<name>/`
+  /// (a gitignored, persistent dir — survives tearDown): the whole-app screenshot,
+  /// the error + stack + recent app logs, and (via [_captureExtra]) any per-session
+  /// extras. Best-effort: a capture step failing must not mask the original error.
+  Future<void> _captureFailure(
+    String name,
+    Object error,
+    StackTrace stack,
+  ) async {
+    final dir = Directory('build/sim-failures/$name');
+    try {
+      if (await dir.exists()) await dir.delete(recursive: true);
+      await dir.create(recursive: true);
+      try {
+        await screenshot('app', keep: '${dir.path}/app.png');
+      } catch (_) {}
+      await _captureExtra(dir);
+      await File('${dir.path}/error.txt').writeAsString(
+        '$error\n\n$stack\n\n--- recent app log ---\n${_appLog.join('\n')}\n',
+      );
+      stderr.writeln('sim-failure diagnostics: ${dir.absolute.path}');
+    } catch (_) {
+      // Diagnostics are best-effort; never mask the scenario's own error.
+    }
+  }
+
+  /// Hook for subclasses to add session-specific failure artifacts into [dir]. No-op here.
+  Future<void> _captureExtra(Directory dir) async {}
+
+  /// Quit the app and delete the disposable app dir (which holds all harness
+  /// screenshots) — no residue. The first cleanup error (if any) is rethrown once
+  /// everything has been torn down.
+  Future<void> tearDown() async {
+    final err = await _cleanup(
+      driver: driver,
+      proc: _appProcess,
+      appDir: appDir,
+    );
+    if (err != null) throw err;
+  }
+}
+
+/// The desktop sim: an [AppSession] plus the host device-input channels (one `device-<n>.sock` per
+/// virtual device). Driving devices over those sockets is what `./simctl` and the e2e tests use; it
+/// works only when the app shares the host filesystem (a desktop platform), not on an emulator.
+class SimHarness extends AppSession {
+  /// One device-input channel per virtual device, in 1-based order; index with
+  /// [device]. A single-device session has just `devices[0]` (i.e. `device(1)`).
+  final List<SimDeviceChannel> devices;
+
+  SimHarness._(
+    super.appProcess,
+    super.appDir,
+    super.driver,
+    super.appLog,
+    this.devices,
+  );
+
+  /// The device-input channel for device [number] (1-based; defaults to device 1).
+  SimDeviceChannel device([int number = 1]) => devices[number - 1];
+
+  /// Run [body] against a fresh harness; on ANY failure capture diagnostics — a
+  /// whole-app screenshot, the device framebuffer, the error+stack, and recent app
+  /// logs — to a persistent dir, then always tear down. Rethrows so the run still
+  /// fails. This is the supported way to drive a scenario: a failure leaves you a
+  /// picture of where it stopped plus the logs, instead of a bare stack trace.
+  ///
+  /// On success it also enforces the no-residue invariant: the disposable app dir (and
+  /// thus the device socket + all screenshots) must be gone after teardown.
+  static Future<void> runScenario(
+    String name,
+    Future<void> Function(SimHarness h) body, {
+    int deviceCount = 1,
+    String flutterDevice = 'macos',
+    bool withRegtest = false,
+    Map<String, String> extraDartDefines = const {},
+  }) async {
+    final h = await SimHarness.launch(
+      deviceCount: deviceCount,
+      flutterDevice: flutterDevice,
+      withRegtest: withRegtest,
+      extraDartDefines: extraDartDefines,
+    );
+    try {
+      await body(h);
+    } catch (error, stack) {
+      await h._captureFailure(name, error, stack);
+      rethrow;
+    } finally {
+      await h.tearDown();
+    }
+    // Reached only when [body] succeeded: assert teardown left nothing behind.
+    if (await h.appDir.exists()) {
+      throw StateError('teardown left residue: ${h.appDir.path}');
+    }
+  }
+
+  /// Launch the instrumented sim app, then connect the app channel (flutter_driver) AND a device
+  /// channel per `device-<n>.sock`. Host platforms only — the sockets must be reachable.
+  static Future<SimHarness> launch({
+    int deviceCount = 1,
+    String flutterDevice = 'macos',
+    bool agentOwnsKeyboard = true,
+    bool withRegtest = false,
+    Map<String, String> extraDartDefines = const {},
+    IOSink? logSink,
+  }) async {
+    final (proc, appDir, driver, appLog) = await AppSession._launchApp(
+      deviceCount: deviceCount,
+      flutterDevice: flutterDevice,
+      agentOwnsKeyboard: agentOwnsKeyboard,
+      withRegtest: withRegtest,
+      extraDartDefines: extraDartDefines,
+      // The host shares the filesystem with the app, so point it at our appDir — that's where its
+      // device-<n>.sock files must land for [_connectChannel] below to reach them.
+      shareHostAppDir: true,
+      logSink: logSink,
+    );
+
+    final channels = <SimDeviceChannel>[];
+    try {
+      // load_sim creates device-<n>.sock (1-based) during startup; wait for each before
+      // connecting. (Runtime-added devices are picked up later by [ensureDevices].)
+      for (var n = 1; n <= deviceCount; n++) {
+        channels.add(await _connectChannel(appDir, n));
+      }
+      return SimHarness._(proc, appDir, driver, appLog, channels);
+    } catch (_) {
+      await AppSession._cleanup(
+        channels: channels,
+        driver: driver,
+        proc: proc,
+        appDir: appDir,
+      );
+      rethrow;
+    }
+  }
+
+  /// Wait for `device-<number>.sock` (created by `load_sim` at startup or `add_device` at
+  /// runtime) to appear, then connect a channel to it.
+  static Future<SimDeviceChannel> _connectChannel(
+    Directory appDir,
+    int number,
+  ) async {
+    final socketPath = '${appDir.path}/device-$number.sock';
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while (!await File(socketPath).exists()) {
+      if (DateTime.now().isAfter(deadline)) {
+        throw StateError('device socket never appeared at $socketPath');
+      }
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    return SimDeviceChannel.connect(socketPath);
+  }
+
+  /// Reconcile the local channel cache with the app-side fleet (the source of truth via
+  /// [deviceNumbers]). Devices can be added by the TRAY + button too — a writer this harness never
+  /// observes — so we cannot just append one channel per our own [addDevice]; instead we connect
+  /// `device-<n>.sock` for every number the app reports that we don't yet hold. Numbers are
+  /// contiguous and append-only, so connecting the missing ones in ascending order keeps
+  /// `device(n) ↔ socket-n` aligned (no stale or misindexed cache).
+  Future<void> ensureDevices() async {
+    final numbers = await deviceNumbers();
+    for (var i = 0; i < numbers.length; i++) {
+      final n = numbers[i];
+      if (n != i + 1) {
+        throw StateError('app device numbers not contiguous 1..N: $numbers');
+      }
+      if (n > devices.length) devices.add(await _connectChannel(appDir, n));
+    }
+  }
+
+  /// Add a device (via the app channel) AND connect its new host socket, so [device]`(n)` can drive
+  /// it. Returns the new 1-based number.
+  @override
+  Future<int> addDevice() async {
+    final number = await super.addDevice();
+    await ensureDevices();
+    return number;
+  }
+
+  @override
+  Future<void> _captureExtra(Directory dir) async {
+    for (var n = 1; n <= devices.length; n++) {
+      try {
+        await device(n).screen('${dir.path}/device-$n.png');
+      } catch (_) {}
+    }
+  }
+
   // ---- chain composition (pool-level; one source of truth via setChain) ----
   // The connected chain is an ordered list of 1-based device numbers (first = the device
   // on the coordinator USB port). connect/disconnect/reorder all funnel through setChain.
@@ -559,78 +745,13 @@ class SimHarness {
   Future<void> unplug([int number = 1]) => disconnect(number);
   Future<void> plug([int number = 1]) => connect(number);
 
-  // ---- whole-app screenshot (incl. the tray) ----
-
-  /// Capture the whole Flutter surface (app + tray) to `<appDir>/screenshots/`. The
-  /// file is removed with everything else on [tearDown]; pass [keep] for a path
-  /// outside the app dir to retain a shot. Returns the written path.
-  ///
-  /// Brings the app window to the foreground first: macOS pauses a backgrounded window's
-  /// render loop, so `driver.screenshot()` would otherwise return the last on-screen frame
-  /// (e.g. a chain edit made via the socket would not appear, even though the tray's widget
-  /// tree already reflects it). Foregrounding resumes rendering so the shot is current.
-  Future<String> screenshot(String name, {String? keep}) async {
-    await _bringAppToFront();
-    final png = await driver.runUnsynchronized(() => driver.screenshot());
-    final path = keep ?? '${appDir.path}/screenshots/${_shotSeq++}-$name.png';
-    await File(path).writeAsBytes(png);
-    return path;
-  }
-
-  /// Best-effort: raise the macOS app window so its render loop resumes and the next
-  /// screenshot is a fresh frame. A no-op (silently) off macOS or if osascript is absent.
-  Future<void> _bringAppToFront() async {
-    if (!Platform.isMacOS) return;
-    try {
-      await Process.run('osascript', [
-        '-e',
-        'tell application "Frostsnap" to activate',
-      ]);
-      // Give the embedder a moment to resume and render a frame before capturing.
-      await Future<void>.delayed(const Duration(milliseconds: 400));
-    } catch (_) {
-      // Foregrounding is a convenience; never fail a screenshot over it.
-    }
-  }
-
-  // ---- failure diagnostics ----
-
-  /// On a scenario failure, dump where it stopped to `build/sim-failures/<name>/`
-  /// (a gitignored, persistent dir — survives tearDown): the whole-app screenshot,
-  /// the exact device framebuffer, and `error.txt` (the error + stack + recent app
-  /// logs). Best-effort: a capture step failing must not mask the original error.
-  Future<void> _captureFailure(
-    String name,
-    Object error,
-    StackTrace stack,
-  ) async {
-    final dir = Directory('build/sim-failures/$name');
-    try {
-      if (await dir.exists()) await dir.delete(recursive: true);
-      await dir.create(recursive: true);
-      try {
-        await screenshot('app', keep: '${dir.path}/app.png');
-      } catch (_) {}
-      for (var n = 1; n <= devices.length; n++) {
-        try {
-          await device(n).screen('${dir.path}/device-$n.png');
-        } catch (_) {}
-      }
-      await File('${dir.path}/error.txt').writeAsString(
-        '$error\n\n$stack\n\n--- recent app log ---\n${_appLog.join('\n')}\n',
-      );
-      stderr.writeln('sim-failure diagnostics: ${dir.absolute.path}');
-    } catch (_) {
-      // Diagnostics are best-effort; never mask the scenario's own error.
-    }
-  }
-
   /// Close both channels, quit the app, and delete the disposable app dir (which
   /// holds the device socket and all harness screenshots) — no residue. App
   /// termination and dir deletion run even if a client close fails; the first
   /// cleanup error (if any) is rethrown once everything has been torn down.
+  @override
   Future<void> tearDown() async {
-    final err = await _cleanup(
+    final err = await AppSession._cleanup(
       channels: devices,
       driver: driver,
       proc: _appProcess,
