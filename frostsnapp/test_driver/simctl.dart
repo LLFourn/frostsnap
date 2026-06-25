@@ -586,12 +586,28 @@ Future<void> _provisionEmulator(String sdk, String serial) async {
   // Keep the screen awake so the device can't sleep + re-lock during the build/launch.
   await sh(['svc', 'power', 'stayon', 'true']);
   await sh(['input', 'keyevent', 'KEYCODE_WAKEUP']);
-  // Unlock: dismiss the keyguard, entering the PIN if one is already set (harmless otherwise).
+  // Unlock past the keyguard. Feed the PIN to the bouncer ONLY when the device is actually locked (a
+  // secure PIN set AND the keyguard engaged) — `dumpsys trust` reports `deviceLocked=1` exactly then.
+  // Typing it unconditionally was a bug: on a fresh emulator (no PIN, keyguard already dismissed) the
+  // `0000` has no PIN field, so it lands on whatever IS focused — the launcher's Google search box —
+  // and fires a stray web search. `deviceLocked` is 0 for an insecure/already-unlocked device, so the
+  // guard correctly skips it there and only types into a real bouncer.
   await sh(['wm', 'dismiss-keyguard']);
-  await sh(['input', 'text', '0000']);
-  await sh(['input', 'keyevent', 'KEYCODE_ENTER']);
+  final trust = await Process.run(adb, [
+    '-s',
+    serial,
+    'shell',
+    'dumpsys',
+    'trust',
+  ]);
+  if ((trust.stdout as String).contains('deviceLocked=1')) {
+    await sh(['input', 'text', '0000']);
+    await sh(['input', 'keyevent', 'KEYCODE_ENTER']);
+  }
   // Set the PIN while unlocked + awake, so it's configured but the session stays unlocked (a no-op
-  // exit if one already exists).
+  // exit if one already exists). This is REQUIRED, not cosmetic: the app's SecureKeyManager
+  // (getOrCreateKey) fails fast with NO_LOCK_SCREEN unless `isDeviceSecure`, because its signing key
+  // is `setUserAuthenticationRequired(true)` — so the sim can't keygen/sign without a secure lock.
   await sh(['locksettings', 'set-pin', '0000']);
   // enable-exclusive --category disables the other nav-bar overlays (gestural/two-button) so we
   // land on three-button cleanly rather than leaving several enabled.
