@@ -20,8 +20,16 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_driver/flutter_driver.dart';
+import 'package:frostsnap/sim_faucet.dart';
 
-import 'regtest.dart' show ensureRegtestBackend, regtestControlSocket;
+import 'regtest.dart'
+    show
+        RegtestSession,
+        androidSdkRoot,
+        bridgeRegtestToEmulator,
+        ensureRegtestBackend,
+        regtestControlSocket,
+        startRegtestSession;
 
 /// Root for all sim temp artifacts — disposable app dirs, the simctl control socket,
 /// ad-hoc screenshots — grouped under one folder instead of loose in the system temp
@@ -30,6 +38,29 @@ Directory simTmpRoot() {
   final dir = Directory('${Directory.systemTemp.path}/frostsnap-sim');
   dir.createSync(recursive: true);
   return dir;
+}
+
+/// A scenario's PRIVATE regtest backend (its own chain), bound to the harness for the run and reaped
+/// on tearDown. On Android the app's endpoints are bridged to its emulator; [_unbridge] tears that
+/// bridge down (null on host, where the app reaches the session's unix socket + electrum directly).
+class _ScenarioRegtest {
+  final RegtestSession session;
+
+  /// The dart-defines that point the app's regtest wallet + tray faucet at THIS session.
+  final Map<String, String> defines;
+
+  /// On Android, tears down the emulator bridge (close the faucet proxy + remove the adb reverses).
+  /// Null on host, where the app reaches the session's endpoints directly.
+  final Future<void> Function()? _unbridge;
+
+  _ScenarioRegtest(this.session, this.defines, [this._unbridge]);
+
+  Future<void> stop() async {
+    try {
+      await _unbridge?.call();
+    } catch (_) {}
+    await session.stop();
+  }
 }
 
 /// A launched sim app: the Flutter process + FlutterDriver over the (possibly adb-forwarded) VM
@@ -43,7 +74,23 @@ class AppSession {
   final List<String> _appLog;
   int _shotSeq = 0;
 
+  /// This scenario's isolated regtest backend, if it ran `withRegtest` (see [faucet]). Owned by the
+  /// session: reaped on [tearDown].
+  _ScenarioRegtest? _regtest;
+
   AppSession(this._appProcess, this.appDir, this.driver, this._appLog);
+
+  /// Connect to THIS scenario's private faucet (its own chain). The test drives funding/mining here,
+  /// so parallel scenarios never share a chain. Throws if the scenario didn't request `withRegtest`.
+  Future<SimFaucet> faucet() {
+    final r = _regtest;
+    if (r == null) {
+      throw StateError(
+        'scenario has no regtest backend (run with withRegtest: true)',
+      );
+    }
+    return r.session.faucet();
+  }
 
   /// Resolves when the launched app process exits — e.g. its window was closed, which (with
   /// `applicationShouldTerminateAfterLastWindowClosed`) terminates the app and exits `flutter run`.
@@ -125,6 +172,28 @@ class AppSession {
     // Track partial resources so a failure anywhere in setup tears them all down.
     Process? proc;
     FlutterDriver? driver;
+    // Serialize the flutter BUILD across concurrent launches (parallel `./simctl test`): two
+    // `flutter run` for the SAME app write the shared `build/` dir at once and corrupt the packaged
+    // native lib (`dlopen` "invalid shdr offset/size"). A cross-process advisory file lock (flock),
+    // held ONLY through build+launch (released once the VM service is up) — the slow test EXECUTION
+    // then overlaps freely on each session's own emulator. The OS drops the lock if a worker dies, so
+    // it can't deadlock; uncontended (a single launch) it's instant.
+    final buildLock = await File(
+      '${simTmpRoot().path}/flutter-build.lock',
+    ).open(mode: FileMode.write);
+    await buildLock.lock(FileLock.blockingExclusive); // WAITS until acquired
+    var buildLockHeld = true;
+    Future<void> releaseBuildLock() async {
+      if (!buildLockHeld) return;
+      buildLockHeld = false;
+      try {
+        await buildLock.unlock();
+      } catch (_) {}
+      try {
+        await buildLock.close();
+      } catch (_) {}
+    }
+
     try {
       await Directory('${appDir.path}/screenshots').create();
 
@@ -181,6 +250,9 @@ class AppSession {
           });
 
       final url = await vmUrl.future.timeout(const Duration(minutes: 5));
+      // Build + install + launch are done (the app's VM service is up) — release the build lock so
+      // the next concurrent launch can build while this one's test executes.
+      await releaseBuildLock();
       driver = await FlutterDriver.connect(dartVmServiceUrl: url);
       // Build the semantics tree so find.bySemanticsLabel resolves (it isn't generated without an
       // a11y client otherwise). On Android setSemantics throws until runApp has attached the root
@@ -203,6 +275,7 @@ class AppSession {
       return (proc, appDir, driver, appLog);
     } catch (_) {
       // Tear down whatever got created, then rethrow the original setup error.
+      await releaseBuildLock();
       await _cleanup(driver: driver, proc: proc, appDir: appDir);
       rethrow;
     }
@@ -214,6 +287,7 @@ class AppSession {
     FlutterDriver? driver,
     Process? proc,
     Directory? appDir,
+    _ScenarioRegtest? regtest,
   }) async {
     Object? firstError;
     Future<void> guard(Future<void> Function() step) async {
@@ -224,9 +298,10 @@ class AppSession {
       }
     }
 
-    // NB: the regtest backend is a DELIBERATELY PERSISTENT shared node — no test or serve tears it
-    // down, so sequential runs reuse it AND multiple app instances in one test share it (none pulls
-    // it out from under another). It's reaped only by `./simctl regtest down` / `./simctl clean`.
+    // A scenario's regtest is a PRIVATE per-session backend (its own chain) — reaped here with the
+    // session so parallel scenarios never share a chain, and nothing orphans. (The INTERACTIVE
+    // `serve` node is the separate, deliberately-persistent shared one, reaped by `regtest down`.)
+    if (regtest != null) await guard(regtest.stop);
     if (driver != null) await guard(driver.close);
     if (proc != null) {
       final p = proc;
@@ -245,6 +320,34 @@ class AppSession {
       await guard(() => appDir.delete(recursive: true));
     }
     return firstError;
+  }
+
+  /// Start an ISOLATED regtest backend for ONE scenario (its own chain) + the dart-defines that point
+  /// the app at it. On a host target the app reaches the session's unix control socket + electrum TCP
+  /// directly; on an Android emulator [device] those host endpoints are unreachable, so bridge them to
+  /// THAT emulator (adb-reverse electrs + a unix→TCP faucet proxy) and point the app at the bridge —
+  /// dynamic per-session ports + per-serial reverses, so parallel scenarios never collide. The dir is
+  /// `rt-$pid` (one scenario per test process) kept SHORT so the control socket stays under the
+  /// unix-socket path limit (the scenario name lives in the test's own logs).
+  static Future<_ScenarioRegtest> _startScenarioRegtest(String device) async {
+    final session = await startRegtestSession(
+      Directory('${simTmpRoot().path}/rt-$pid'),
+    );
+    final isHost = const {'macos', 'linux', 'windows'}.contains(device);
+    if (isHost) {
+      return _ScenarioRegtest(session, {
+        'SIM_REGTEST_ELECTRUM_URL': session.url,
+        'SIM_REGTEST_CONTROL_SOCKET': session.controlSocket,
+      });
+    }
+    try {
+      final bridge = await bridgeRegtestToEmulator(session, device);
+      return _ScenarioRegtest(session, bridge.defines, bridge.unbridge);
+    } catch (_) {
+      await session
+          .stop(); // bridge failed → reap the backend so it can't orphan
+      rethrow;
+    }
   }
 
   /// The app's live device numbers (1..N), via the `device-numbers` driver-data endpoint — the
@@ -351,8 +454,9 @@ class AppSession {
 
   /// Run [body] against an [AppSession] on [flutterDevice] (or the `SIM_FLUTTER_DEVICE` env, default
   /// macos) — the single session shape for host AND emulator (devices drive over the app channel).
-  /// `./simctl test <name> --android` boots the emulator and sets that env. [withRegtest] brings up
-  /// (or attaches to) the shared regtest backend. Captures failure diagnostics and asserts no residue.
+  /// `./simctl test <name> --android` boots the emulator and sets that env. [withRegtest] starts a
+  /// PRIVATE per-session regtest backend (its own chain) so concurrent scenarios never share one.
+  /// Captures failure diagnostics and asserts no residue.
   static Future<void> runScenario(
     String name,
     Future<void> Function(AppSession h) body, {
@@ -363,12 +467,25 @@ class AppSession {
   }) async {
     final device =
         flutterDevice ?? Platform.environment['SIM_FLUTTER_DEVICE'] ?? 'macos';
-    final h = await AppSession.launch(
-      deviceCount: deviceCount,
-      flutterDevice: device,
-      withRegtest: withRegtest,
-      extraDartDefines: extraDartDefines,
-    );
+    // Start the scenario's PRIVATE regtest backend (its own chain) BEFORE the app, so its electrum
+    // URL + faucet socket seed the launch. Owned by the session → reaped on tearDown, so concurrent
+    // scenarios never share a chain (a foreign `mine` can't confirm another's pending receive).
+    final regtest = withRegtest ? await _startScenarioRegtest(device) : null;
+    final defines = {...extraDartDefines, ...?regtest?.defines};
+
+    late final AppSession h;
+    try {
+      h = await AppSession.launch(
+        deviceCount: deviceCount,
+        flutterDevice: device,
+        extraDartDefines: defines,
+      );
+    } catch (_) {
+      await regtest
+          ?.stop(); // launch failed before the session could own it — reap it here
+      rethrow;
+    }
+    h._regtest = regtest;
     try {
       await body(h);
     } catch (error, stack) {
@@ -589,6 +706,32 @@ class AppSession {
     }
   }
 
+  /// Dismiss the topmost `showBottomSheetOrDialog`. Its layout is responsive: the WIDE layout is a
+  /// Dialog with a 'Close' button (host), the COMPACT layout is a drag-handle bottom sheet with NO
+  /// Close button (the emulator's narrow screen). So tap Close where it exists, else dismiss the sheet
+  /// the way a user would — the Android system Back gesture pops the modal route. Keeps sheet-closing
+  /// portable across host and emulator without baking a Close button into the app's mobile sheets.
+  Future<void> dismissSheetOrDialog() async {
+    if (await exists('Close')) {
+      await tap('Close');
+      return;
+    }
+    final serial = Platform.environment['SIM_FLUTTER_DEVICE'];
+    if (serial == null) {
+      throw StateError(
+        'no Close button and no SIM_FLUTTER_DEVICE: cannot dismiss the sheet',
+      );
+    }
+    await Process.run('${androidSdkRoot()}/platform-tools/adb', [
+      '-s',
+      serial,
+      'shell',
+      'input',
+      'keyevent',
+      'KEYCODE_BACK',
+    ]);
+  }
+
   // ---- whole-app screenshot (incl. the tray) ----
 
   /// Capture the whole Flutter surface (app + tray) to `<appDir>/screenshots/`. The
@@ -669,6 +812,7 @@ class AppSession {
       driver: driver,
       proc: _appProcess,
       appDir: appDir,
+      regtest: _regtest,
     );
     if (err != null) throw err;
   }

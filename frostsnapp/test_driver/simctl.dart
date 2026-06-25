@@ -41,11 +41,18 @@ simctl — drive the running sim app/devices through SimHarness.
                                               one if needed) with regtest bridged over adb; drive the
                                               devices via `./simctl` (below) or the in-app tray
   simctl info                                 print the running daemon's shape (platform/count/regtest)
-  simctl test [NAME] [--android]              run e2e driver test <NAME> (a *_drive.dart stem),
-                                              or all with no NAME; --android runs <NAME> on the
-                                              emulator (an AppSession) instead of the host
+  simctl test [NAMES...] [--android] [--jobs N]
+                                              run e2e driver tests (stems; ALL if none) IN PARALLEL —
+                                              host: one `dart run` each; --android: each on its OWN
+                                              pool emulator + (if it uses regtest) its OWN chain
+                                              bridged to that emulator (degrades to however many
+                                              boot). --jobs caps parallelism (default = all at once)
   simctl regtest up|down|status               manage the shared regtest bitcoind+electrs+faucet
   simctl regtest fund <addr> <sats> | mine [n] | balance | height | address | url   drive the faucet
+  simctl pool status|acquire [--cap N]|release <slot>|reset
+                                              inspect/manage the test emulator pool (dedicated
+                                              per-test emulators, name-isolated from the interactive
+                                              one); the parallel test runner allocates from it
   simctl clean                                remove sim temp artifacts + reap any backend
                                               (no daemon running)
   simctl tap <label> [--regex]                tap a control by semantic label
@@ -86,6 +93,8 @@ Future<void> main(List<String> args) async {
     await _runTests(args.skip(1).toList());
   } else if (args.first == 'regtest') {
     await runRegtest(args.skip(1).toList());
+  } else if (args.first == 'pool') {
+    await _pool(args.skip(1).toList());
   } else if (args.first == 'clean') {
     await _clean();
   } else {
@@ -105,6 +114,17 @@ Future<void> _clean() async {
     exit(1);
   }
   await stopRegtestBackend();
+  // Reap any pooled emulators before deleting their lockfile registry, else they orphan.
+  // Best-effort: a no-op when there's no Android SDK (host-only checkout).
+  try {
+    final claimed = _claimedSlots();
+    if (claimed.isNotEmpty) {
+      final sdk = androidSdkRoot();
+      for (final slot in claimed) {
+        _releaseEmulator(sdk, slot);
+      }
+    }
+  } catch (_) {}
   final root = simTmpRoot();
   if (await root.exists()) await root.delete(recursive: true);
   stdout.writeln(jsonEncode({'ok': true, 'cleaned': root.path}));
@@ -273,12 +293,24 @@ Future<Map<String, dynamic>> _query(Map<String, dynamic> req) async {
 /// fails the whole run. Replaces the per-test justfile recipes — a new test is just a new
 /// `*_drive.dart` file, discovered here automatically.
 Future<void> _runTests(List<String> args) async {
-  // `--android` runs the named test ON the emulator (an AppSession, not a host SimHarness): boot/
-  // reuse the emulator and pass its serial via SIM_FLUTTER_DEVICE, which the test's
-  // AppSession.runScenario reads. The test must name a single stem (running the whole host suite on
-  // the emulator makes no sense).
+  // Runs the named tests (or ALL if none) IN PARALLEL. On `--android`, each test runs on its own
+  // DEDICATED pool emulator (Task 1's allocator); on host, each is a self-contained `dart run`. Each
+  // test owns its isolated state (a fresh emulator/app dir + its own per-session regtest chain, bridged
+  // to its emulator on `--android`), so there's no shared state to serialize around. `--jobs N` caps
+  // the parallelism; default = run them all at once (degrading to however many emulators boot).
   final android = args.contains('--android');
-  final positional = args.where((a) => !a.startsWith('--')).toList();
+  int? jobs; // null = "as many as possible"
+  final positional = <String>[];
+  for (var i = 0; i < args.length; i++) {
+    final a = args[i];
+    if (a == '--android') continue;
+    if (a == '--jobs') {
+      jobs = int.parse(args[++i]);
+      continue;
+    }
+    if (a.startsWith('--')) continue;
+    positional.add(a);
+  }
 
   final stems = <String, String>{}; // stem -> filename
   for (final entry in Directory('test_driver').listSync()) {
@@ -291,56 +323,52 @@ Future<void> _runTests(List<String> args) async {
 
   final List<String> files;
   if (positional.isEmpty) {
-    if (android) {
-      stderr.writeln(
-        'simctl test --android: name a test (e.g. android_safe_area)',
-      );
-      exit(2);
-    }
     files = available.map((s) => stems[s]!).toList();
   } else {
-    final file = stems[positional.first];
-    if (file == null) {
-      stderr.writeln(
-        'simctl test: no test "${positional.first}". Available: ${available.join(', ')}',
-      );
-      exit(2);
+    files = [];
+    for (final name in positional) {
+      final file = stems[name];
+      if (file == null) {
+        stderr.writeln(
+          'simctl test: no test "$name". Available: ${available.join(', ')}',
+        );
+        exit(2);
+      }
+      files.add(file);
     }
-    files = [file];
   }
 
-  Map<String, String>? env;
-  if (android) {
-    final serial = await _ensureEmulatorBooted();
-    // Deterministic fresh app state EVERY run: an emulator AppSession keeps its sandbox app-support
-    // dir (no disposable SIM_APP_DIR like the host), and it survives tearDown + warm reuse — so
-    // without this a second run could start from an existing wallet instead of onboarding, breaking
-    // createWallet. `pm clear` wipes the app's data (best-effort; no-op if not yet installed) while
-    // leaving the system PIN/lock intact.
-    await Process.run('${_androidSdkRoot()}/platform-tools/adb', [
-      '-s',
-      serial,
-      'shell',
-      'pm',
-      'clear',
-      'com.frostsnap',
-    ]);
-    env = {'SIM_FLUTTER_DEVICE': serial};
-    stdout.writeln(
-      '=== simctl test: on Android emulator $serial (app data cleared) ===',
-    );
-  }
-
+  // Default to running every test at once; the android pool degrades to however many emulators boot.
+  final effJobs = (jobs ?? files.length).clamp(1, files.length);
   final failed = <String>[];
-  for (final file in files) {
-    stdout.writeln('=== simctl test: $file ===');
-    final proc = await Process.start(
-      'dart',
-      ['run', 'test_driver/$file'],
-      mode: ProcessStartMode.inheritStdio,
-      environment: env,
-    );
-    if (await proc.exitCode != 0) failed.add(file);
+  if (android) {
+    await _runAndroidPool(files, effJobs, failed);
+  } else {
+    // Host: each test is a self-contained `dart run` (owns its PRIVATE per-session regtest chain), so
+    // up to `effJobs` run concurrently with no shared state. Concurrent output is captured + printed
+    // grouped on completion (interleaved live streams would be unreadable); a single test streams live.
+    final capture = effJobs > 1;
+    await _runBounded(files, effJobs, (file) async {
+      if (!capture) stdout.writeln('=== simctl test: $file ===');
+      final proc = await Process.start(
+        'dart',
+        ['run', 'test_driver/$file'],
+        mode: capture ? ProcessStartMode.normal : ProcessStartMode.inheritStdio,
+      );
+      if (!capture) {
+        if (await proc.exitCode != 0) failed.add(file);
+        return;
+      }
+      final buf = StringBuffer();
+      final outDone = proc.stdout.transform(utf8.decoder).forEach(buf.write);
+      final errDone = proc.stderr.transform(utf8.decoder).forEach(buf.write);
+      final code = await proc.exitCode;
+      await Future.wait([outDone, errDone]);
+      stdout.writeln(
+        '=== simctl test: $file ${code == 0 ? 'PASSED' : 'FAILED'} ===\n$buf',
+      );
+      if (code != 0) failed.add(file);
+    });
   }
 
   if (files.length > 1) {
@@ -350,6 +378,110 @@ Future<void> _runTests(List<String> args) async {
     );
   }
   exit(failed.isEmpty ? 0 : 1);
+}
+
+/// Run [files] across the emulator POOL: spawn up to [jobs] workers, each acquiring its OWN dedicated
+/// pool emulator (Task 1's allocator) and running queued tests on it (`pm clear` between for fresh
+/// app state), releasing it on finish. A worker that can't boot an emulator drops out — so this
+/// DEGRADES to however many emulators actually boot (down to one = serial) rather than failing. Per-
+/// test output is captured + printed grouped (workers interleave) when more than one test runs.
+Future<void> _runAndroidPool(
+  List<String> files,
+  int jobs,
+  List<String> failed,
+) async {
+  final sdk = androidSdkRoot();
+  final adb = '$sdk/platform-tools/adb';
+  final queue = [...files];
+  final capture = files.length > 1;
+  final workers = jobs.clamp(1, files.length);
+  stdout.writeln(
+    '=== simctl test: ${files.length} test(s) across up to $workers pool emulator(s) ===',
+  );
+
+  // NB: concurrent `flutter run` builds write the shared build/ dir and would corrupt the packaged
+  // native lib — they're serialized by a cross-process build lock in the harness's `_launchApp`
+  // (released once each app's VM service is up), so only the slow test EXECUTION overlaps. Nothing to
+  // pre-build here.
+
+  var acquiredAny = false;
+
+  Future<void> runOne(String serial, String file) async {
+    await Process.run(adb, [
+      '-s',
+      serial,
+      'shell',
+      'pm',
+      'clear',
+      'com.frostsnap',
+    ]);
+    if (!capture) stdout.writeln('=== simctl test: $file on $serial ===');
+    final proc = await Process.start(
+      'dart',
+      ['run', 'test_driver/$file'],
+      mode: capture ? ProcessStartMode.normal : ProcessStartMode.inheritStdio,
+      environment: {'SIM_FLUTTER_DEVICE': serial},
+    );
+    if (!capture) {
+      if (await proc.exitCode != 0) failed.add(file);
+      return;
+    }
+    final buf = StringBuffer();
+    final outDone = proc.stdout.transform(utf8.decoder).forEach(buf.write);
+    final errDone = proc.stderr.transform(utf8.decoder).forEach(buf.write);
+    final code = await proc.exitCode;
+    await Future.wait([outDone, errDone]);
+    stdout.writeln(
+      '=== simctl test: $file on $serial ${code == 0 ? 'PASSED' : 'FAILED'} ===\n$buf',
+    );
+    if (code != 0) failed.add(file);
+  }
+
+  await Future.wait(
+    List.generate(workers, (_) async {
+      ({int slot, String serial}) emu;
+      try {
+        emu = await _acquireEmulator(sdk, cap: workers);
+      } catch (e) {
+        stderr.writeln(
+          'simctl: a pool worker could not boot an emulator ($e) — running with fewer in parallel',
+        );
+        return;
+      }
+      acquiredAny = true;
+      try {
+        while (queue.isNotEmpty) {
+          await runOne(emu.serial, queue.removeAt(0));
+        }
+      } finally {
+        _releaseEmulator(sdk, emu.slot);
+      }
+    }),
+  );
+
+  if (!acquiredAny) {
+    stderr.writeln('simctl: could not boot ANY pool emulator');
+    failed.addAll(queue); // nothing ran
+  }
+}
+
+/// Run [task] over [items] with at most [jobs] running concurrently (a bounded worker pool). Workers
+/// pull from a shared queue; the Dart event loop is single-threaded, so `failed.add` from concurrent
+/// tasks doesn't race.
+Future<void> _runBounded(
+  List<String> items,
+  int jobs,
+  Future<void> Function(String) task,
+) async {
+  final queue = [...items];
+  final workers = (jobs < 1 ? 1 : jobs).clamp(1, items.length);
+  await Future.wait(
+    List.generate(workers, (_) async {
+      while (queue.isNotEmpty) {
+        await task(queue.removeAt(0));
+      }
+    }),
+  );
 }
 
 // ---- platform resolution: --android boots/reuses an emulator ----
@@ -366,69 +498,36 @@ Future<String> _resolvePlatform(List<String> args) async {
   return platform;
 }
 
-/// The TCP port from an electrum URL (`tcp://host:port`, `ssl://host:port`, or `host:port`).
-int _electrumPort(String url) {
-  final u = Uri.parse(url.contains('://') ? url : 'tcp://$url');
-  if (u.port == 0) throw StateError('cannot parse electrum port from "$url"');
-  return u.port;
-}
-
-/// Proxy a host unix socket over a loopback TCP port so an adb-reversed emulator can reach it. Each
-/// TCP connection opens a fresh unix connection and pipes both ways (the faucet protocol is short
-/// connect→request→close exchanges). Returns the listening server — close it to stop the bridge.
-Future<ServerSocket> _bridgeUnixOverTcp(String unixPath) async {
-  final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
-  server.listen((client) async {
-    final Socket upstream;
-    try {
-      upstream = await Socket.connect(
-        InternetAddress(unixPath, type: InternetAddressType.unix),
-        0,
-      );
-    } catch (_) {
-      client.destroy();
-      return;
-    }
-    unawaited(client.cast<List<int>>().pipe(upstream).catchError((_) {}));
-    unawaited(upstream.cast<List<int>>().pipe(client).catchError((_) {}));
-  });
-  return server;
-}
-
 /// The simctl-managed AVD; created on first use, reused after.
 const _avdName = 'frostsnap_sim';
 
-/// The Android SDK root from ANDROID_HOME / ANDROID_SDK_ROOT / android/local.properties / the macOS
-/// default. Throws a clear error if none resolves.
-String _androidSdkRoot() {
-  for (final v in [
-    Platform.environment['ANDROID_HOME'],
-    Platform.environment['ANDROID_SDK_ROOT'],
-  ]) {
-    if (v != null && v.isNotEmpty && Directory(v).existsSync()) return v;
-  }
-  final lp = File('android/local.properties');
-  if (lp.existsSync()) {
-    for (final line in lp.readAsLinesSync()) {
-      final m = RegExp(r'^\s*sdk\.dir\s*=\s*(.+)$').firstMatch(line);
-      if (m != null && Directory(m.group(1)!.trim()).existsSync()) {
-        return m.group(1)!.trim();
-      }
-    }
-  }
-  final fallback = '${Platform.environment['HOME']}/Library/Android/sdk';
-  if (Directory(fallback).existsSync()) return fallback;
-  throw StateError(
-    'Android SDK not found — set ANDROID_HOME or android/local.properties sdk.dir',
-  );
+/// Whether [serial] is running a pool AVD (the `frostsnap_sim_pool` prefix). The interactive path
+/// uses this to skip pool emulators — true AVD ownership, not a port/serial guess.
+Future<bool> _isPoolEmulator(String sdk, String serial) async {
+  final r = await Process.run('$sdk/platform-tools/adb', [
+    '-s',
+    serial,
+    'emu',
+    'avd',
+    'name',
+  ]);
+  final name = (r.stdout as String).trim().split('\n').first.trim();
+  return name.startsWith('frostsnap_sim_pool');
 }
 
-/// The serial of a running emulator (e.g. `emulator-5554`), or null if none is up.
-Future<String?> _runningEmulatorSerial(String sdk) async {
+/// The serial of a running INTERACTIVE emulator (e.g. `emulator-5554`), or null if none is up. With
+/// [excludePool], skips pool-owned emulators (by AVD name) so `up`/`serve` can never reuse one.
+Future<String?> _runningEmulatorSerial(
+  String sdk, {
+  bool excludePool = false,
+}) async {
   final res = await Process.run('$sdk/platform-tools/adb', ['devices']);
   for (final line in (res.stdout as String).split('\n')) {
     final m = RegExp(r'^(emulator-\d+)\s+device$').firstMatch(line.trim());
-    if (m != null) return m.group(1);
+    if (m == null) continue;
+    final serial = m.group(1)!;
+    if (excludePool && await _isPoolEmulator(sdk, serial)) continue;
+    return serial;
   }
   return null;
 }
@@ -436,8 +535,8 @@ Future<String?> _runningEmulatorSerial(String sdk) async {
 /// Boot an emulator (reusing a running one, else provisioning + booting [_avdName]) and return its
 /// serial once `sys.boot_completed` is set.
 Future<String> _ensureEmulatorBooted() async {
-  final sdk = _androidSdkRoot();
-  final existing = await _runningEmulatorSerial(sdk);
+  final sdk = androidSdkRoot();
+  final existing = await _runningEmulatorSerial(sdk, excludePool: true);
   if (existing != null) {
     stderr.writeln('simctl: reusing the running emulator $existing');
     await _provisionEmulator(sdk, existing);
@@ -445,6 +544,11 @@ Future<String> _ensureEmulatorBooted() async {
   }
   final avd = await _ensureAvd(sdk);
   stderr.writeln('simctl: booting emulator AVD "$avd" (cold, clean state) …');
+  // Boot on the FIXED interactive port (clear of the pool's `_poolBasePort`+), so every wait/probe
+  // below targets `_interactiveSerial`. An untargeted `adb wait-for-device`/`adb shell` would return
+  // for / fail against a concurrently-running pool emulator ("more than one device"), so the
+  // interactive bring-up must not depend on being the only emulator connected.
+  //
   // `-wipe-data` cold-boots a CLEAN package DB. Repeated `flutter run` installs otherwise corrupt
   // the package state on a long-lived emulator — the launcher activity stops resolving (am start ->
   // -92), so the app never launches and bring-up dies on the VM-service timeout. A clean boot is
@@ -452,15 +556,17 @@ Future<String> _ensureEmulatorBooted() async {
   await Process.start('$sdk/emulator/emulator', [
     '-avd',
     avd,
+    '-port',
+    '$_interactivePort',
     '-no-snapshot',
     '-wipe-data',
     '-no-boot-anim',
     '-gpu',
     'auto',
   ], mode: ProcessStartMode.detached);
-  final serial = await _waitForBoot(sdk);
-  await _provisionEmulator(sdk, serial);
-  return serial;
+  await _waitForBoot(sdk, serial: _interactiveSerial);
+  await _provisionEmulator(sdk, _interactiveSerial);
+  return _interactiveSerial;
 }
 
 /// Put a booted emulator into the state the sim needs, BEFORE the app launches. Best-effort and
@@ -498,19 +604,22 @@ Future<void> _provisionEmulator(String sdk, String serial) async {
   ]);
 }
 
-/// Ensure [_avdName] exists, provisioning the emulator package + a host-matching system image and
-/// creating it if missing. Idempotent; the first run is a large download (logged).
-Future<String> _ensureAvd(String sdk) async {
-  final avdIni = '${Platform.environment['HOME']}/.android/avd/$_avdName.ini';
-  if (File(avdIni).existsSync()) return _avdName;
+String get _sysImage =>
+    'system-images;android-34;google_apis;${_hostArchIsArm() ? 'arm64-v8a' : 'x86_64'}';
 
+/// Install the emulator package + system image once (idempotent; gated on the image already being
+/// present, so per-AVD callers don't re-run the slow check). The first run is a large download.
+Future<void> _ensureSdkPackages(String sdk) async {
   final abi = _hostArchIsArm() ? 'arm64-v8a' : 'x86_64';
-  final image = 'system-images;android-34;google_apis;$abi';
+  if (File('$sdk/emulator/emulator').existsSync() &&
+      Directory(
+        '$sdk/system-images/android-34/google_apis/$abi',
+      ).existsSync()) {
+    return;
+  }
   final sdkmanager = '$sdk/cmdline-tools/latest/bin/sdkmanager';
-  final avdmanager = '$sdk/cmdline-tools/latest/bin/avdmanager';
-
   stderr.writeln(
-    'simctl: provisioning emulator + $image (one-time, large download) …',
+    'simctl: provisioning emulator + $_sysImage (one-time, large download) …',
   );
   // Accept any pending licenses, then install (feeding "y" covers per-package license prompts).
   await _runFeeding(sdkmanager, ['--licenses'], 'y\n' * 50);
@@ -518,23 +627,31 @@ Future<String> _ensureAvd(String sdk) async {
     '--install',
     'emulator',
     'platform-tools',
-    image,
+    _sysImage,
   ], 'y\n' * 50);
+}
 
-  stderr.writeln('simctl: creating AVD "$_avdName" …');
+/// Ensure AVD [avd] exists (creating it if missing), installing the SDK packages first if needed.
+/// Idempotent. Used for the interactive AVD and for each pool AVD.
+Future<String> _ensureAvd(String sdk, {String avd = _avdName}) async {
+  final avdIni = '${Platform.environment['HOME']}/.android/avd/$avd.ini';
+  if (File(avdIni).existsSync()) return avd;
+  await _ensureSdkPackages(sdk);
+  final avdmanager = '$sdk/cmdline-tools/latest/bin/avdmanager';
+  stderr.writeln('simctl: creating AVD "$avd" …');
   // "no" declines the custom-hardware-profile prompt.
   await _runFeeding(avdmanager, [
     'create',
     'avd',
     '-n',
-    _avdName,
+    avd,
     '-k',
-    image,
+    _sysImage,
     '--device',
     'pixel_6',
     '--force',
   ], 'no\n');
-  return _avdName;
+  return avd;
 }
 
 bool _hostArchIsArm() {
@@ -546,24 +663,180 @@ bool _hostArchIsArm() {
   }
 }
 
-/// adb wait-for-device + poll `sys.boot_completed`; return the emulator serial.
-Future<String> _waitForBoot(String sdk) async {
+/// adb wait-for-device + poll `sys.boot_completed` for the SPECIFIC [serial] (every emulator boots on
+/// a known fixed port, so we always target one device). Targeting matters: an untargeted poll fails
+/// with "more than one device" once the pool and the interactive emulator run concurrently.
+Future<void> _waitForBoot(String sdk, {required String serial}) async {
   final adb = '$sdk/platform-tools/adb';
-  await _run(adb, ['wait-for-device']);
+  await _run(adb, ['-s', serial, 'wait-for-device']);
   final deadline = DateTime.now().add(const Duration(minutes: 5));
   while (DateTime.now().isBefore(deadline)) {
     final r = await Process.run(adb, [
+      '-s',
+      serial,
       'shell',
       'getprop',
       'sys.boot_completed',
     ]);
-    if ((r.stdout as String).trim() == '1') {
-      final serial = await _runningEmulatorSerial(sdk);
-      if (serial != null) return serial;
-    }
+    if ((r.stdout as String).trim() == '1') return;
     await Future<void>.delayed(const Duration(seconds: 2));
   }
-  throw StateError('emulator did not finish booting within 5 minutes');
+  throw StateError('emulator $serial did not finish booting within 5 minutes');
+}
+
+// ---- test emulator pool: a DEDICATED emulator per concurrent test (parallel-android-tests) ----
+
+/// The interactive emulator's FIXED port + serial. Kept below `_poolBasePort` so it never collides
+/// with a pool slot, and fixed so interactive bring-up can target it even when pool emulators run.
+const _interactivePort = 5554;
+const _interactiveSerial = 'emulator-$_interactivePort';
+
+/// Pool AVD name for slot [s] — the `frostsnap_sim_pool` prefix keeps it NAME-isolated from the
+/// interactive `frostsnap_sim` AVD, so a pooled test can never boot/clear the interactive wallet.
+String _poolAvd(int slot) => 'frostsnap_sim_pool_$slot';
+
+/// First pool emulator port. Kept clear of the interactive emulator's default 5554 so the pool can
+/// never collide with it. Slot s → port `_poolBasePort + 2s` → serial `emulator-(port)` (the
+/// emulator assigns the serial from `-port`), so each slot has a DETERMINISTIC serial — no
+/// boot-order/serial-diff race.
+const _poolBasePort = 5582;
+int _poolPort(int slot) => _poolBasePort + slot * 2;
+String _poolSerial(int slot) => 'emulator-${_poolPort(slot)}';
+Directory _poolDir() =>
+    Directory('${simTmpRoot().path}/pool')..createSync(recursive: true);
+
+/// Atomically claim the lowest free pool slot in `[0, cap)`, or null if all are busy. The claim is an
+/// O_EXCL lockfile create (`exclusive: true`), so two concurrent runners can never grab the same slot
+/// (the exact collision this pool prevents).
+int? _claimSlot(int cap) {
+  for (var slot = 0; slot < cap; slot++) {
+    try {
+      File('${_poolDir().path}/slot-$slot.lock').createSync(exclusive: true);
+      return slot;
+    } on FileSystemException {
+      continue; // already claimed
+    }
+  }
+  return null;
+}
+
+void _releaseSlot(int slot) {
+  try {
+    File('${_poolDir().path}/slot-$slot.lock').deleteSync();
+  } catch (_) {}
+}
+
+Future<bool> _serialRunning(String sdk, String serial) async {
+  final res = await Process.run('$sdk/platform-tools/adb', ['devices']);
+  return (res.stdout as String)
+      .split('\n')
+      .any((l) => l.trim().startsWith('$serial\t'));
+}
+
+/// Acquire a DEDICATED test emulator: claim a free slot, ensure its pool AVD, cold-boot it on the
+/// slot's fixed port (deterministic serial), provision it. Returns the slot + serial. The caller MUST
+/// `_releaseEmulator(slot)` it (try/finally) to kill the instance and free the slot.
+Future<({int slot, String serial})> _acquireEmulator(
+  String sdk, {
+  required int cap,
+}) async {
+  final slot = _claimSlot(cap);
+  if (slot == null) throw StateError('emulator pool exhausted (cap $cap)');
+  final serial = _poolSerial(slot);
+  try {
+    await _ensureAvd(sdk, avd: _poolAvd(slot));
+    if (!await _serialRunning(sdk, serial)) {
+      stderr.writeln(
+        'simctl: pool slot $slot booting ${_poolAvd(slot)} → $serial …',
+      );
+      await Process.start('$sdk/emulator/emulator', [
+        '-avd',
+        _poolAvd(slot),
+        '-port',
+        '${_poolPort(slot)}',
+        '-no-snapshot',
+        '-wipe-data',
+        '-no-boot-anim',
+        '-gpu',
+        'auto',
+      ], mode: ProcessStartMode.detached);
+      await _waitForBoot(sdk, serial: serial);
+    }
+    await _provisionEmulator(sdk, serial);
+    return (slot: slot, serial: serial);
+  } catch (_) {
+    // KILL the instance before freeing the slot: if `Process.start` already booted it but boot/
+    // provision then threw, releasing only the lock would orphan a running emulator that
+    // `release`/`reset` can no longer reap (no claim). `emu kill` is a harmless no-op if unstarted.
+    _releaseEmulator(sdk, slot);
+    rethrow;
+  }
+}
+
+/// Kill the slot's emulator and free the slot (idempotent — safe to call on a failed acquire).
+void _releaseEmulator(String sdk, int slot) {
+  Process.runSync('$sdk/platform-tools/adb', [
+    '-s',
+    _poolSerial(slot),
+    'emu',
+    'kill',
+  ]);
+  _releaseSlot(slot);
+}
+
+/// The currently-claimed pool slots (from the lockfile registry), sorted.
+List<int> _claimedSlots() {
+  final dir = _poolDir();
+  if (!dir.existsSync()) return const [];
+  return dir
+      .listSync()
+      .map((e) => RegExp(r'slot-(\d+)\.lock$').firstMatch(e.path)?.group(1))
+      .whereType<String>()
+      .map(int.parse)
+      .toList()
+    ..sort();
+}
+
+/// `./simctl pool <status|acquire|release|reset>` — inspect/manage the test emulator pool (the
+/// allocator the parallel test runner uses). Separate from the interactive emulator by AVD name +
+/// this lockfile registry, so it can never touch the interactive wallet.
+Future<void> _pool(List<String> args) async {
+  final sdk = androidSdkRoot();
+  switch (args.isEmpty ? 'status' : args.first) {
+    case 'status':
+      stdout.writeln(
+        jsonEncode({
+          'ok': true,
+          'claimed': [
+            for (final s in _claimedSlots())
+              {'slot': s, 'serial': _poolSerial(s)},
+          ],
+        }),
+      );
+    case 'acquire':
+      var cap = 4;
+      for (var i = 0; i < args.length - 1; i++) {
+        if (args[i] == '--cap') cap = int.parse(args[i + 1]);
+      }
+      final emu = await _acquireEmulator(sdk, cap: cap);
+      stdout.writeln(
+        jsonEncode({'ok': true, 'slot': emu.slot, 'serial': emu.serial}),
+      );
+    case 'release':
+      final slot = int.parse(args[1]);
+      _releaseEmulator(sdk, slot);
+      stdout.writeln(jsonEncode({'ok': true, 'released': slot}));
+    case 'reset':
+      for (final slot in _claimedSlots()) {
+        _releaseEmulator(sdk, slot);
+      }
+      stdout.writeln(jsonEncode({'ok': true, 'reset': true}));
+    default:
+      stderr.writeln(
+        'simctl pool <status | acquire [--cap N] | release <slot> | reset>',
+      );
+      exit(2);
+  }
 }
 
 /// Run a command, streaming its output; throw on non-zero exit.
@@ -647,8 +920,8 @@ Future<void> _serve(List<String> args) async {
       try {
         serveLog('simctl: bridging regtest to $platform over adb …');
         final backend = await ensureRegtestBackend();
-        final adb = '${_androidSdkRoot()}/platform-tools/adb';
-        final ePort = _electrumPort(backend.url);
+        final adb = '${androidSdkRoot()}/platform-tools/adb';
+        final ePort = electrumPort(backend.url);
         await _run(adb, [
           '-s',
           platform,
@@ -657,7 +930,7 @@ Future<void> _serve(List<String> args) async {
           'tcp:$ePort',
         ]);
         extraDefines['SIM_REGTEST_ELECTRUM_URL'] = backend.url;
-        controlProxy = await _bridgeUnixOverTcp(regtestControlSocket);
+        controlProxy = await bridgeUnixOverTcp(regtestControlSocket);
         await _run(adb, [
           '-s',
           platform,

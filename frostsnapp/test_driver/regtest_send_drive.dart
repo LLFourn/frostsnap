@@ -1,9 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:frostsnap/sim_faucet.dart';
-
-import 'regtest.dart' show regtestControlSocket;
 import 'sim_harness.dart';
 
 // regtest SEND end-to-end — the second half of the wallet lifecycle, on a real 2-of-3 wallet.
@@ -84,7 +81,7 @@ Future<void> main() async {
         throw StateError('expected a bcrt1 receive address, got "$address"');
       }
 
-      final faucet = await SimFaucet.connect(regtestControlSocket);
+      final faucet = await h.faucet();
       try {
         // Fund (broadcasts UNCONFIRMED), see it pending, then mine to confirm it.
         await faucet.fund(address, _fundSats);
@@ -98,8 +95,9 @@ Future<void> main() async {
           timeout: const Duration(seconds: 90),
         );
 
-        // Close the receive sheet to get back to the wallet home (where Send lives).
-        await h.tap('Close');
+        // Close the receive view → wallet home (where Send lives). Portable across layouts: the wide
+        // layout has a Close button; the compact emulator bottom sheet is back-dismissed.
+        await h.dismissSheetOrDialog();
         await h.waitForAbsent(RegExp('Share Address'));
 
         // 3. SEND the whole balance back to a FRESH node address (so its electrs balance reflects
@@ -145,18 +143,17 @@ Future<void> main() async {
         await h.waitFor(RegExp('Sign transaction'));
         await h.tap(RegExp('Sign transaction'));
 
-        // 4. Confirm the transaction ON each signing device, ONE CONNECTED AT A TIME — the send was
-        //    built with everything unplugged and we never have two signers connected at once (as on
-        //    real hardware). For each signer: plug it (unplugging the previous one first), walk the
-        //    tx-review screens (amount, address, fee) — each advances on a swipe-up — to the
-        //    3-second hold-to-sign and hold until its share lands. The gotShares/threshold counter
-        //    ticks "i/$_threshold" as each share is collected; "Broadcast" appears at the last one.
+        // 4. Confirm the tx ON each signing device, ONE CONNECTED AT A TIME (as on real hardware): plug
+        //    it (unplugging the previous), swipe up through the review screens to the 3s hold-to-sign,
+        //    and wait for the gotShares/threshold counter to tick to THIS signer's share. EVERY signer
+        //    must land its share — the last reaches "$_threshold/$_threshold" (all shares in) — before
+        //    we broadcast. NB: don't key the last signer off "Broadcast": that control is prebuilt in a
+        //    faded AnimatedCrossFade branch whose semantics leak on Android, so it reads as "present"
+        //    before signing is actually done — keying off it lets the loop broadcast an UNSIGNED tx.
         for (var i = 0; i < signers.length; i++) {
           if (i > 0) await h.unplug(signers[i - 1]);
           await h.plug(signers[i]);
-          final progressed = (i == signers.length - 1)
-              ? RegExp('Broadcast')
-              : RegExp('${i + 1}/$_threshold');
+          final signed = RegExp('${i + 1}/$_threshold');
           var ok = false;
           for (var round = 0; round < 8 && !ok; round++) {
             await h
@@ -169,14 +166,16 @@ Future<void> main() async {
                   _confirmY,
                   const Duration(milliseconds: 3200),
                 );
-            ok = await h.exists(progressed);
+            ok = await h.exists(signed);
           }
           if (!ok) {
             throw StateError(
-              'signer ${signers[i]} did not contribute its signature share',
+              'signer ${signers[i]} did not contribute its signature share '
+              '(threshold counter never reached ${i + 1}/$_threshold)',
             );
           }
         }
+        // Only now — all $_threshold shares collected — is the real Broadcast control shown.
         await h.tap(RegExp('Broadcast'));
         await h.waitFor(
           RegExp('Sending'),
@@ -187,9 +186,9 @@ Future<void> main() async {
         await faucet.mine(1);
         await h.waitFor(RegExp('Sent'), timeout: const Duration(seconds: 90));
 
-        // Close the tx-details dialog and confirm the wallet's activity list shows BOTH the receive
-        // and the send — the full lifecycle is reflected, not just the last action.
-        await h.tap('Close');
+        // Close the tx-details view and confirm the wallet's activity list shows BOTH the receive and
+        // the send — the full lifecycle is reflected, not just the last action.
+        await h.dismissSheetOrDialog();
         await h.waitForAbsent(RegExp('Transaction Details'));
         await h.waitFor(RegExp('Received'));
         await h.waitFor(RegExp('Sent'));

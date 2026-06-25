@@ -1,9 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:frostsnap/sim_faucet.dart';
-
-import 'regtest.dart' show regtestControlSocket;
 import 'sim_harness.dart';
 
 // regtest-bitcoin-receiving end-to-end: create a (default-Regtest) wallet, fund its REAL receive
@@ -76,7 +73,7 @@ Future<void> main() async {
     // 3. Fund the address. fund now broadcasts WITHOUT mining, so the receive must land
     //    UNCONFIRMED first: the activity tile reads "Receiving…" and shows the +1 BTC amount.
     //    (Generous timeouts for electrs to index + the app's streaming sync to pick it up.)
-    final faucet = await SimFaucet.connect(regtestControlSocket);
+    final faucet = await h.faucet();
     try {
       await faucet.fund(address, _fundSats);
       await h.waitFor(
