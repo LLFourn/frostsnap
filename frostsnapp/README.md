@@ -54,6 +54,22 @@ just run
 
 Flutter will give you an option of running on an android device if one is connected (in [debug mode](https://www.lifewire.com/enable-usb-debugging-android-46L90927)). If you can not see your device you may need to check `adb devices` ([android debug bridge](https://wiki.archlinux.org/title/Android_Debug_Bridge)) shows your device.
 
+## Sim E2E Tests
+
+Run the simulator end-to-end suite from the repository root:
+
+```sh
+./simctl test --android --jobs 2 --test-timeout 900 --junit build/simctl-junit.xml
+```
+
+`./simctl test` exits zero only when every run test passes. Failures and
+timeouts exit non-zero and print a cargo-test-style summary. Raw child output
+for every test is captured at `frostsnapp/build/sim-failures/<test>/output.log`;
+non-pass tests keep extra diagnostics in that same directory (screenshots,
+device framebuffers, and error details where available). Add `--nocapture` or
+`-v` to stream raw output live while debugging; CI should normally leave capture
+enabled.
+
 ## Build
 
 When this doesn't work figure out why and fix these instructions please. If you want to run on android it may help to open the project in android studio.

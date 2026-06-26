@@ -274,6 +274,57 @@ class RegtestSession {
   }
 }
 
+/// Reap a possibly-running isolated regtest session rooted at [dir].
+///
+/// Used by the outer test runner's timeout path, where the timed-out test process
+/// may never reach [RegtestSession.stop]. We no longer have the in-process
+/// [RegtestSession] value, so recover the backend PID from its control socket (or,
+/// during startup, the process command line), then reap the whole backend process
+/// group so bitcoind/electrs children do not leak.
+Future<void> reapRegtestSessionDir(Directory dir) async {
+  final controlSocket = '${dir.path}/control.sock';
+  final pid =
+      await _ownerPidAt(controlSocket) ??
+      await _pidForControlSocket(controlSocket);
+  if (pid != null) {
+    try {
+      final f = await SimFaucet.connect(controlSocket);
+      try {
+        await f.down();
+      } catch (_) {
+      } finally {
+        await f.close();
+      }
+    } catch (_) {}
+    if (!await _processExits(pid, const Duration(seconds: 10))) {
+      await _killProcessGroup(pid);
+    }
+  }
+  try {
+    if (await dir.exists()) await dir.delete(recursive: true);
+  } catch (_) {}
+}
+
+Future<int?> _pidForControlSocket(String controlSocket) async {
+  final ps = await Process.run('ps', ['-ax', '-o', 'pid=,command=']);
+  if (ps.exitCode != 0) return null;
+  for (final line in (ps.stdout as String).split('\n')) {
+    final trimmed = line.trimLeft();
+    if (trimmed.isEmpty) continue;
+    final sep = trimmed.indexOf(RegExp(r'\s+'));
+    if (sep < 0) continue;
+    final pid = int.tryParse(trimmed.substring(0, sep));
+    final command = trimmed.substring(sep).trimLeft();
+    if (pid != null &&
+        command.contains('sim_regtest') &&
+        command.contains('--control-socket') &&
+        command.contains(controlSocket)) {
+      return pid;
+    }
+  }
+  return null;
+}
+
 /// Start a fresh, isolated [RegtestSession] under [dir] (created if absent). Always spawns its own
 /// backend (no attach) — the caller owns it and MUST `stop()` it. Throws on build/startup failure.
 Future<RegtestSession> startRegtestSession(Directory dir) async {

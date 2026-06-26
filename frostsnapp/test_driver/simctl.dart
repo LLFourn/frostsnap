@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter_driver/flutter_driver.dart';
+
 import 'regtest.dart';
 import 'sim_harness.dart';
 
@@ -41,12 +43,16 @@ simctl — drive the running sim app/devices through SimHarness.
                                               one if needed) with regtest bridged over adb; drive the
                                               devices via `./simctl` (below) or the in-app tray
   simctl info                                 print the running daemon's shape (platform/count/regtest)
-  simctl test [NAMES...] [--android] [--jobs N]
+  simctl test [NAMES...] [--android] [--jobs N] [--test-timeout SECS] [--nocapture|-v] [--junit PATH]
                                               run e2e driver tests (stems; ALL if none) IN PARALLEL —
                                               host: one `dart run` each; --android: each on its OWN
                                               pool emulator + (if it uses regtest) its OWN chain
                                               bridged to that emulator (degrades to however many
-                                              boot). --jobs caps parallelism (default = all at once)
+                                              boot). --jobs caps parallelism (default = all at once);
+                                              --test-timeout (default 900s) reaps a wedged test as
+                                              TIMEOUT so the run never stalls; raw output goes to
+                                              build/sim-failures/<test>/output.log unless
+                                              --nocapture/-v streams it live; --junit writes XML
   simctl regtest up|down|status               manage the shared regtest bitcoind+electrs+faucet
   simctl regtest fund <addr> <sats> | mine [n] | balance | height | address | url   drive the faucet
   simctl pool status|acquire [--cap N]|release <slot>|reset
@@ -288,6 +294,157 @@ Future<Map<String, dynamic>> _query(Map<String, dynamic> req) async {
 
 // ---- test runner: run the driver e2e tests (test_driver/*_drive.dart) ----
 
+const _driveSuffix = '_drive.dart';
+const _diagnosticTimeout = Duration(seconds: 10);
+
+class _TestSpec {
+  final String file;
+  final String name;
+  final Directory artifactsDir;
+
+  _TestSpec(this.file, this.name)
+    : artifactsDir = Directory('build/sim-failures/$name');
+}
+
+class _TestResult {
+  final _TestSpec test;
+  final String status;
+  final String output;
+  final Duration duration;
+  final String? reason;
+
+  _TestResult({
+    required this.test,
+    required this.status,
+    required this.output,
+    required this.duration,
+    this.reason,
+  });
+
+  bool get passed => status == 'PASSED';
+  bool get failed => status == 'FAILED';
+  bool get timedOut => status == 'TIMEOUT';
+  bool get skipped => status == 'SKIPPED';
+}
+
+List<_TestSpec> _testSpecs(List<String> files) {
+  final seen = <String, int>{};
+  return [
+    for (final file in files)
+      () {
+        final stem = file.substring(0, file.length - _driveSuffix.length);
+        final count = (seen[stem] ?? 0) + 1;
+        seen[stem] = count;
+        return _TestSpec(file, count == 1 ? stem : '$stem-$count');
+      }(),
+  ];
+}
+
+Future<void> _clearArtifacts(Directory dir) async {
+  if (await dir.exists()) await dir.delete(recursive: true);
+}
+
+Future<void> _writeOutputLog(Directory dir, String output) async {
+  await dir.create(recursive: true);
+  await File('${dir.path}/output.log').writeAsString(output);
+}
+
+Future<void> _writeErrorIfAbsent(Directory dir, String error) async {
+  await dir.create(recursive: true);
+  final file = File('${dir.path}/error.txt');
+  if (!await file.exists()) await file.writeAsString(error);
+}
+
+String _elapsed(Duration d) =>
+    '${(d.inMilliseconds / 1000).toStringAsFixed(1)}s';
+
+String _displayStatus(_TestResult r) => switch (r.status) {
+  'PASSED' => 'ok',
+  'FAILED' => 'FAILED',
+  'TIMEOUT' => 'TIMEOUT',
+  'SKIPPED' => 'SKIPPED',
+  _ => r.status,
+};
+
+void _printResult(_TestResult r) {
+  stdout.writeln(
+    'test ${r.test.name} ... ${_displayStatus(r)} (${_elapsed(r.duration)})',
+  );
+}
+
+void _printFailures(List<_TestResult> failures) {
+  if (failures.isEmpty) return;
+  stdout.writeln();
+  stdout.writeln('failures:');
+  for (final failure in failures) {
+    final reason = failure.reason ?? failure.status;
+    stdout.writeln(
+      '  ${failure.test.name}: $reason; see ${failure.test.artifactsDir.path}',
+    );
+  }
+}
+
+void _printSummary(List<_TestResult> results, Duration elapsed) {
+  final passed = results.where((r) => r.passed).length;
+  final failed = results.where((r) => r.failed).length;
+  final timedOut = results.where((r) => r.timedOut).length;
+  final skipped = results.where((r) => r.skipped).length;
+  stdout.writeln();
+  stdout.writeln(
+    'test result: $passed passed; $failed failed; $timedOut timed out; '
+    '$skipped skipped; finished in ${_elapsed(elapsed)}',
+  );
+}
+
+Future<void> _writeJunit(
+  String path,
+  List<_TestResult> results,
+  Duration elapsed,
+) async {
+  final file = File(path);
+  await file.parent.create(recursive: true);
+  final failed = results.where((r) => r.failed).length;
+  final timedOut = results.where((r) => r.timedOut).length;
+  final skipped = results.where((r) => r.skipped).length;
+  final b = StringBuffer()
+    ..writeln('<?xml version="1.0" encoding="UTF-8"?>')
+    ..writeln(
+      '<testsuite name="simctl" tests="${results.length}" failures="$failed" '
+      'errors="$timedOut" skipped="$skipped" time="${_junitTime(elapsed)}">',
+    );
+  for (final r in results) {
+    b.writeln(
+      '  <testcase classname="simctl" name="${_xmlEscape(r.test.name)}" '
+      'time="${_junitTime(r.duration)}">',
+    );
+    if (r.skipped) {
+      b.writeln('    <skipped/>');
+    } else if (r.failed) {
+      final message = _xmlEscape(r.reason ?? 'failed');
+      b.writeln(
+        '    <failure message="$message">${_xmlEscape(r.output)}</failure>',
+      );
+    } else if (r.timedOut) {
+      final message = _xmlEscape(r.reason ?? 'timed out');
+      b.writeln(
+        '    <error type="timeout" message="$message">${_xmlEscape(r.output)}</error>',
+      );
+    }
+    b.writeln('  </testcase>');
+  }
+  b.writeln('</testsuite>');
+  await file.writeAsString(b.toString());
+}
+
+String _junitTime(Duration d) => (d.inMilliseconds / 1000).toStringAsFixed(3);
+
+String _xmlEscape(String s) => s
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+
 /// Run one driver test by its file STEM (`<stem>_drive.dart`), or all of them with no arg.
 /// Each runs as its own `dart run` so they get a fresh app/harness; a non-zero exit from any
 /// fails the whole run. Replaces the per-test justfile recipes — a new test is just a new
@@ -300,12 +457,27 @@ Future<void> _runTests(List<String> args) async {
   // the parallelism; default = run them all at once (degrading to however many emulators boot).
   final android = args.contains('--android');
   int? jobs; // null = "as many as possible"
+  int? testTimeout; // per-test hard deadline, seconds
+  var noCapture = false;
+  String? junitPath;
   final positional = <String>[];
   for (var i = 0; i < args.length; i++) {
     final a = args[i];
     if (a == '--android') continue;
+    if (a == '--nocapture' || a == '-v') {
+      noCapture = true;
+      continue;
+    }
     if (a == '--jobs') {
       jobs = int.parse(args[++i]);
+      continue;
+    }
+    if (a == '--test-timeout') {
+      testTimeout = int.parse(args[++i]);
+      continue;
+    }
+    if (a == '--junit') {
+      junitPath = args[++i];
       continue;
     }
     if (a.startsWith('--')) continue;
@@ -315,8 +487,8 @@ Future<void> _runTests(List<String> args) async {
   final stems = <String, String>{}; // stem -> filename
   for (final entry in Directory('test_driver').listSync()) {
     final name = entry.uri.pathSegments.last;
-    if (entry is File && name.endsWith('_drive.dart')) {
-      stems[name.substring(0, name.length - '_drive.dart'.length)] = name;
+    if (entry is File && name.endsWith(_driveSuffix)) {
+      stems[name.substring(0, name.length - _driveSuffix.length)] = name;
     }
   }
   final available = stems.keys.toList()..sort();
@@ -337,47 +509,40 @@ Future<void> _runTests(List<String> args) async {
       files.add(file);
     }
   }
+  final tests = _testSpecs(files);
 
   // Default to running every test at once; the android pool degrades to however many emulators boot.
   final effJobs = (jobs ?? files.length).clamp(1, files.length);
-  final failed = <String>[];
+  // Per-test hard deadline so a wedged test (frozen app / unbounded wait) can't stall the run — it's
+  // reaped and reported TIMEOUT instead. Generous by default: each test process includes its flutter
+  // BUILD (serialized by the build lock), so parallel workers can queue behind one build. `--test-timeout`.
+  final deadline = Duration(seconds: testTimeout ?? 900);
+  final results = <_TestResult>[];
+  final started = DateTime.now();
+  stdout.writeln('running ${tests.length} tests');
   if (android) {
-    await _runAndroidPool(files, effJobs, failed);
+    await _runAndroidPool(tests, effJobs, results, deadline, noCapture);
   } else {
     // Host: each test is a self-contained `dart run` (owns its PRIVATE per-session regtest chain), so
     // up to `effJobs` run concurrently with no shared state. Concurrent output is captured + printed
     // grouped on completion (interleaved live streams would be unreadable); a single test streams live.
-    final capture = effJobs > 1;
-    await _runBounded(files, effJobs, (file) async {
-      if (!capture) stdout.writeln('=== simctl test: $file ===');
-      final proc = await Process.start(
-        'dart',
-        ['run', 'test_driver/$file'],
-        mode: capture ? ProcessStartMode.normal : ProcessStartMode.inheritStdio,
+    await _runBounded(tests, effJobs, (test) async {
+      final r = await _runOneTest(
+        test,
+        capture: !noCapture,
+        deadline: deadline,
       );
-      if (!capture) {
-        if (await proc.exitCode != 0) failed.add(file);
-        return;
-      }
-      final buf = StringBuffer();
-      final outDone = proc.stdout.transform(utf8.decoder).forEach(buf.write);
-      final errDone = proc.stderr.transform(utf8.decoder).forEach(buf.write);
-      final code = await proc.exitCode;
-      await Future.wait([outDone, errDone]);
-      stdout.writeln(
-        '=== simctl test: $file ${code == 0 ? 'PASSED' : 'FAILED'} ===\n$buf',
-      );
-      if (code != 0) failed.add(file);
+      _printResult(r);
+      results.add(r);
     });
   }
 
-  if (files.length > 1) {
-    stdout.writeln(
-      '=== simctl test: ${files.length - failed.length}/${files.length} passed'
-      '${failed.isEmpty ? '' : ' — FAILED: ${failed.join(', ')}'} ===',
-    );
-  }
-  exit(failed.isEmpty ? 0 : 1);
+  final failures = results.where((r) => !r.passed && !r.skipped).toList();
+  _printFailures(failures);
+  final elapsed = DateTime.now().difference(started);
+  _printSummary(results, elapsed);
+  if (junitPath != null) await _writeJunit(junitPath, results, elapsed);
+  exit(failures.isEmpty ? 0 : 1);
 }
 
 /// Run [files] across the emulator POOL: spawn up to [jobs] workers, each acquiring its OWN dedicated
@@ -386,18 +551,16 @@ Future<void> _runTests(List<String> args) async {
 /// DEGRADES to however many emulators actually boot (down to one = serial) rather than failing. Per-
 /// test output is captured + printed grouped (workers interleave) when more than one test runs.
 Future<void> _runAndroidPool(
-  List<String> files,
+  List<_TestSpec> tests,
   int jobs,
-  List<String> failed,
+  List<_TestResult> results,
+  Duration deadline,
+  bool noCapture,
 ) async {
   final sdk = androidSdkRoot();
   final adb = '$sdk/platform-tools/adb';
-  final queue = [...files];
-  final capture = files.length > 1;
-  final workers = jobs.clamp(1, files.length);
-  stdout.writeln(
-    '=== simctl test: ${files.length} test(s) across up to $workers pool emulator(s) ===',
-  );
+  final queue = [...tests];
+  final workers = jobs.clamp(1, tests.length);
 
   // NB: concurrent `flutter run` builds write the shared build/ dir and would corrupt the packaged
   // native lib — they're serialized by a cross-process build lock in the harness's `_launchApp`
@@ -406,7 +569,7 @@ Future<void> _runAndroidPool(
 
   var acquiredAny = false;
 
-  Future<void> runOne(String serial, String file) async {
+  Future<void> runOne(String serial, _TestSpec test) async {
     await Process.run(adb, [
       '-s',
       serial,
@@ -415,26 +578,15 @@ Future<void> _runAndroidPool(
       'clear',
       'com.frostsnap',
     ]);
-    if (!capture) stdout.writeln('=== simctl test: $file on $serial ===');
-    final proc = await Process.start(
-      'dart',
-      ['run', 'test_driver/$file'],
-      mode: capture ? ProcessStartMode.normal : ProcessStartMode.inheritStdio,
-      environment: {'SIM_FLUTTER_DEVICE': serial},
+    final r = await _runOneTest(
+      test,
+      serial: serial,
+      sdk: sdk,
+      capture: !noCapture,
+      deadline: deadline,
     );
-    if (!capture) {
-      if (await proc.exitCode != 0) failed.add(file);
-      return;
-    }
-    final buf = StringBuffer();
-    final outDone = proc.stdout.transform(utf8.decoder).forEach(buf.write);
-    final errDone = proc.stderr.transform(utf8.decoder).forEach(buf.write);
-    final code = await proc.exitCode;
-    await Future.wait([outDone, errDone]);
-    stdout.writeln(
-      '=== simctl test: $file on $serial ${code == 0 ? 'PASSED' : 'FAILED'} ===\n$buf',
-    );
-    if (code != 0) failed.add(file);
+    _printResult(r);
+    results.add(r);
   }
 
   await Future.wait(
@@ -461,17 +613,310 @@ Future<void> _runAndroidPool(
 
   if (!acquiredAny) {
     stderr.writeln('simctl: could not boot ANY pool emulator');
-    failed.addAll(queue); // nothing ran
+    for (final test in queue) {
+      final r = await _recordSyntheticFailure(
+        test,
+        'FAILED',
+        'could not boot ANY pool emulator',
+      );
+      _printResult(r);
+      results.add(r);
+    }
   }
+}
+
+/// Run `dart run test_driver/<file>` to completion or [deadline], whichever comes first. On the
+/// deadline the test is wedged — commonly a frozen app whose VM service can't answer, so NO in-test
+/// timeout can fire — so reap what it spawned and return TIMEOUT, and the run never stalls. With
+/// [capture] the child's output is buffered (returned for grouped printing); else it inherits stdio.
+Future<_TestResult> _runOneTest(
+  _TestSpec test, {
+  String? serial,
+  String? sdk,
+  required bool capture,
+  required Duration deadline,
+}) async {
+  await _clearArtifacts(test.artifactsDir);
+  final started = DateTime.now();
+  final proc = await Process.start(
+    'dart',
+    ['run', 'test_driver/${test.file}'],
+    mode: ProcessStartMode.normal,
+    environment: {
+      'SIM_TEST_NAME': test.name,
+      'SIM_TEST_ARTIFACTS_DIR': test.artifactsDir.absolute.path,
+      if (serial != null) 'SIM_FLUTTER_DEVICE': serial,
+    },
+  );
+  final buf = StringBuffer();
+  final drains = [
+    proc.stdout.transform(utf8.decoder).forEach((chunk) {
+      buf.write(chunk);
+      if (!capture) stdout.write(chunk);
+    }),
+    proc.stderr.transform(utf8.decoder).forEach((chunk) {
+      buf.write(chunk);
+      if (!capture) stderr.write(chunk);
+    }),
+  ];
+  int code;
+  var timedOut = false;
+  String? reason;
+  try {
+    code = await proc.exitCode.timeout(deadline);
+  } on TimeoutException {
+    timedOut = true;
+    reason = 'timed out after ${deadline.inSeconds}s';
+    await _writeOutputLog(test.artifactsDir, buf.toString());
+    await _captureTimeoutDiagnostics(
+      test.artifactsDir,
+      output: buf.toString(),
+      serial: serial,
+      sdk: sdk,
+      deadline: deadline,
+    );
+    await _reapHungTest(proc, serial, sdk);
+    code = await proc.exitCode.timeout(_diagnosticTimeout, onTimeout: () => -1);
+  }
+  await Future.wait(
+    drains,
+  ).timeout(_diagnosticTimeout, onTimeout: () => <void>[]);
+  final output = buf.toString();
+  final status = timedOut ? 'TIMEOUT' : (code == 0 ? 'PASSED' : 'FAILED');
+  await _writeOutputLog(test.artifactsDir, output);
+  if (status != 'PASSED') {
+    reason ??= 'exit code $code';
+    await _writeErrorIfAbsent(
+      test.artifactsDir,
+      '$status: $reason\n\nSee output.log for the child process log.\n',
+    );
+  }
+  return _TestResult(
+    test: test,
+    status: status,
+    output: output,
+    duration: DateTime.now().difference(started),
+    reason: reason,
+  );
+}
+
+Future<_TestResult> _recordSyntheticFailure(
+  _TestSpec test,
+  String status,
+  String reason,
+) async {
+  await _clearArtifacts(test.artifactsDir);
+  await _writeOutputLog(test.artifactsDir, '');
+  await _writeErrorIfAbsent(test.artifactsDir, '$status: $reason\n');
+  return _TestResult(
+    test: test,
+    status: status,
+    output: '',
+    duration: Duration.zero,
+    reason: reason,
+  );
+}
+
+Future<void> _captureTimeoutDiagnostics(
+  Directory dir, {
+  required String output,
+  required String? serial,
+  required String? sdk,
+  required Duration deadline,
+}) async {
+  await dir.create(recursive: true);
+  await File('${dir.path}/error.txt').writeAsString(
+    'TIMEOUT after ${deadline.inSeconds}s\n\n'
+    'The child test process did not exit before the runner deadline.\n'
+    'Partial child output is in output.log.\n',
+  );
+  if (serial != null && sdk != null) {
+    await _captureAndroidTimeoutDiagnostics(dir, serial: serial, sdk: sdk);
+  } else {
+    await _captureHostTimeoutDiagnostics(dir);
+  }
+  await _captureVmDeviceFrames(dir, output);
+}
+
+Future<void> _captureAndroidTimeoutDiagnostics(
+  Directory dir, {
+  required String serial,
+  required String sdk,
+}) async {
+  final adb = '$sdk/platform-tools/adb';
+  final screen = await _runDiagnosticProcess(adb, [
+    '-s',
+    serial,
+    'exec-out',
+    'screencap',
+    '-p',
+  ], stdoutEncoding: null);
+  if (screen != null && screen.exitCode == 0 && screen.stdout is List<int>) {
+    await File(
+      '${dir.path}/android-screen.png',
+    ).writeAsBytes(screen.stdout as List<int>);
+  }
+
+  final logcat = await _runDiagnosticProcess(adb, [
+    '-s',
+    serial,
+    'logcat',
+    '-d',
+  ]);
+  if (logcat != null) {
+    await File(
+      '${dir.path}/logcat.txt',
+    ).writeAsString('${logcat.stdout}${logcat.stderr}');
+  }
+}
+
+Future<void> _captureHostTimeoutDiagnostics(Directory dir) async {
+  if (Platform.isMacOS) {
+    await _runDiagnosticProcess('screencapture', [
+      '-x',
+      '${dir.path}/host-screen.png',
+    ]);
+  } else if (Platform.isLinux) {
+    await _runDiagnosticProcess('scrot', ['${dir.path}/host-screen.png']);
+  }
+}
+
+Future<void> _captureVmDeviceFrames(Directory dir, String output) async {
+  final url = _vmServiceUrl(output);
+  if (url == null) return;
+  FlutterDriver? driver;
+  try {
+    driver = await FlutterDriver.connect(
+      dartVmServiceUrl: url,
+    ).timeout(_diagnosticTimeout);
+    final csv = await driver
+        .runUnsynchronized(() => driver!.requestData('device-numbers'))
+        .timeout(_diagnosticTimeout);
+    final numbers = csv.isEmpty ? <int>[] : csv.split(',').map(int.parse);
+    for (final n in numbers) {
+      try {
+        final b64 = await driver
+            .runUnsynchronized(() => driver!.requestData('device-screen:$n'))
+            .timeout(_diagnosticTimeout);
+        await File('${dir.path}/device-$n.png').writeAsBytes(base64Decode(b64));
+      } catch (_) {}
+    }
+  } catch (_) {
+  } finally {
+    try {
+      await driver?.close().timeout(_diagnosticTimeout);
+    } catch (_) {}
+  }
+}
+
+String? _vmServiceUrl(String output) {
+  final m = RegExp(r'(http://127\.0\.0\.1:\d+/[^\s]+)').firstMatch(output);
+  return m?.group(1);
+}
+
+Future<ProcessResult?> _runDiagnosticProcess(
+  String executable,
+  List<String> args, {
+  Encoding? stdoutEncoding = utf8,
+}) async {
+  try {
+    return await Process.run(
+      executable,
+      args,
+      stdoutEncoding: stdoutEncoding,
+      stderrEncoding: utf8,
+    ).timeout(_diagnosticTimeout);
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Best-effort reap of a timed-out test: it never ran its own teardown, so kill what it spawned — the
+/// app on its emulator, the `flutter run` driving that serial, its per-session regtest backend
+/// (`rt-<testpid>`), and the process itself. Serial-scoped, so a parallel run's other workers survive.
+Future<void> _reapHungTest(Process proc, String? serial, String? sdk) async {
+  if (serial != null && sdk != null) {
+    await Process.run('$sdk/platform-tools/adb', [
+      '-s',
+      serial,
+      'shell',
+      'am',
+      'force-stop',
+      'com.frostsnap',
+    ]);
+    await Process.run('pkill', ['-9', '-f', 'sim_app.dart -d $serial']);
+  }
+  await reapRegtestSessionDir(Directory('${simTmpRoot().path}/rt-${proc.pid}'));
+  await _killProcessTree(proc.pid);
+}
+
+Future<void> _killProcessTree(int rootPid) async {
+  final pids = await _processTree(rootPid);
+  if (pids.isEmpty) return;
+  _signalPids(pids, ProcessSignal.sigterm);
+  await Future<void>.delayed(const Duration(milliseconds: 500));
+  _signalPids(pids, ProcessSignal.sigkill);
+
+  final deadline = DateTime.now().add(const Duration(seconds: 2));
+  while (DateTime.now().isBefore(deadline)) {
+    if ((await _alivePids(pids)).isEmpty) return;
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+  }
+}
+
+void _signalPids(List<int> pids, ProcessSignal signal) {
+  for (final pid in pids.reversed) {
+    try {
+      Process.killPid(pid, signal);
+    } catch (_) {}
+  }
+}
+
+Future<Set<int>> _alivePids(List<int> pids) async {
+  final ps = await Process.run('ps', ['-ax', '-o', 'pid=']);
+  if (ps.exitCode != 0) return {};
+  final alive = <int>{};
+  for (final line in (ps.stdout as String).split('\n')) {
+    final pid = int.tryParse(line.trim());
+    if (pid != null) alive.add(pid);
+  }
+  return pids.where(alive.contains).toSet();
+}
+
+Future<List<int>> _processTree(int rootPid) async {
+  final ps = await Process.run('ps', ['-ax', '-o', 'pid=,ppid=']);
+  if (ps.exitCode != 0) return [rootPid];
+  final children = <int, List<int>>{};
+  var rootAlive = false;
+  for (final line in (ps.stdout as String).split('\n')) {
+    final parts = line.trim().split(RegExp(r'\s+'));
+    if (parts.length < 2) continue;
+    final pid = int.tryParse(parts[0]);
+    final ppid = int.tryParse(parts[1]);
+    if (pid == null || ppid == null) continue;
+    if (pid == rootPid) rootAlive = true;
+    children.putIfAbsent(ppid, () => []).add(pid);
+  }
+
+  final ordered = <int>[];
+  void visit(int pid) {
+    ordered.add(pid);
+    for (final child in children[pid] ?? const <int>[]) {
+      visit(child);
+    }
+  }
+
+  visit(rootPid);
+  return rootAlive || ordered.length > 1 ? ordered : <int>[];
 }
 
 /// Run [task] over [items] with at most [jobs] running concurrently (a bounded worker pool). Workers
 /// pull from a shared queue; the Dart event loop is single-threaded, so `failed.add` from concurrent
 /// tasks doesn't race.
 Future<void> _runBounded(
-  List<String> items,
+  List<_TestSpec> items,
   int jobs,
-  Future<void> Function(String) task,
+  Future<void> Function(_TestSpec) task,
 ) async {
   final queue = [...items];
   final workers = (jobs < 1 ? 1 : jobs).clamp(1, items.length);

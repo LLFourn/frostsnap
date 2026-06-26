@@ -354,18 +354,14 @@ class AppSession {
   /// app-side source of truth that BOTH the tray + button and `./simctl add-device` grow. App
   /// channel only, so it works on an emulator (no host sockets involved).
   Future<List<int>> deviceNumbers() async {
-    final csv = await driver.runUnsynchronized(
-      () => driver.requestData('device-numbers'),
-    );
+    final csv = await _requestData('device-numbers');
     return csv.isEmpty ? <int>[] : csv.split(',').map(int.parse).toList();
   }
 
   /// Add a virtual device to the fleet at runtime (CLI/harness parity with the tray + button) and
   /// return its 1-based number. App channel only — triggers the in-app pool add via driver data.
   /// [SimHarness] overrides this to also connect the new device's host socket.
-  Future<int> addDevice() async => int.parse(
-    await driver.runUnsynchronized(() => driver.requestData('add-device')),
-  );
+  Future<int> addDevice() async => int.parse(await _requestData('add-device'));
 
   // ---- device driving over the APP channel (FRB pool) ----
   // These drive the in-process `simDevicePool` via driver-data, so a scenario drives a device the
@@ -378,8 +374,15 @@ class AppSession {
 
   /// Drive a device endpoint and return its reply — for the query endpoints (chain/id/is-connected/
   /// screen) that return data, not just an ack.
-  Future<String> _deviceQuery(String cmd) =>
-      driver.runUnsynchronized(() => driver.requestData(cmd));
+  Future<String> _deviceQuery(String cmd) => _requestData(cmd);
+
+  /// Every app-channel driver-data request funnels through here so they share ONE client-side timeout:
+  /// a slow/stuck app can't make a single request hang the scenario forever. (A FULLY wedged app —
+  /// VM service unable to answer at all, e.g. a frozen UI thread — is caught by the runner's per-test
+  /// deadline, since no client-side timeout can fire if the isolate never schedules the reply.)
+  Future<String> _requestData(String message) => driver
+      .runUnsynchronized(() => driver.requestData(message))
+      .timeout(_cmdTimeout);
 
   /// An app-channel handle to virtual device [number] (1-based, default 1): the same method surface
   /// the host socket had, but every call goes over the app channel (driver-data → the in-process
@@ -435,13 +438,7 @@ class AppSession {
   /// widget's screen rect (e.g. is a button below `height - bottomInset`, i.e. behind the nav bar).
   Future<({double width, double height, double topInset, double bottomInset})>
   viewMetrics() async {
-    final m =
-        jsonDecode(
-              await driver.runUnsynchronized(
-                () => driver.requestData('metrics'),
-              ),
-            )
-            as Map<String, dynamic>;
+    final m = jsonDecode(await _requestData('metrics')) as Map<String, dynamic>;
     return (
       width: (m['width'] as num).toDouble(),
       height: (m['height'] as num).toDouble(),
@@ -587,7 +584,7 @@ class AppSession {
     var prev = double.nan;
     while (true) {
       final br = await driver.runUnsynchronized(
-        () => driver.getBottomRight(finder),
+        () => driver.getBottomRight(finder, timeout: _cmdTimeout),
       );
       if ((br.dy - prev).abs() < 1.0 || DateTime.now().isAfter(deadline)) {
         return br;
@@ -668,14 +665,12 @@ class AppSession {
 
   /// The app clipboard, via the sim_app driver data handler — e.g. to read a wallet receive
   /// address after tapping its Copy button (the address Text has no stable label to target).
-  Future<String> getClipboard() =>
-      driver.runUnsynchronized(() => driver.requestData('clipboard'));
+  Future<String> getClipboard() => _requestData('clipboard');
 
   /// Set the app clipboard (e.g. to seed a recipient address before tapping a Paste button), via
   /// the sim_app driver data handler. Portable counterpart to [getClipboard] — uses Flutter's
   /// Clipboard, so scenarios need no platform pasteboard tool (pbcopy/xclip) and stay cross-platform.
-  Future<void> setClipboard(String text) =>
-      driver.runUnsynchronized(() => driver.requestData('setclip:$text'));
+  Future<void> setClipboard(String text) => _requestData('setclip:$text');
 
   Future<void> waitFor(
     Pattern label, {
@@ -744,7 +739,11 @@ class AppSession {
   /// tree already reflects it). Foregrounding resumes rendering so the shot is current.
   Future<String> screenshot(String name, {String? keep}) async {
     await _bringAppToFront();
-    final png = await driver.runUnsynchronized(() => driver.screenshot());
+    // `screenshot` takes no `timeout:`, so bound it client-side — keeps the failure-diagnostics path
+    // from turning a bounded command failure back into an unbounded FlutterDriver wait on a stuck app.
+    final png = await driver
+        .runUnsynchronized(() => driver.screenshot())
+        .timeout(_cmdTimeout);
     final path = keep ?? '${appDir.path}/screenshots/${_shotSeq++}-$name.png';
     await File(path).writeAsBytes(png);
     return path;
@@ -768,7 +767,8 @@ class AppSession {
 
   // ---- failure diagnostics ----
 
-  /// On a scenario failure, dump where it stopped to `build/sim-failures/<name>/`
+  /// On a scenario failure, dump where it stopped to the runner-provided artifacts dir
+  /// (`SIM_TEST_ARTIFACTS_DIR`) or `build/sim-failures/<name>/` when run directly.
   /// (a gitignored, persistent dir — survives tearDown): the whole-app screenshot,
   /// the error + stack + recent app logs, and (via [_captureExtra]) any per-session
   /// extras. Best-effort: a capture step failing must not mask the original error.
@@ -777,17 +777,28 @@ class AppSession {
     Object error,
     StackTrace stack,
   ) async {
-    final dir = Directory('build/sim-failures/$name');
+    final configuredDir = Platform.environment['SIM_TEST_ARTIFACTS_DIR'];
+    final runnerOwnedDir = configuredDir != null && configuredDir.isNotEmpty;
+    final dir = Directory(
+      runnerOwnedDir ? configuredDir : 'build/sim-failures/$name',
+    );
     try {
-      if (await dir.exists()) await dir.delete(recursive: true);
+      // The runner owns SIM_TEST_ARTIFACTS_DIR and may already have timeout
+      // artifacts there; direct runs still get a fresh directory per failure.
+      if (!runnerOwnedDir && await dir.exists())
+        await dir.delete(recursive: true);
       await dir.create(recursive: true);
       try {
         await screenshot('app', keep: '${dir.path}/app.png');
       } catch (_) {}
       await _captureExtra(dir);
-      await File('${dir.path}/error.txt').writeAsString(
-        '$error\n\n$stack\n\n--- recent app log ---\n${_appLog.join('\n')}\n',
-      );
+      final errorText =
+          '$error\n\n$stack\n\n--- recent app log ---\n${_appLog.join('\n')}\n';
+      final errorFile = File('${dir.path}/error.txt');
+      final path = runnerOwnedDir && await errorFile.exists()
+          ? '${dir.path}/scenario-error.txt'
+          : errorFile.path;
+      await File(path).writeAsString(errorText);
       stderr.writeln('sim-failure diagnostics: ${dir.absolute.path}');
     } catch (_) {
       // Diagnostics are best-effort; never mask the scenario's own error.
