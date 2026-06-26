@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:flutter/gestures.dart';
@@ -18,7 +19,12 @@ const double _narrowBreakpoint = 900;
 
 /// Force the narrow (slide-in) presentation regardless of width — lets the slide-in be driven on a
 /// wide desktop host (the narrow-tray e2e passes this), so it needs no emulator to test.
-const bool _kForceNarrow = bool.fromEnvironment('SIM_FORCE_NARROW');
+const bool _kCompileForceNarrow = bool.fromEnvironment('SIM_FORCE_NARROW');
+
+bool get _forceNarrow {
+  final value = Platform.environment['SIM_FORCE_NARROW'];
+  return value == null ? _kCompileForceNarrow : value == 'true';
+}
 
 /// Device dimensions of the virtual device framebuffer (sim-1). Pointer coords
 /// are scaled back to this range before being injected via [SimDevice.touch].
@@ -328,7 +334,7 @@ class _SimTrayShellState extends State<SimTrayShell>
   @override
   Widget build(BuildContext context) {
     final width = MediaQuery.sizeOf(context).width;
-    final narrow = _kForceNarrow || width < _narrowBreakpoint;
+    final narrow = _forceNarrow || width < _narrowBreakpoint;
 
     if (!narrow) {
       return Row(

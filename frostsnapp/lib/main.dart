@@ -65,13 +65,16 @@ Future<void> main() async {
     final appDirPath = appDir.path;
     if (kSim) {
       // Point the sim at a disposable app dir (clean DB per run, and the device
-      // channel's socket lives here too) via `--dart-define=SIM_APP_DIR=/tmp/...`;
-      // defaults to the app-support dir.
-      const simAppDir = String.fromEnvironment('SIM_APP_DIR');
-      const simDeviceCount = int.fromEnvironment(
+      // channel's socket lives here too) via SIM_APP_DIR; defaults to the app-support dir.
+      const compileSimAppDir = String.fromEnvironment('SIM_APP_DIR');
+      final simAppDir = Platform.environment['SIM_APP_DIR'] ?? compileSimAppDir;
+      const compileSimDeviceCount = int.fromEnvironment(
         'SIM_DEVICE_COUNT',
         defaultValue: 1,
       );
+      final simDeviceCount =
+          int.tryParse(Platform.environment['SIM_DEVICE_COUNT'] ?? '') ??
+          compileSimDeviceCount;
       final (coord_, appCtx_, pool_) = await api.loadSim(
         appDir: simAppDir.isEmpty ? appDirPath : simAppDir,
         seed: 1,
@@ -84,12 +87,18 @@ Future<void> main() async {
       // The harness seeds its local electrs URL here (regtest only); point the regtest wallet
       // at it via the existing setter so "receive bitcoin" syncs over the sim's own node. No
       // effect on other networks, and absent (offline sim) when the harness didn't start one.
-      const simRegtestElectrum = String.fromEnvironment(
+      const compileSimRegtestElectrum = String.fromEnvironment(
         'SIM_REGTEST_ELECTRUM_URL',
       );
-      const simRegtestControl = String.fromEnvironment(
+      final simRegtestElectrum =
+          Platform.environment['SIM_REGTEST_ELECTRUM_URL'] ??
+          compileSimRegtestElectrum;
+      const compileSimRegtestControl = String.fromEnvironment(
         'SIM_REGTEST_CONTROL_SOCKET',
       );
+      final simRegtestControl =
+          Platform.environment['SIM_REGTEST_CONTROL_SOCKET'] ??
+          compileSimRegtestControl;
       if (simRegtestElectrum.isNotEmpty) {
         simRegtestElectrumUrl = simRegtestElectrum;
         simRegtestControlSocket = simRegtestControl.isEmpty

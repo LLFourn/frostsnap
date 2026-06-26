@@ -514,8 +514,8 @@ Future<void> _runTests(List<String> args) async {
   // Default to running every test at once; the android pool degrades to however many emulators boot.
   final effJobs = (jobs ?? files.length).clamp(1, files.length);
   // Per-test hard deadline so a wedged test (frozen app / unbounded wait) can't stall the run — it's
-  // reaped and reported TIMEOUT instead. Generous by default: each test process includes its flutter
-  // BUILD (serialized by the build lock), so parallel workers can queue behind one build. `--test-timeout`.
+  // reaped and reported TIMEOUT instead. Generous by default: Android workers can queue behind a
+  // serialized `flutter run` build/install. Host workers direct-launch a prebuilt debug app.
   final deadline = Duration(seconds: testTimeout ?? 900);
   final results = <_TestResult>[];
   final started = DateTime.now();
@@ -523,12 +523,18 @@ Future<void> _runTests(List<String> args) async {
   if (android) {
     await _runAndroidPool(tests, effJobs, results, deadline, noCapture);
   } else {
+    // Build once before spawning workers, then each child direct-launches the same debug app binary
+    // with per-test runtime env. That keeps host `--jobs N` from serializing on `flutter run`.
+    final hostAppBinary = Platform.isMacOS
+        ? await AppSession.ensureMacosSimAppBuilt(logSink: stderr)
+        : null;
     // Host: each test is a self-contained `dart run` (owns its PRIVATE per-session regtest chain), so
     // up to `effJobs` run concurrently with no shared state. Concurrent output is captured + printed
     // grouped on completion (interleaved live streams would be unreadable); a single test streams live.
     await _runBounded(tests, effJobs, (test) async {
       final r = await _runOneTest(
         test,
+        hostAppBinary: hostAppBinary,
         capture: !noCapture,
         deadline: deadline,
       );
@@ -633,6 +639,7 @@ Future<_TestResult> _runOneTest(
   _TestSpec test, {
   String? serial,
   String? sdk,
+  String? hostAppBinary,
   required bool capture,
   required Duration deadline,
 }) async {
@@ -646,6 +653,7 @@ Future<_TestResult> _runOneTest(
       'SIM_TEST_NAME': test.name,
       'SIM_TEST_ARTIFACTS_DIR': test.artifactsDir.absolute.path,
       if (serial != null) 'SIM_FLUTTER_DEVICE': serial,
+      if (hostAppBinary != null) 'SIM_HOST_APP_BINARY': hostAppBinary,
     },
   );
   final buf = StringBuffer();

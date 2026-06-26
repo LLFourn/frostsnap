@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
@@ -162,7 +163,7 @@ Future<String> _driveDevice(List<String> parts) async {
 /// Enables the `flutter_driver` extension so the out-of-process harness can drive the
 /// app's widget tree by semantic label over the VM service, then runs the normal app.
 /// Lives in `test_driver/` so `flutter_driver` stays a dev-dependency and never enters
-/// production `lib/main.dart`. SIM mode + a clean app dir come from the run flags:
+/// production `lib/main.dart`. SIM mode + a clean app dir come from launch configuration:
 ///
 ///   flutter run -t test_driver/sim_app.dart --dart-define=SIM=true \
 ///     --dart-define=SIM_APP_DIR=/tmp/...
@@ -172,10 +173,14 @@ Future<void> main() {
   // keyboard is blocked; when the USER owns it, the real keyboard works and
   // `driver.enterText` does not. The two are mutually exclusive (no hybrid). Defaults to
   // the agent (the automated test path); `simctl serve` hands the keyboard to a human.
-  const agentOwnsKeyboard = bool.fromEnvironment(
+  const compileAgentOwnsKeyboard = bool.fromEnvironment(
     'SIM_AGENT_OWNS_KEYBOARD',
     defaultValue: true,
   );
+  final envAgentOwnsKeyboard = Platform.environment['SIM_AGENT_OWNS_KEYBOARD'];
+  final agentOwnsKeyboard = envAgentOwnsKeyboard == null
+      ? compileAgentOwnsKeyboard
+      : envAgentOwnsKeyboard == 'true';
   enableFlutterDriverExtension(
     handler: _driverData,
     enableTextEntryEmulation: agentOwnsKeyboard,

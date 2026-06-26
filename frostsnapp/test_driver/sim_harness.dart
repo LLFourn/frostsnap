@@ -46,7 +46,7 @@ Directory simTmpRoot() {
 class _ScenarioRegtest {
   final RegtestSession session;
 
-  /// The dart-defines that point the app's regtest wallet + tray faucet at THIS session.
+  /// The launch config that points the app's regtest wallet + tray faucet at THIS session.
   final Map<String, String> defines;
 
   /// On Android, tears down the emulator bridge (close the faucet proxy + remove the adb reverses).
@@ -93,9 +93,9 @@ class AppSession {
   }
 
   /// Resolves when the launched app process exits — e.g. its window was closed, which (with
-  /// `applicationShouldTerminateAfterLastWindowClosed`) terminates the app and exits `flutter run`.
-  /// `simctl serve` watches this so the daemon never outlives a dead app (a zombie daemon would
-  /// answer `up` with already:true against nothing).
+  /// `applicationShouldTerminateAfterLastWindowClosed`) terminates the launched app process.
+  /// `simctl serve` watches this so the daemon never outlives a dead app (a zombie daemon would answer
+  /// `up` with already:true against nothing).
   Future<int> get appExitCode => _appProcess.exitCode;
 
   /// Launch the instrumented sim app and return a session that drives the app + devices over the app
@@ -131,9 +131,137 @@ class AppSession {
     return AppSession(proc, dir, drv, log);
   }
 
-  /// Start `flutter run` for the sim target, connect FlutterDriver, enable semantics, and return the
-  /// pieces both session shapes need. On any setup failure tears down whatever got created and
-  /// rethrows (so a timed-out connect can't leak the flutter process + the app dir).
+  static const _macosSimAppBinary =
+      'build/macos/Build/Products/Debug/Frostsnap.app/Contents/MacOS/Frostsnap';
+
+  /// Build the macOS debug sim app once. Parallel workers direct-launch this binary so they don't
+  /// serialize on `flutter run`'s shared build directory.
+  static Future<String> ensureMacosSimAppBuilt({
+    IOSink? logSink,
+  }) => _withFlutterBuildLock(() async {
+    final proc = await Process.start('flutter', [
+      'build',
+      'macos',
+      '--debug',
+      '-t',
+      'test_driver/sim_app.dart',
+      '--dart-define=SIM=true',
+    ]);
+    final output = StringBuffer();
+    void capture(String prefix, String line) {
+      final tagged = '[$prefix] $line';
+      output.writeln(tagged);
+      logSink?.writeln(tagged);
+    }
+
+    final drains = [
+      proc.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .forEach((line) => capture('build', line)),
+      proc.stderr
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .forEach((line) => capture('build:err', line)),
+    ];
+    final code = await proc.exitCode;
+    await Future.wait(drains);
+    if (code != 0) {
+      throw StateError('flutter build macos failed with exit $code\n$output');
+    }
+    final binary = File(_macosSimAppBinary);
+    if (!await binary.exists()) {
+      throw StateError(
+        'flutter build macos succeeded but $_macosSimAppBinary does not exist',
+      );
+    }
+    return binary.absolute.path;
+  });
+
+  static Future<T> _withFlutterBuildLock<T>(Future<T> Function() body) async {
+    // Serialize Flutter's writes to build/ across concurrent launches. The OS drops the lock if a
+    // worker dies, so it can't deadlock.
+    final buildLock = await File(
+      '${simTmpRoot().path}/flutter-build.lock',
+    ).open(mode: FileMode.write);
+    await buildLock.lock(FileLock.blockingExclusive);
+    try {
+      return await body();
+    } finally {
+      try {
+        await buildLock.unlock();
+      } catch (_) {}
+      try {
+        await buildLock.close();
+      } catch (_) {}
+    }
+  }
+
+  static Map<String, String> _simLaunchEnvironment({
+    required Directory appDir,
+    required int deviceCount,
+    required bool agentOwnsKeyboard,
+    required bool shareHostAppDir,
+    required String? regtestElectrumUrl,
+    required Map<String, String> extraDartDefines,
+  }) => {
+    'FROSTSNAP_SIM_NO_ACTIVATE': '1',
+    if (shareHostAppDir) 'SIM_APP_DIR': appDir.path,
+    'SIM_DEVICE_COUNT': '$deviceCount',
+    'SIM_AGENT_OWNS_KEYBOARD': '$agentOwnsKeyboard',
+    if (regtestElectrumUrl != null)
+      'SIM_REGTEST_ELECTRUM_URL': regtestElectrumUrl,
+    if (regtestElectrumUrl != null)
+      'SIM_REGTEST_CONTROL_SOCKET': regtestControlSocket,
+    ...extraDartDefines,
+  };
+
+  static Map<String, String> _macosVmServiceEnvironment() {
+    final switches = <String>[
+      'enable-dart-profiling=true',
+      'vm-service-port=0',
+      'enable-checked-mode=true',
+      'verify-entry-points=true',
+    ];
+    return {
+      for (var i = 0; i < switches.length; i++)
+        'FLUTTER_ENGINE_SWITCH_${i + 1}': switches[i],
+      'FLUTTER_ENGINE_SWITCHES': '${switches.length}',
+    };
+  }
+
+  static List<String> _flutterRunArgs({
+    required String flutterDevice,
+    required String? flavor,
+    required Directory appDir,
+    required int deviceCount,
+    required bool agentOwnsKeyboard,
+    required bool shareHostAppDir,
+    required String? regtestElectrumUrl,
+    required Map<String, String> extraDartDefines,
+  }) => [
+    'run',
+    '-t',
+    'test_driver/sim_app.dart',
+    '-d',
+    flutterDevice,
+    if (flavor != null) ...['--flavor', flavor],
+    '--dart-define=SIM=true',
+    // Omitted on Android — a host path is meaningless in the sandbox.
+    if (shareHostAppDir) '--dart-define=SIM_APP_DIR=${appDir.path}',
+    '--dart-define=SIM_DEVICE_COUNT=$deviceCount',
+    '--dart-define=SIM_AGENT_OWNS_KEYBOARD=$agentOwnsKeyboard',
+    if (regtestElectrumUrl != null)
+      '--dart-define=SIM_REGTEST_ELECTRUM_URL=$regtestElectrumUrl',
+    if (regtestElectrumUrl != null)
+      '--dart-define=SIM_REGTEST_CONTROL_SOCKET=$regtestControlSocket',
+    for (final e in extraDartDefines.entries)
+      '--dart-define=${e.key}=${e.value}',
+  ];
+
+  /// Start the sim target, connect FlutterDriver, enable semantics, and return the pieces both
+  /// session shapes need. On macOS host runs this direct-launches the prebuilt debug app; Android
+  /// stays on `flutter run` for install + adb-forwarded VM service.
   static Future<(Process, Directory, FlutterDriver, List<String>)> _launchApp({
     required int deviceCount,
     required String flutterDevice,
@@ -172,87 +300,89 @@ class AppSession {
     // Track partial resources so a failure anywhere in setup tears them all down.
     Process? proc;
     FlutterDriver? driver;
-    // Serialize the flutter BUILD across concurrent launches (parallel `./simctl test`): two
-    // `flutter run` for the SAME app write the shared `build/` dir at once and corrupt the packaged
-    // native lib (`dlopen` "invalid shdr offset/size"). A cross-process advisory file lock (flock),
-    // held ONLY through build+launch (released once the VM service is up) — the slow test EXECUTION
-    // then overlaps freely on each session's own emulator. The OS drops the lock if a worker dies, so
-    // it can't deadlock; uncontended (a single launch) it's instant.
-    final buildLock = await File(
-      '${simTmpRoot().path}/flutter-build.lock',
-    ).open(mode: FileMode.write);
-    await buildLock.lock(FileLock.blockingExclusive); // WAITS until acquired
-    var buildLockHeld = true;
-    Future<void> releaseBuildLock() async {
-      if (!buildLockHeld) return;
-      buildLockHeld = false;
-      try {
-        await buildLock.unlock();
-      } catch (_) {}
-      try {
-        await buildLock.close();
-      } catch (_) {}
-    }
 
     try {
       await Directory('${appDir.path}/screenshots').create();
 
-      proc = await Process.start(
-        'flutter',
-        [
-          'run',
-          '-t',
-          'test_driver/sim_app.dart',
-          '-d',
-          flutterDevice,
-          if (flavor != null) ...['--flavor', flavor],
-          '--dart-define=SIM=true',
-          // Omitted on Android — a host path is meaningless in the sandbox (the app uses its own
-          // app-support dir). On desktop it puts the device sockets where SimHarness connects them.
-          if (shareHostAppDir) '--dart-define=SIM_APP_DIR=${appDir.path}',
-          '--dart-define=SIM_DEVICE_COUNT=$deviceCount',
-          '--dart-define=SIM_AGENT_OWNS_KEYBOARD=$agentOwnsKeyboard',
-          // main.dart points the regtest wallet at this electrs (regtest-only); empty = offline.
-          if (regtestElectrumUrl != null)
-            '--dart-define=SIM_REGTEST_ELECTRUM_URL=$regtestElectrumUrl',
-          // ...and gives the tray's "Test BTC" column the faucet control socket to drive.
-          if (regtestElectrumUrl != null)
-            '--dart-define=SIM_REGTEST_CONTROL_SOCKET=$regtestControlSocket',
-          for (final e in extraDartDefines.entries)
-            '--dart-define=${e.key}=${e.value}',
-          // Tell the macOS app (AppDelegate) to launch as an accessory so it doesn't steal focus —
-          // it's driven over the VM service, not looked at. Sim-only: only this harness sets it.
-        ],
-        environment: {'FROSTSNAP_SIM_NO_ACTIVATE': '1'},
+      final launchEnvironment = _simLaunchEnvironment(
+        appDir: appDir,
+        deviceCount: deviceCount,
+        agentOwnsKeyboard: agentOwnsKeyboard,
+        shareHostAppDir: shareHostAppDir,
+        regtestElectrumUrl: regtestElectrumUrl,
+        extraDartDefines: extraDartDefines,
       );
 
-      // Capture the VM service URL from the run output (surface logs on stderr). flutter forwards
-      // the emulator's VM service to 127.0.0.1 too, so this regex matches on Android as well.
+      // Capture the VM service URL from the app/tool output (surface logs on stderr). `flutter run`
+      // forwards an emulator's VM service to 127.0.0.1 too, so this regex matches on Android as well.
       final vmUrl = Completer<String>();
       final urlRe = RegExp(r'(http://127\.0\.0\.1:\d+/[^\s]+)');
-      proc.stdout
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())
-          .listen((line) {
+      void wireProcessLogs(Process p) {
+        p.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen(
+          (line) {
             stderr.writeln('[app] $line');
             log('[app] $line');
-            if (!vmUrl.isCompleted && line.contains('Dart VM Service')) {
+            if (!vmUrl.isCompleted &&
+                line.toLowerCase().contains('dart vm service')) {
               final m = urlRe.firstMatch(line);
               if (m != null) vmUrl.complete(m.group(1));
             }
-          });
-      proc.stderr
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())
-          .listen((line) {
+          },
+        );
+        p.stderr.transform(utf8.decoder).transform(const LineSplitter()).listen(
+          (line) {
             stderr.writeln('[app:err] $line');
             log('[app:err] $line');
-          });
+          },
+        );
+        p.exitCode.then((code) {
+          if (!vmUrl.isCompleted) {
+            vmUrl.completeError(
+              StateError('sim app exited before VM service URL (exit $code)'),
+            );
+          }
+        });
+      }
 
-      final url = await vmUrl.future.timeout(const Duration(minutes: 5));
-      // Build + install + launch are done (the app's VM service is up) — release the build lock so
-      // the next concurrent launch can build while this one's test executes.
-      await releaseBuildLock();
+      late final String url;
+      final directMacosLaunch =
+          shareHostAppDir && flutterDevice == 'macos' && Platform.isMacOS;
+      if (directMacosLaunch) {
+        final configuredBinary = Platform.environment['SIM_HOST_APP_BINARY'];
+        final binary = configuredBinary != null && configuredBinary.isNotEmpty
+            ? configuredBinary
+            : await ensureMacosSimAppBuilt(logSink: logSink);
+        if (!await File(binary).exists()) {
+          throw StateError('SIM_HOST_APP_BINARY does not exist: $binary');
+        }
+        proc = await Process.start(
+          binary,
+          const <String>[],
+          environment: {...launchEnvironment, ..._macosVmServiceEnvironment()},
+        );
+        wireProcessLogs(proc);
+        log('[harness] launched macOS sim app binary: $binary');
+        url = await vmUrl.future.timeout(const Duration(minutes: 5));
+      } else {
+        url = await _withFlutterBuildLock(() async {
+          proc = await Process.start(
+            'flutter',
+            _flutterRunArgs(
+              flutterDevice: flutterDevice,
+              flavor: flavor,
+              appDir: appDir,
+              deviceCount: deviceCount,
+              agentOwnsKeyboard: agentOwnsKeyboard,
+              shareHostAppDir: shareHostAppDir,
+              regtestElectrumUrl: regtestElectrumUrl,
+              extraDartDefines: extraDartDefines,
+            ),
+            environment: launchEnvironment,
+          );
+          wireProcessLogs(proc!);
+          return vmUrl.future.timeout(const Duration(minutes: 5));
+        });
+      }
       driver = await FlutterDriver.connect(dartVmServiceUrl: url);
       // Build the semantics tree so find.bySemanticsLabel resolves (it isn't generated without an
       // a11y client otherwise). On Android setSemantics throws until runApp has attached the root
@@ -272,10 +402,13 @@ class AppSession {
         log('[harness] setSemantics never took — find-by-label will not work');
       }
 
-      return (proc, appDir, driver, appLog);
+      final launchedProc = proc;
+      if (launchedProc == null) {
+        throw StateError('sim launch reached success without an app process');
+      }
+      return (launchedProc, appDir, driver, appLog);
     } catch (_) {
       // Tear down whatever got created, then rethrow the original setup error.
-      await releaseBuildLock();
       await _cleanup(driver: driver, proc: proc, appDir: appDir);
       rethrow;
     }
@@ -322,7 +455,7 @@ class AppSession {
     return firstError;
   }
 
-  /// Start an ISOLATED regtest backend for ONE scenario (its own chain) + the dart-defines that point
+  /// Start an ISOLATED regtest backend for ONE scenario (its own chain) + the launch config that points
   /// the app at it. On a host target the app reaches the session's unix control socket + electrum TCP
   /// directly; on an Android emulator [device] those host endpoints are unreachable, so bridge them to
   /// THAT emulator (adb-reverse electrs + a unix→TCP faucet proxy) and point the app at the bridge —
