@@ -204,17 +204,22 @@ class AppSession {
     required bool shareHostAppDir,
     required String? regtestElectrumUrl,
     required Map<String, String> extraDartDefines,
-  }) => {
-    'FROSTSNAP_SIM_NO_ACTIVATE': '1',
-    if (shareHostAppDir) 'SIM_APP_DIR': appDir.path,
-    'SIM_DEVICE_COUNT': '$deviceCount',
-    'SIM_AGENT_OWNS_KEYBOARD': '$agentOwnsKeyboard',
-    if (regtestElectrumUrl != null)
-      'SIM_REGTEST_ELECTRUM_URL': regtestElectrumUrl,
-    if (regtestElectrumUrl != null)
-      'SIM_REGTEST_CONTROL_SOCKET': regtestControlSocket,
-    ...extraDartDefines,
-  };
+  }) {
+    final windowSlot = Platform.environment['FROSTSNAP_SIM_WINDOW_SLOT'];
+    return {
+      'FROSTSNAP_SIM_NO_ACTIVATE': '1',
+      if (windowSlot != null && windowSlot.isNotEmpty)
+        'FROSTSNAP_SIM_WINDOW_SLOT': windowSlot,
+      if (shareHostAppDir) 'SIM_APP_DIR': appDir.path,
+      'SIM_DEVICE_COUNT': '$deviceCount',
+      'SIM_AGENT_OWNS_KEYBOARD': '$agentOwnsKeyboard',
+      if (regtestElectrumUrl != null)
+        'SIM_REGTEST_ELECTRUM_URL': regtestElectrumUrl,
+      if (regtestElectrumUrl != null)
+        'SIM_REGTEST_CONTROL_SOCKET': regtestControlSocket,
+      ...extraDartDefines,
+    };
+  }
 
   static Map<String, String> _macosVmServiceEnvironment() {
     final switches = <String>[

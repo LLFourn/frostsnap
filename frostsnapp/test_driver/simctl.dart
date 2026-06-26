@@ -531,10 +531,11 @@ Future<void> _runTests(List<String> args) async {
     // Host: each test is a self-contained `dart run` (owns its PRIVATE per-session regtest chain), so
     // up to `effJobs` run concurrently with no shared state. Concurrent output is captured + printed
     // grouped on completion (interleaved live streams would be unreadable); a single test streams live.
-    await _runBounded(tests, effJobs, (test) async {
+    await _runBounded(tests, effJobs, (test, workerSlot) async {
       final r = await _runOneTest(
         test,
         hostAppBinary: hostAppBinary,
+        windowSlot: workerSlot,
         capture: !noCapture,
         deadline: deadline,
       );
@@ -640,6 +641,7 @@ Future<_TestResult> _runOneTest(
   String? serial,
   String? sdk,
   String? hostAppBinary,
+  int? windowSlot,
   required bool capture,
   required Duration deadline,
 }) async {
@@ -654,6 +656,7 @@ Future<_TestResult> _runOneTest(
       'SIM_TEST_ARTIFACTS_DIR': test.artifactsDir.absolute.path,
       if (serial != null) 'SIM_FLUTTER_DEVICE': serial,
       if (hostAppBinary != null) 'SIM_HOST_APP_BINARY': hostAppBinary,
+      if (windowSlot != null) 'FROSTSNAP_SIM_WINDOW_SLOT': '$windowSlot',
     },
   );
   final buf = StringBuffer();
@@ -924,14 +927,14 @@ Future<List<int>> _processTree(int rootPid) async {
 Future<void> _runBounded(
   List<_TestSpec> items,
   int jobs,
-  Future<void> Function(_TestSpec) task,
+  Future<void> Function(_TestSpec, int workerSlot) task,
 ) async {
   final queue = [...items];
   final workers = (jobs < 1 ? 1 : jobs).clamp(1, items.length);
   await Future.wait(
-    List.generate(workers, (_) async {
+    List.generate(workers, (workerSlot) async {
       while (queue.isNotEmpty) {
-        await task(queue.removeAt(0));
+        await task(queue.removeAt(0), workerSlot);
       }
     }),
   );
