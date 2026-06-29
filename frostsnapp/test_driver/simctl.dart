@@ -55,10 +55,12 @@ simctl — drive the running sim app/devices through SimHarness.
                                               --nocapture/-v streams it live; --junit writes XML
   simctl regtest up|down|status               manage the shared regtest bitcoind+electrs+faucet
   simctl regtest fund <addr> <sats> | mine [n] | balance | height | address | url   drive the faucet
-  simctl pool status|acquire [--cap N]|release <slot>|reset
+  simctl pool status|acquire [--cap N]|release <slot>|reconcile|reset
                                               inspect/manage the test emulator pool (dedicated
                                               per-test emulators, name-isolated from the interactive
-                                              one); the parallel test runner allocates from it
+                                              one); the parallel test runner allocates from it.
+                                              `reconcile` drops leaked (dead-claimant) slots; the
+                                              runner self-heals on acquire, so this is rarely needed
   simctl clean                                remove sim temp artifacts + reap any backend
                                               (no daemon running)
   simctl tap <label> [--regex]                tap a control by semantic label
@@ -568,6 +570,16 @@ Future<void> _runAndroidPool(
   final adb = '$sdk/platform-tools/adb';
   final queue = [...tests];
   final workers = jobs.clamp(1, tests.length);
+
+  // Self-heal a pool poisoned by a previously crashed/killed run before any worker acquires, so a
+  // leaked claim never counts against the cap and shows up as "exhausted". (Acquire reconciles too;
+  // this just sweeps it once up front and reports it.)
+  final swept = _reconcilePool(sdk);
+  if (swept.isNotEmpty) {
+    stderr.writeln(
+      'simctl: reconciled ${swept.length} stale pool slot(s) $swept',
+    );
+  }
 
   // NB: concurrent `flutter run` builds write the shared build/ dir and would corrupt the packaged
   // native lib — they're serialized by a cross-process build lock in the harness's `_launchApp`
@@ -1178,20 +1190,120 @@ String _poolSerial(int slot) => 'emulator-${_poolPort(slot)}';
 Directory _poolDir() =>
     Directory('${simTmpRoot().path}/pool')..createSync(recursive: true);
 
-/// Atomically claim the lowest free pool slot in `[0, cap)`, or null if all are busy. The claim is an
-/// O_EXCL lockfile create (`exclusive: true`), so two concurrent runners can never grab the same slot
-/// (the exact collision this pool prevents).
-int? _claimSlot(int cap) {
-  for (var slot = 0; slot < cap; slot++) {
+/// The OS start-time of process [p] (`ps -o lstart`), or null if it is gone. Constant for a given
+/// process, so a RECYCLED pid — a new process that happens to reuse the number — reports a different
+/// start-time. Recorded with the claim and re-checked, this distinguishes the original claimant from
+/// an unrelated process that later inherited its pid.
+String? _pidStarted(int p) {
+  try {
+    final r = Process.runSync('ps', ['-p', '$p', '-o', 'lstart=']);
+    final s = (r.stdout as String).trim();
+    return r.exitCode == 0 && s.isNotEmpty ? s : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// What a slot lock records: the claiming runner's PID, that PID's start-time (to catch pid reuse),
+/// the slot's serial (legibility / `pool status`), and when. JSON so the registry stays legible.
+String _slotClaimRecord(int slot) => jsonEncode({
+  'pid': pid,
+  'started': _pidStarted(pid),
+  'serial': _poolSerial(slot),
+  'ts': DateTime.now().millisecondsSinceEpoch,
+});
+
+/// True if slot [slot]'s lock is STALE — its claimant is gone, OR its pid was recycled by a different
+/// process (recorded start-time no longer matches) — so the lock leaked and the slot is safe to
+/// reclaim. A claimant mid-cold-boot is a live pid whose start-time still matches, so a booting slot is
+/// never reclaimed (this is why liveness is pid identity, not `adb devices`, which a booting emulator
+/// has not joined yet). A lock with no readable pid (empty / pre-format / corrupt) is reclaimed only
+/// once it has aged past the brief create→write window, so a lock being written right now is not stolen.
+bool _slotStale(int slot) {
+  final lock = File('${_poolDir().path}/slot-$slot.lock');
+  Map? rec;
+  try {
+    rec = jsonDecode(lock.readAsStringSync()) as Map;
+  } catch (_) {
+    rec = null;
+  }
+  final claimant = rec?['pid'] as int?;
+  if (claimant != null) {
+    final current = _pidStarted(claimant);
+    if (current == null) return true; // claimant gone
+    final recorded = rec!['started'] as String?;
+    // If the start-time wasn't captured at claim time, trust the live pid. Otherwise the claimant is
+    // live only if it's the SAME process that claimed (start-time matches) — a recycled pid reports a
+    // different start-time and reads as stale.
+    return recorded != null && current != recorded;
+  }
+  try {
+    return DateTime.now().difference(lock.lastModifiedSync()) >
+        const Duration(seconds: 30);
+  } catch (_) {
+    return false; // vanished under us — nothing to reclaim
+  }
+}
+
+/// Reclaim every leaked (stale) slot: kill any orphaned emulator and free the lock. MUST run holding
+/// the pool mutex. Returns the slots it reclaimed. This is what makes a stale claim from a crashed or
+/// killed run self-heal instead of wedging the pool until a manual `pool reset`.
+List<int> _reconcileStaleSlots(String sdk) {
+  final reclaimed = <int>[];
+  for (final slot in _claimedSlots()) {
+    if (_slotStale(slot)) {
+      stderr.writeln(
+        'simctl: reclaiming stale pool slot $slot (dead claimant)',
+      );
+      _releaseEmulator(
+        sdk,
+        slot,
+      ); // adb emu kill (no-op if already gone) + delete the lock
+      reclaimed.add(slot);
+    }
+  }
+  return reclaimed;
+}
+
+/// Run [body] holding an exclusive lock on the pool mutex, so reconcile+claim is atomic across
+/// concurrent runners (no two can reclaim or claim the same slot at once). The advisory lock is an
+/// OS file lock — released automatically if a runner dies — so the mutex itself can never leak the
+/// way the slot lockfiles can.
+T _withPoolLock<T>(T Function() body) {
+  final raf = File(
+    '${_poolDir().path}/pool.mutex',
+  ).openSync(mode: FileMode.write);
+  try {
+    raf.lockSync(FileLock.exclusive);
+    return body();
+  } finally {
     try {
-      File('${_poolDir().path}/slot-$slot.lock').createSync(exclusive: true);
+      raf.unlockSync();
+    } catch (_) {}
+    raf.closeSync();
+  }
+}
+
+/// Atomically claim the lowest free pool slot in `[0, cap)`, or null if all are GENUINELY busy.
+/// Reconciles leaked (dead-claimant) slots first, so a stale lock self-heals on the next acquire
+/// rather than reporting the pool exhausted; the whole reconcile+claim runs under the pool mutex.
+int? _claimSlot(String sdk, int cap) => _withPoolLock<int?>(() {
+  _reconcileStaleSlots(sdk);
+  for (var slot = 0; slot < cap; slot++) {
+    final lock = File('${_poolDir().path}/slot-$slot.lock');
+    if (!lock.existsSync()) {
+      lock.writeAsStringSync(_slotClaimRecord(slot));
       return slot;
-    } on FileSystemException {
-      continue; // already claimed
     }
   }
   return null;
-}
+});
+
+/// Reconcile leaked slots outside of an acquire — the `pool reconcile` command and the test runner's
+/// startup sweep. Same self-heal as [_claimSlot] does inline, run for its side effect under the pool
+/// mutex. Returns the slots it reclaimed.
+List<int> _reconcilePool(String sdk) =>
+    _withPoolLock(() => _reconcileStaleSlots(sdk));
 
 void _releaseSlot(int slot) {
   try {
@@ -1213,7 +1325,7 @@ Future<({int slot, String serial})> _acquireEmulator(
   String sdk, {
   required int cap,
 }) async {
-  final slot = _claimSlot(cap);
+  final slot = _claimSlot(sdk, cap);
   if (slot == null) throw StateError('emulator pool exhausted (cap $cap)');
   final serial = _poolSerial(slot);
   try {
@@ -1282,7 +1394,7 @@ Future<void> _pool(List<String> args) async {
           'ok': true,
           'claimed': [
             for (final s in _claimedSlots())
-              {'slot': s, 'serial': _poolSerial(s)},
+              {'slot': s, 'serial': _poolSerial(s), 'stale': _slotStale(s)},
           ],
         }),
       );
@@ -1299,6 +1411,12 @@ Future<void> _pool(List<String> args) async {
       final slot = int.parse(args[1]);
       _releaseEmulator(sdk, slot);
       stdout.writeln(jsonEncode({'ok': true, 'released': slot}));
+    case 'reconcile':
+      // Drop leaked (dead-claimant) slots without disturbing live ones — recovery without the
+      // sledgehammer `reset`, which kills EVERY emulator including ones an active run is using.
+      stdout.writeln(
+        jsonEncode({'ok': true, 'reconciled': _reconcilePool(sdk)}),
+      );
     case 'reset':
       for (final slot in _claimedSlots()) {
         _releaseEmulator(sdk, slot);
@@ -1306,7 +1424,7 @@ Future<void> _pool(List<String> args) async {
       stdout.writeln(jsonEncode({'ok': true, 'reset': true}));
     default:
       stderr.writeln(
-        'simctl pool <status | acquire [--cap N] | release <slot> | reset>',
+        'simctl pool <status | acquire [--cap N] | release <slot> | reconcile | reset>',
       );
       exit(2);
   }
