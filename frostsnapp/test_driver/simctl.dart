@@ -315,6 +315,9 @@ class _TestResult {
   final Duration duration;
   final String? reason;
 
+  /// Transient-flake retries taken before this (final) result; 0 = passed/failed first try.
+  int retries = 0;
+
   _TestResult({
     required this.test,
     required this.status,
@@ -391,10 +394,12 @@ void _printSummary(List<_TestResult> results, Duration elapsed) {
   final failed = results.where((r) => r.failed).length;
   final timedOut = results.where((r) => r.timedOut).length;
   final skipped = results.where((r) => r.skipped).length;
+  final retried = results.where((r) => r.retries > 0).length;
   stdout.writeln();
   stdout.writeln(
     'test result: $passed passed; $failed failed; $timedOut timed out; '
-    '$skipped skipped; finished in ${_elapsed(elapsed)}',
+    '$skipped skipped; finished in ${_elapsed(elapsed)}'
+    '${retried > 0 ? ' ($retried retried a transient flake)' : ''}',
   );
 }
 
@@ -408,16 +413,18 @@ Future<void> _writeJunit(
   final failed = results.where((r) => r.failed).length;
   final timedOut = results.where((r) => r.timedOut).length;
   final skipped = results.where((r) => r.skipped).length;
+  final retries = results.fold<int>(0, (sum, r) => sum + r.retries);
   final b = StringBuffer()
     ..writeln('<?xml version="1.0" encoding="UTF-8"?>')
     ..writeln(
       '<testsuite name="simctl" tests="${results.length}" failures="$failed" '
-      'errors="$timedOut" skipped="$skipped" time="${_junitTime(elapsed)}">',
+      'errors="$timedOut" skipped="$skipped" retries="$retries" '
+      'time="${_junitTime(elapsed)}">',
     );
   for (final r in results) {
     b.writeln(
       '  <testcase classname="simctl" name="${_xmlEscape(r.test.name)}" '
-      'time="${_junitTime(r.duration)}">',
+      'retries="${r.retries}" time="${_junitTime(r.duration)}">',
     );
     if (r.skipped) {
       b.writeln('    <skipped/>');
@@ -534,14 +541,19 @@ Future<void> _runTests(List<String> args) async {
     // up to `effJobs` run concurrently with no shared state. Concurrent output is captured + printed
     // grouped on completion (interleaved live streams would be unreadable); a single test streams live.
     await _runBounded(tests, effJobs, (test, workerSlot) async {
-      final r = await _runOneTest(
-        test,
-        hostAppBinary: hostAppBinary,
-        windowSlot: workerSlot,
-        capture: !noCapture,
-        deadline: deadline,
+      final (r, retries) = await runWithRetry<_TestResult>(
+        (_) => _runOneTest(
+          test,
+          hostAppBinary: hostAppBinary,
+          windowSlot: workerSlot,
+          capture: !noCapture,
+          deadline: deadline,
+        ),
+        (res) => res.failed && isTransientFlake(res.output),
       );
+      r.retries = retries;
       _printResult(r);
+      _reportRetries(r, retries);
       results.add(r);
     });
   }
@@ -589,22 +601,26 @@ Future<void> _runAndroidPool(
   var acquiredAny = false;
 
   Future<void> runOne(String serial, _TestSpec test) async {
-    await Process.run(adb, [
-      '-s',
-      serial,
-      'shell',
-      'pm',
-      'clear',
-      'com.frostsnap',
-    ]);
-    final r = await _runOneTest(
-      test,
-      serial: serial,
-      sdk: sdk,
-      capture: !noCapture,
-      deadline: deadline,
-    );
+    final (r, retries) = await runWithRetry<_TestResult>((_) async {
+      await Process.run(adb, [
+        '-s',
+        serial,
+        'shell',
+        'pm',
+        'clear',
+        'com.frostsnap',
+      ]);
+      return _runOneTest(
+        test,
+        serial: serial,
+        sdk: sdk,
+        capture: !noCapture,
+        deadline: deadline,
+      );
+    }, (res) => res.failed && isTransientFlake(res.output));
+    r.retries = retries;
     _printResult(r);
+    _reportRetries(r, retries);
     results.add(r);
   }
 
@@ -642,6 +658,60 @@ Future<void> _runAndroidPool(
       results.add(r);
     }
   }
+}
+
+/// One try plus up to two retries — enough to ride out a transient startup flake without masking a
+/// chronically broken test.
+const _maxTestAttempts = 3;
+
+/// Signatures of a GENUINE scenario failure — present iff the test ran and asserted/threw on its own.
+/// Such a failure must NOT be retried even when a connection-drop line is ALSO in the output (e.g. the
+/// app shutting down after the failure prints "Lost connection to device"). NB: an uncaught
+/// `StateError('x')` prints as `Bad state: x`, NOT "StateError" — matching the literal type name would
+/// miss every real scenario assertion.
+const _realFailureSignatures = [
+  'Bad state:', // StateError — the scenarios' and tapUntil's assertions
+  'Expected:', // package:test / matcher expect()
+  'TestFailure', // package:test
+  'Failed assertion', // dart assert()
+];
+
+/// True if [output] shows a TRANSIENT startup connection flake — the emulator dropping the VM service
+/// while the app janks at launch — rather than a real failure. The driver's first command after the
+/// drop fails with a SetFrameSync remote error / "Lost connection to device". A failure that ALSO
+/// carries a real-assertion signature is never transient, so a genuine failure whose app then dropped
+/// the connection is not retried.
+bool isTransientFlake(String output) {
+  final connectionDropped =
+      output.contains('Failed to fulfill SetFrameSync') ||
+      output.contains('Lost connection to device');
+  if (!connectionDropped) return false;
+  return !_realFailureSignatures.any(output.contains);
+}
+
+/// Run [attempt] (each call is one fresh attempt, given its 1-based number) and retry while
+/// [shouldRetry] holds the result, up to [maxAttempts] total. Returns the final result and the number
+/// of RETRIES taken (0 on a first-try result). Pure control flow — unit-tested with a fake [attempt].
+Future<(T, int)> runWithRetry<T>(
+  Future<T> Function(int attempt) attempt,
+  bool Function(T) shouldRetry, {
+  int maxAttempts = _maxTestAttempts,
+}) async {
+  for (var n = 1; ; n++) {
+    final r = await attempt(n);
+    if (n >= maxAttempts || !shouldRetry(r)) return (r, n - 1);
+  }
+}
+
+/// Surface retries on stderr so a flaky test is visible, never silently papered over.
+void _reportRetries(_TestResult r, int retries) {
+  if (retries == 0) return;
+  final s = retries == 1 ? 'retry' : 'retries';
+  stderr.writeln(
+    r.passed
+        ? 'simctl: ${r.test.name} recovered after $retries transient-flake $s'
+        : 'simctl: ${r.test.name} FAILED after ${retries + 1} attempts (transient startup flake persisted)',
+  );
 }
 
 /// Run `dart run test_driver/<file>` to completion or [deadline], whichever comes first. On the
