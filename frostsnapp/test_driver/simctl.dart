@@ -593,10 +593,12 @@ Future<void> _runAndroidPool(
     );
   }
 
-  // NB: concurrent `flutter run` builds write the shared build/ dir and would corrupt the packaged
-  // native lib — they're serialized by a cross-process build lock in the harness's `_launchApp`
-  // (released once each app's VM service is up), so only the slow test EXECUTION overlaps. Nothing to
-  // pre-build here.
+  // Build the shared sim APK once up front; workers install it (`flutter run --use-application-binary`)
+  // instead of each running a Gradle build, so the build no longer serializes per test — only the slow
+  // test EXECUTION overlaps.
+  final androidAppBinary = await AppSession.ensureAndroidSimApkBuilt(
+    logSink: stderr,
+  );
 
   var acquiredAny = false;
 
@@ -614,6 +616,7 @@ Future<void> _runAndroidPool(
         test,
         serial: serial,
         sdk: sdk,
+        androidAppBinary: androidAppBinary,
         capture: !noCapture,
         deadline: deadline,
       );
@@ -723,6 +726,7 @@ Future<_TestResult> _runOneTest(
   String? serial,
   String? sdk,
   String? hostAppBinary,
+  String? androidAppBinary,
   int? windowSlot,
   required bool capture,
   required Duration deadline,
@@ -739,6 +743,7 @@ Future<_TestResult> _runOneTest(
       if (serial != null) 'SIM_FLUTTER_DEVICE': serial,
       if (serial != null) 'SIM_REQUIRE_FLUTTER_DEVICE': '1',
       if (hostAppBinary != null) 'SIM_HOST_APP_BINARY': hostAppBinary,
+      if (androidAppBinary != null) 'SIM_ANDROID_APP_BINARY': androidAppBinary,
       if (windowSlot != null) 'FROSTSNAP_SIM_WINDOW_SLOT': '$windowSlot',
     },
   );

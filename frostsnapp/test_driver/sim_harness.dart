@@ -25,6 +25,8 @@ import 'package:frostsnap/sim_faucet.dart';
 import 'regtest.dart'
     show
         RegtestSession,
+        androidBridgeControlSocket,
+        androidBridgeElectrumUrl,
         androidSdkRoot,
         bridgeRegtestToEmulator,
         ensureRegtestBackend,
@@ -38,6 +40,34 @@ Directory simTmpRoot() {
   final dir = Directory('${Directory.systemTemp.path}/frostsnap-sim');
   dir.createSync(recursive: true);
   return dir;
+}
+
+/// Grow the sim fleet to EXACTLY [target] devices: [count] reads the current device count, [addOne]
+/// hot-plugs one and returns the new count. This is how an android test's device count is delivered at
+/// runtime — a shared APK can't bake a per-test count and the emulator app can't read the host env, so
+/// the count is grown over the app channel after launch instead. The final count is ASSERTED to equal
+/// [target]: a shared-APK count mismatch is a hard setup failure, not a silent "3-device test runs with
+/// 1 and still passes the early steps". A stuck add (one that doesn't grow the fleet) throws rather than
+/// spin. On host this is a no-op grow whose equality check just confirms the env-loaded count.
+Future<void> growFleetTo(
+  int target,
+  Future<int> Function() count,
+  Future<int> Function() addOne,
+) async {
+  for (var n = await count(); n < target;) {
+    final grown = await addOne();
+    if (grown <= n) {
+      throw StateError('add-device did not grow the fleet ($n -> $grown)');
+    }
+    n = grown;
+  }
+  final fleet = await count();
+  if (fleet != target) {
+    throw StateError(
+      'sim fleet has $fleet device(s), expected exactly $target — '
+      'runtime device-count delivery is wrong',
+    );
+  }
 }
 
 /// A scenario's PRIVATE regtest backend (its own chain), bound to the harness for the run and reaped
@@ -185,6 +215,63 @@ class AppSession {
     return binary.absolute.path;
   });
 
+  static const _androidSimApkBinary =
+      'build/app/outputs/flutter-apk/app-direct-debug.apk';
+
+  /// Build the Android `direct` debug sim APK once. Pool workers install this prebuilt APK
+  /// (`flutter run --use-application-binary`) rather than each running a Gradle build, so only the slow
+  /// test EXECUTION overlaps — not the build. The emulator app can't read the host env, so every value
+  /// the host delivers per-launch via the env is baked here EXCEPT the device count (grown over the app
+  /// channel at runtime) and SIM_APP_DIR (a host path, meaningless in the sandbox). The regtest
+  /// endpoints are the FIXED bridge ports, so the per-session adb-reverse does the routing and this one
+  /// APK serves regtest and non-regtest scenarios alike.
+  static Future<String> ensureAndroidSimApkBuilt({
+    IOSink? logSink,
+  }) => _withFlutterBuildLock(() async {
+    final proc = await Process.start('flutter', [
+      'build',
+      'apk',
+      '--debug',
+      '-t',
+      'test_driver/sim_app.dart',
+      '--flavor',
+      'direct',
+      '--dart-define=SIM=true',
+      '--dart-define=SIM_AGENT_OWNS_KEYBOARD=true',
+      '--dart-define=SIM_REGTEST_ELECTRUM_URL=$androidBridgeElectrumUrl',
+      '--dart-define=SIM_REGTEST_CONTROL_SOCKET=$androidBridgeControlSocket',
+    ]);
+    final output = StringBuffer();
+    void capture(String prefix, String line) {
+      final tagged = '[$prefix] $line';
+      output.writeln(tagged);
+      logSink?.writeln(tagged);
+    }
+
+    final drains = [
+      proc.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .forEach((line) => capture('build', line)),
+      proc.stderr
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .forEach((line) => capture('build:err', line)),
+    ];
+    final code = await proc.exitCode;
+    await Future.wait(drains);
+    if (code != 0) {
+      throw StateError('flutter build apk failed with exit $code\n$output');
+    }
+    final binary = File(_androidSimApkBinary);
+    if (!await binary.exists()) {
+      throw StateError(
+        'flutter build apk succeeded but $_androidSimApkBinary does not exist',
+      );
+    }
+    return binary.absolute.path;
+  });
+
   static Future<T> _withFlutterBuildLock<T>(Future<T> Function() body) async {
     // Serialize Flutter's writes to build/ across concurrent launches. The OS drops the lock if a
     // worker dies, so it can't deadlock.
@@ -246,7 +333,6 @@ class AppSession {
     required String flutterDevice,
     required String? flavor,
     required Directory appDir,
-    required int deviceCount,
     required bool agentOwnsKeyboard,
     required bool shareHostAppDir,
     required String? regtestElectrumUrl,
@@ -263,7 +349,8 @@ class AppSession {
     '--dart-define=SIM=true',
     // Omitted on Android — a host path is meaningless in the sandbox.
     if (shareHostAppDir) '--dart-define=SIM_APP_DIR=${appDir.path}',
-    '--dart-define=SIM_DEVICE_COUNT=$deviceCount',
+    // SIM_DEVICE_COUNT is NOT baked in: the emulator app can't read the host env, and a shared APK
+    // (build-once) can't carry a per-test value — the harness grows the fleet at runtime instead.
     '--dart-define=SIM_AGENT_OWNS_KEYBOARD=$agentOwnsKeyboard',
     if (regtestElectrumUrl != null)
       '--dart-define=SIM_REGTEST_ELECTRUM_URL=$regtestElectrumUrl',
@@ -361,6 +448,11 @@ class AppSession {
       late final String url;
       final directMacosLaunch =
           shareHostAppDir && flutterDevice == 'macos' && Platform.isMacOS;
+      final androidAppBinary = Platform.environment['SIM_ANDROID_APP_BINARY'];
+      final usePrebuiltApk =
+          !shareHostAppDir &&
+          androidAppBinary != null &&
+          androidAppBinary.isNotEmpty;
       if (directMacosLaunch) {
         final configuredBinary = Platform.environment['SIM_HOST_APP_BINARY'];
         final binary = configuredBinary != null && configuredBinary.isNotEmpty
@@ -377,6 +469,27 @@ class AppSession {
         wireProcessLogs(proc);
         log('[harness] launched macOS sim app binary: $binary');
         url = await vmUrl.future.timeout(const Duration(minutes: 5));
+      } else if (usePrebuiltApk) {
+        if (!await File(androidAppBinary).exists()) {
+          throw StateError(
+            'SIM_ANDROID_APP_BINARY does not exist: $androidAppBinary',
+          );
+        }
+        // Install + attach to the prebuilt APK: no Gradle build, so no build-lock serialization and
+        // launches overlap. Every per-build define is baked in the APK (ensureAndroidSimApkBuilt); the
+        // device count grows over the app channel and the regtest chain is reached via the per-serial
+        // adb-reverse, so nothing per-test needs passing here.
+        proc = await Process.start('flutter', [
+          'run',
+          '--use-application-binary',
+          androidAppBinary,
+          '-d',
+          flutterDevice,
+          '--no-pub',
+        ], environment: launchEnvironment);
+        wireProcessLogs(proc);
+        log('[harness] launched prebuilt android sim APK: $androidAppBinary');
+        url = await vmUrl.future.timeout(const Duration(minutes: 5));
       } else {
         url = await _withFlutterBuildLock(() async {
           proc = await Process.start(
@@ -385,7 +498,6 @@ class AppSession {
               flutterDevice: flutterDevice,
               flavor: flavor,
               appDir: appDir,
-              deviceCount: deviceCount,
               agentOwnsKeyboard: agentOwnsKeyboard,
               shareHostAppDir: shareHostAppDir,
               regtestElectrumUrl: regtestElectrumUrl,
@@ -640,6 +752,16 @@ class AppSession {
     }
     h._regtest = regtest;
     try {
+      // Bring the fleet up to [deviceCount] over the app channel. On host the app already loaded that
+      // many from SIM_DEVICE_COUNT in its inherited env (a no-op grow). On android the emulator app
+      // can't see the host env (and a shared APK can't bake a per-test --dart-define), so the count is
+      // delivered here at runtime instead — the proven add-device hot-plug path, with a hard assertion
+      // that the fleet lands at exactly [deviceCount] (see growFleetTo).
+      await growFleetTo(
+        deviceCount,
+        () async => (await h.deviceNumbers()).length,
+        h.addDevice,
+      );
       await body(h);
     } catch (error, stack) {
       await h._captureFailure(name, error, stack);

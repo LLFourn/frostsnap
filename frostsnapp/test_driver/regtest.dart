@@ -506,32 +506,57 @@ class RegtestEmulatorBridge {
   RegtestEmulatorBridge(this.defines, this.unbridge);
 }
 
+// FIXED emulator-side bridge ports. The app binary is built ONCE and shared across tests, so the
+// regtest URLs it reads must be CONSTANT — they cannot carry a per-session host port. We expose the
+// chain on these fixed emulator-loopback ports and let a per-serial `adb reverse` map them to THIS
+// session's dynamic host ports. Reverses are per-serial, so parallel emulators reuse the same fixed
+// ports without colliding, and a crashed scenario's stale reverse is overwritten by the next claim of
+// that slot rather than leaking a distinct port.
+const _bridgeElectrumPort = 53321;
+const _bridgeControlPort = 53322;
+
+/// The fixed emulator-side regtest endpoints the shared android sim APK bakes in: the app reaches the
+/// chain at these constant loopback ports, and [bridgeRegtestToEmulator]'s per-serial adb-reverse
+/// routes them to each session. Single source of truth for both the baked define and the live bridge.
+const androidBridgeElectrumUrl = 'tcp://127.0.0.1:$_bridgeElectrumPort';
+const androidBridgeControlSocket = '127.0.0.1:$_bridgeControlPort';
+
 /// Bridge a per-session regtest [session] to the Android emulator [serial] so its app can reach the
-/// host-side chain: adb-reverse electrs' port (the app hits the same 127.0.0.1:port the URL names), and
-/// proxy the unix faucet control socket over an adb-reversed loopback TCP port (SimFaucet speaks
-/// either). The app then runs regtest unaware it's remote. Dynamic per-session ports + per-serial
-/// reverses, so parallel scenarios on different emulators never collide.
+/// host-side chain: adb-reverse electrs' port and a unix→tcp faucet proxy onto fixed emulator ports
+/// ([_bridgeElectrumPort]/[_bridgeControlPort]) that each map to this session's dynamic host ports. The
+/// app then runs regtest unaware it's remote.
 Future<RegtestEmulatorBridge> bridgeRegtestToEmulator(
   RegtestSession session,
   String serial,
 ) async {
   final adb = '${androidSdkRoot()}/platform-tools/adb';
   final ePort = electrumPort(session.url);
-  await Process.run(adb, ['-s', serial, 'reverse', 'tcp:$ePort', 'tcp:$ePort']);
+  await Process.run(adb, [
+    '-s',
+    serial,
+    'reverse',
+    'tcp:$_bridgeElectrumPort',
+    'tcp:$ePort',
+  ]);
   final controlProxy = await bridgeUnixOverTcp(session.controlSocket);
-  final cPort = controlProxy.port;
-  await Process.run(adb, ['-s', serial, 'reverse', 'tcp:$cPort', 'tcp:$cPort']);
+  await Process.run(adb, [
+    '-s',
+    serial,
+    'reverse',
+    'tcp:$_bridgeControlPort',
+    'tcp:${controlProxy.port}',
+  ]);
   Future<void> unbridge() async {
     try {
       await controlProxy.close();
     } catch (_) {}
-    for (final p in [ePort, cPort]) {
+    for (final p in [_bridgeElectrumPort, _bridgeControlPort]) {
       await Process.run(adb, ['-s', serial, 'reverse', '--remove', 'tcp:$p']);
     }
   }
 
   return RegtestEmulatorBridge({
-    'SIM_REGTEST_ELECTRUM_URL': session.url,
-    'SIM_REGTEST_CONTROL_SOCKET': '127.0.0.1:$cPort',
+    'SIM_REGTEST_ELECTRUM_URL': androidBridgeElectrumUrl,
+    'SIM_REGTEST_CONTROL_SOCKET': androidBridgeControlSocket,
   }, unbridge);
 }
