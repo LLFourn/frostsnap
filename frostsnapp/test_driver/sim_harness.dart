@@ -72,13 +72,20 @@ class AppSession {
   final Directory appDir;
   final FlutterDriver driver;
   final List<String> _appLog;
+  final String flutterDevice;
   int _shotSeq = 0;
 
   /// This scenario's isolated regtest backend, if it ran `withRegtest` (see [faucet]). Owned by the
   /// session: reaped on [tearDown].
   _ScenarioRegtest? _regtest;
 
-  AppSession(this._appProcess, this.appDir, this.driver, this._appLog);
+  AppSession(
+    this._appProcess,
+    this.appDir,
+    this.driver,
+    this._appLog,
+    this.flutterDevice,
+  );
 
   /// Connect to THIS scenario's private faucet (its own chain). The test drives funding/mining here,
   /// so parallel scenarios never share a chain. Throws if the scenario didn't request `withRegtest`.
@@ -128,7 +135,7 @@ class AppSession {
       flavor: hostPlatform ? null : 'direct',
       logSink: logSink,
     );
-    return AppSession(proc, dir, drv, log);
+    return AppSession(proc, dir, drv, log, flutterDevice);
   }
 
   static const _macosSimAppBinary =
@@ -250,6 +257,8 @@ class AppSession {
     'test_driver/sim_app.dart',
     '-d',
     flutterDevice,
+    '--no-pub',
+    if (!shareHostAppDir) '--no-hot',
     if (flavor != null) ...['--flavor', flavor],
     '--dart-define=SIM=true',
     // Omitted on Android — a host path is meaningless in the sandbox.
@@ -440,7 +449,9 @@ class AppSession {
     // session so parallel scenarios never share a chain, and nothing orphans. (The INTERACTIVE
     // `serve` node is the separate, deliberately-persistent shared one, reaped by `regtest down`.)
     if (regtest != null) await guard(regtest.stop);
-    if (driver != null) await guard(driver.close);
+    if (driver != null) {
+      await guard(() => driver.close().timeout(const Duration(seconds: 5)));
+    }
     if (proc != null) {
       final p = proc;
       p.kill();
@@ -602,6 +613,13 @@ class AppSession {
   }) async {
     final device =
         flutterDevice ?? Platform.environment['SIM_FLUTTER_DEVICE'] ?? 'macos';
+    if (Platform.environment['SIM_REQUIRE_FLUTTER_DEVICE'] == '1' &&
+        flutterDevice == null &&
+        Platform.environment['SIM_FLUTTER_DEVICE'] == null) {
+      throw StateError(
+        'SIM_REQUIRE_FLUTTER_DEVICE=1 but SIM_FLUTTER_DEVICE is unset',
+      );
+    }
     // Start the scenario's PRIVATE regtest backend (its own chain) BEFORE the app, so its electrum
     // URL + faucet socket seed the launch. Owned by the session → reaped on tearDown, so concurrent
     // scenarios never share a chain (a foreign `mine` can't confirm another's pending receive).
@@ -721,7 +739,7 @@ class AppSession {
     final deadline = DateTime.now().add(timeout);
     var prev = double.nan;
     while (true) {
-      final br = await driver.runUnsynchronized(
+      final br = await _driverCall(
         () => driver.getBottomRight(finder, timeout: _cmdTimeout),
       );
       if ((br.dy - prev).abs() < 1.0 || DateTime.now().isAfter(deadline)) {
@@ -747,7 +765,10 @@ class AppSession {
   /// Per-command timeout for app interactions.
   static const Duration _cmdTimeout = Duration(seconds: 20);
 
-  Future<void> tap(Pattern label) => driver.runUnsynchronized(
+  Future<T> _driverCall<T>(Future<T> Function() call, [Duration? timeout]) =>
+      driver.runUnsynchronized(call).timeout(timeout ?? _cmdTimeout);
+
+  Future<void> tap(Pattern label) => _driverCall(
     () => driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout),
   );
 
@@ -782,8 +803,9 @@ class AppSession {
 
   Future<bool> _appears(Pattern label, Duration timeout) async {
     try {
-      await driver.runUnsynchronized(
+      await _driverCall(
         () => driver.waitFor(find.bySemanticsLabel(label), timeout: timeout),
+        timeout + const Duration(seconds: 1),
       );
       return true;
     } catch (_) {
@@ -791,13 +813,12 @@ class AppSession {
     }
   }
 
-  Future<void> enterText(Pattern label, String text) =>
-      driver.runUnsynchronized(() async {
-        await driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout);
-        await driver.enterText(text, timeout: _cmdTimeout);
-      });
+  Future<void> enterText(Pattern label, String text) => _driverCall(() async {
+    await driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout);
+    await driver.enterText(text, timeout: _cmdTimeout);
+  });
 
-  Future<String> getText(Pattern label) => driver.runUnsynchronized(
+  Future<String> getText(Pattern label) => _driverCall(
     () => driver.getText(find.bySemanticsLabel(label), timeout: _cmdTimeout),
   );
 
@@ -813,25 +834,28 @@ class AppSession {
   Future<void> waitFor(
     Pattern label, {
     Duration timeout = const Duration(seconds: 30),
-  }) => driver.runUnsynchronized(
+  }) => _driverCall(
     () => driver.waitFor(find.bySemanticsLabel(label), timeout: timeout),
+    timeout + const Duration(seconds: 1),
   );
 
   Future<void> waitForAbsent(
     Pattern label, {
     Duration timeout = const Duration(seconds: 30),
-  }) => driver.runUnsynchronized(
+  }) => _driverCall(
     () => driver.waitForAbsent(find.bySemanticsLabel(label), timeout: timeout),
+    timeout + const Duration(seconds: 1),
   );
 
   /// Whether a control with semantic [label] is present right now.
   Future<bool> exists(Pattern label) async {
     try {
-      await driver.runUnsynchronized(
+      await _driverCall(
         () => driver.waitFor(
           find.bySemanticsLabel(label),
           timeout: const Duration(milliseconds: 800),
         ),
+        const Duration(seconds: 2),
       );
       return true;
     } catch (_) {
@@ -890,7 +914,7 @@ class AppSession {
   /// Best-effort: raise the macOS app window so its render loop resumes and the next
   /// screenshot is a fresh frame. A no-op (silently) off macOS or if osascript is absent.
   Future<void> _bringAppToFront() async {
-    if (!Platform.isMacOS) return;
+    if (!Platform.isMacOS || flutterDevice != 'macos') return;
     try {
       await Process.run('osascript', [
         '-e',

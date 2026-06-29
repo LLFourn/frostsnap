@@ -655,6 +655,7 @@ Future<_TestResult> _runOneTest(
       'SIM_TEST_NAME': test.name,
       'SIM_TEST_ARTIFACTS_DIR': test.artifactsDir.absolute.path,
       if (serial != null) 'SIM_FLUTTER_DEVICE': serial,
+      if (serial != null) 'SIM_REQUIRE_FLUTTER_DEVICE': '1',
       if (hostAppBinary != null) 'SIM_HOST_APP_BINARY': hostAppBinary,
       if (windowSlot != null) 'FROSTSNAP_SIM_WINDOW_SLOT': '$windowSlot',
     },
