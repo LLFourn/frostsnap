@@ -146,16 +146,21 @@ Future<Process> _spawnRegtest(
   String root,
   String controlSocket,
   String urlFile,
-  String logFile,
-) {
+  String logFile, {
+  // Isolated sessions pass true: the backend self-reaps when this owner's stdin pipe hits EOF (owner
+  // death). The shared daemon leaves it false — it has no owner, and its detached stdin is /dev/null
+  // (instant EOF), which would otherwise make it self-reap immediately.
+  bool reapOnOwnerExit = false,
+}) {
   // We deliberately do NOT unlink the control/url paths here: a second concurrent spawn at the SAME
   // socket could delete one the other backend just bound. The Rust bind_control_socket owns
   // stale-socket cleanup and refuses a LIVE one — that singleton guard is the sole authority.
+  final reapFlag = reapOnOwnerExit ? ' --reap-on-owner-exit' : '';
   return Process.start(
     'sh',
     [
       '-c',
-      'exec "\$1" --control-socket "\$2" --url-file "\$3" > "\$4" 2>&1',
+      'exec "\$1" --control-socket "\$2" --url-file "\$3"$reapFlag > "\$4" 2>&1',
       'sim_regtest',
       '$root/target/debug/sim_regtest',
       controlSocket,
@@ -163,7 +168,12 @@ Future<Process> _spawnRegtest(
       logFile,
     ],
     workingDirectory: root,
-    mode: ProcessStartMode.detached,
+    // detachedWithStdio (vs detached) when owner-reaping: both keep the setsid detachment that lets the
+    // process group be reaped together, but this one also gives us a stdin pipe whose write end we hold
+    // — the kernel closes it when we die, which is the EOF the backend watches.
+    mode: reapOnOwnerExit
+        ? ProcessStartMode.detachedWithStdio
+        : ProcessStartMode.detached,
   );
 }
 
@@ -241,12 +251,19 @@ class RegtestSession {
   /// This session's private dir (control socket, url file, backend log) — removed on [stop].
   final Directory dir;
 
+  /// The spawned backend process, HELD for the session's lifetime so its stdin pipe (whose write end we
+  /// own) stays open. If this owner dies ANY way — including a SIGKILL that skips [stop] — the kernel
+  /// closes that end, the backend reads EOF, and it self-reaps. That is what binds the backend's
+  /// lifetime to this owner by construction, where [stop] (cleanup code) cannot survive a kill.
+  final Process _backend;
+
   RegtestSession._({
     required this.url,
     required this.controlSocket,
     required this.pid,
     required this.dir,
-  });
+    required Process backend,
+  }) : _backend = backend;
 
   Future<SimFaucet> faucet() => SimFaucet.connect(controlSocket);
 
@@ -268,6 +285,10 @@ class RegtestSession {
     if (!await _processExits(pid, const Duration(seconds: 10))) {
       await _killProcessGroup(pid);
     }
+    // Release our end of the death-pipe; the backend is already reaped above, so this just frees the fd.
+    try {
+      await _backend.stdin.close();
+    } catch (_) {}
     try {
       if (await dir.exists()) await dir.delete(recursive: true);
     } catch (_) {}
@@ -343,7 +364,13 @@ Future<RegtestSession> startRegtestSession(Directory dir) async {
   final logFile = '${dir.path}/backend.log';
   final root = _repoRoot();
   await _buildRegtest(root);
-  final child = await _spawnRegtest(root, controlSocket, urlFile, logFile);
+  final child = await _spawnRegtest(
+    root,
+    controlSocket,
+    urlFile,
+    logFile,
+    reapOnOwnerExit: true,
+  );
   try {
     final pid = await _waitRegtestReady(controlSocket, urlFile, logFile);
     return RegtestSession._(
@@ -351,6 +378,7 @@ Future<RegtestSession> startRegtestSession(Directory dir) async {
       controlSocket: controlSocket,
       pid: pid,
       dir: dir,
+      backend: child,
     );
   } catch (_) {
     // The backend process group may be alive but never became ready — with no RegtestSession to

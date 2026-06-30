@@ -4,8 +4,13 @@
 //! socket until told to stop — a `down` command or SIGINT/SIGTERM — then drops everything,
 //! which reaps the bitcoind/electrs child processes (no orphans).
 //!
-//! Usage: `sim_regtest --control-socket <path> [--url-file <path>]`
+//! Usage: `sim_regtest --control-socket <path> [--url-file <path>] [--reap-on-owner-exit]`
+//!
+//! `--reap-on-owner-exit` binds this backend's lifetime to its spawner: when stdin (a pipe the owner
+//! holds) hits EOF — i.e. the owner died, even via a SIGKILL that skips its teardown — we stop and drop,
+//! reaping the children. Isolated per-test sessions pass it; the shared daemon does not.
 
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -15,6 +20,7 @@ use sim_regtest::Regtest;
 fn main() -> anyhow::Result<()> {
     let mut control_socket: Option<String> = None;
     let mut url_file: Option<String> = None;
+    let mut reap_on_owner_exit = false;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -26,6 +32,10 @@ fn main() -> anyhow::Result<()> {
             "--url-file" => {
                 url_file = args.get(i + 1).cloned();
                 i += 2;
+            }
+            "--reap-on-owner-exit" => {
+                reap_on_owner_exit = true;
+                i += 1;
             }
             other => anyhow::bail!("unknown arg: {other}"),
         }
@@ -57,6 +67,26 @@ fn main() -> anyhow::Result<()> {
         let stop = stop.clone();
         ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst))
             .context("install signal handler")?;
+    }
+
+    // Bind the backend's lifetime to its owner. An isolated session spawns us with the owner holding
+    // the write end of our stdin pipe, so when the owner dies ANY way — including a SIGKILL that skips
+    // its Dart teardown — the kernel closes that end, this read hits EOF, and we flip the same stop flag
+    // (serve returns → Regtest drops → bitcoind/electrs reaped). A finally-based reap cannot do this; it
+    // never runs after SIGKILL. Gated because the shared daemon's stdin is /dev/null (instant EOF) and
+    // must NOT self-reap. Detached thread, never joined: process exit terminates it even mid-read.
+    if reap_on_owner_exit {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            loop {
+                match std::io::stdin().read(&mut buf) {
+                    Ok(0) | Err(_) => break, // EOF (owner's pipe closed) or error → owner is gone
+                    Ok(_) => continue,       // owner shouldn't write; ignore stray bytes
+                }
+            }
+            stop.store(true, Ordering::SeqCst);
+        });
     }
 
     // A machine-readable readiness line for the Dart layer to parse (URL + ready marker).
