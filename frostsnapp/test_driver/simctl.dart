@@ -781,7 +781,15 @@ Future<_TestResult> _runOneTest(
     drains,
   ).timeout(_diagnosticTimeout, onTimeout: () => <void>[]);
   final output = buf.toString();
-  final status = timedOut ? 'TIMEOUT' : (code == 0 ? 'PASSED' : 'FAILED');
+  // A scenario can declare itself skipped (exit 0 + marker) — e.g. a host-only dual-instance scenario
+  // on an emulator. Classify that as SKIPPED so a never-ran test isn't reported as a silent PASS.
+  final skipped =
+      !timedOut && code == 0 && output.contains(simTestSkippedMarker);
+  final status = timedOut
+      ? 'TIMEOUT'
+      : skipped
+      ? 'SKIPPED'
+      : (code == 0 ? 'PASSED' : 'FAILED');
   await _writeOutputLog(test.artifactsDir, output);
   if (status != 'PASSED') {
     reason ??= 'exit code $code';
