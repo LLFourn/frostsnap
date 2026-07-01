@@ -1,5 +1,5 @@
 // Android emulator LIFECYCLE primitives (ensure-AVD / boot / provision / wait / kill), keyed by
-// (avd, port, serial) with NO pool/slot knowledge — extracted from the runner (simctl.dart) so the
+// (avd, port, serial) with NO pool/slot knowledge — extracted from the runner (fsim.dart) so the
 // TEST PROCESS can provision its own emulator(s) too, behind the app-instance seam (sim-unify-app-host).
 // Every function takes the resolved Android SDK root [sdk]; callers own AVD naming and port assignment.
 
@@ -36,7 +36,7 @@ Future<void> runFeeding(String exe, List<String> args, String stdinText) async {
   unawaited(stderr.addStream(p.stderr));
   final code = await p.exitCode;
   if (code != 0) {
-    stderr.writeln('simctl: `$exe ${args.first}` exited $code (continuing)');
+    stderr.writeln('fsim: `$exe ${args.first}` exited $code (continuing)');
   }
 }
 
@@ -52,7 +52,7 @@ Future<void> ensureSdkPackages(String sdk) async {
   }
   final sdkmanager = '$sdk/cmdline-tools/latest/bin/sdkmanager';
   stderr.writeln(
-    'simctl: provisioning emulator + $sysImage (one-time, large download) …',
+    'fsim: provisioning emulator + $sysImage (one-time, large download) …',
   );
   // Accept any pending licenses, then install (feeding "y" covers per-package license prompts).
   await runFeeding(sdkmanager, ['--licenses'], 'y\n' * 50);
@@ -71,7 +71,7 @@ Future<String> ensureAvd(String sdk, String avd) async {
   if (File(avdIni).existsSync()) return avd;
   await ensureSdkPackages(sdk);
   final avdmanager = '$sdk/cmdline-tools/latest/bin/avdmanager';
-  stderr.writeln('simctl: creating AVD "$avd" …');
+  stderr.writeln('fsim: creating AVD "$avd" …');
   // "no" declines the custom-hardware-profile prompt.
   await runFeeding(avdmanager, [
     'create',

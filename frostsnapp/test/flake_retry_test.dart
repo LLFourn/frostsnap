@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 
-import '../test_driver/simctl.dart' show isTransientFlake, runWithRetry;
+import '../test_driver/fsim.dart' show isTransientFlake, runWithRetry;
 
 // Regression guard for the e2e startup-flake retry (sim-e2e-startup-flake-retry). On a cold-booted
 // emulator the app janks at launch, `flutter run` drops the VM service, and the driver's first command

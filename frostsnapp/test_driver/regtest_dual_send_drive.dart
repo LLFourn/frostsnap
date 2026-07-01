@@ -11,7 +11,7 @@ import 'sim_harness.dart';
 // coinbase/fee-immune. No faucet mock, no GUI pixel-tapping.
 //
 // HOST-ONLY (Scenario.runDual): two instances of one app package can't coexist on one Android emulator,
-// so this skips cleanly there. Run: `./simctl test regtest_dual_send`. Needs a display (Xvfb on Linux
+// so this skips cleanly there. Run: `./fsim test regtest_dual_send`. Needs a display (Xvfb on Linux
 // CI); first run downloads bitcoind + electrs.
 
 /// Device hold-to-confirm button point (sim-3 calibration) — used for tx signing here.

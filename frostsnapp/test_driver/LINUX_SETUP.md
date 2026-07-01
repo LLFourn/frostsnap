@@ -1,11 +1,11 @@
 # Running the sim on Linux
 
-The sim harness (`./simctl` + the `test_driver/*_drive.dart` e2e tests) runs on Linux — a native place to
+The sim harness (`./fsim` + the `test_driver/*_drive.dart` e2e tests) runs on Linux — a native place to
 reproduce bugs, fix them, and add regression tests. Two backends:
 
-- **host desktop** — a Linux Flutter desktop app (`./simctl test`, `./simctl serve`/`up`), needs a display
+- **host desktop** — a Linux Flutter desktop app (`./fsim test`, `./fsim serve`/`up`), needs a display
   (real or Xvfb). No emulator.
-- **android** — each test SELF-BOOTS its own emulator (`./simctl test --android`), needs the Android SDK
+- **android** — each test SELF-BOOTS its own emulator (`./fsim test --android`), needs the Android SDK
   and hardware KVM.
 
 > Status: this port is **best-effort, validated on macOS + CI, not yet on a Linux box**. If something
@@ -48,7 +48,7 @@ sudo apt-get install -y xvfb scrot
   just gen
   ```
   (`just build …` runs this via `maybe-gen`, but the sim build path calls `flutter build` directly, so run
-  it once yourself. `simctl` auto-runs the dart `build_runner` step.)
+  it once yourself. `fsim` auto-runs the dart `build_runner` step.)
 - **Firmware at the conventional path** — the app embeds a device firmware binary at
   `target/riscv32imc-unknown-none-elf/release/<env>-frontier.bin` (see `justfile` `firmware_bin`). Either
   build it (`just build-firmware frontier` — needs the RISC-V GCC toolchain, see `build-device-firmware` in
@@ -58,7 +58,7 @@ sudo apt-get install -y xvfb scrot
 ## 4. Android only (`--android`)
 
 - **JDK 17** + the **Android SDK** command-line tools; set `ANDROID_HOME` (or `ANDROID_SDK_ROOT`, or
-  `android/local.properties` `sdk.dir`, or the default `$HOME/Android/Sdk`). `simctl`'s `ensureSdkPackages`
+  `android/local.properties` `sdk.dir`, or the default `$HOME/Android/Sdk`). `fsim`'s `ensureSdkPackages`
   auto-installs the `emulator` package + `system-images;android-34;google_apis;x86_64` on first run.
 - **NDK r25c** (matches `build-android`) for the APK build.
 - **KVM** — the emulator needs hardware accel or it's unusably slow. Confirm `/dev/kvm` is present and
@@ -73,20 +73,20 @@ first use.
 
 Host (under a virtual display):
 ```sh
-xvfb-run -a ./simctl test regtest_receive      # one test
-xvfb-run -a ./simctl test                        # whole suite (add --jobs N to cap parallelism)
-xvfb-run -a ./simctl up                          # interactive: bring the sim up, then drive with ./simctl
+xvfb-run -a ./fsim test regtest_receive      # one test
+xvfb-run -a ./fsim test                        # whole suite (add --jobs N to cap parallelism)
+xvfb-run -a ./fsim up                          # interactive: bring the sim up, then drive with ./fsim
 ```
 
 Android (each test self-boots its own emulator; KVM required):
 ```sh
-./simctl test --android regtest_receive
-./simctl test --android regtest_dual_send        # two self-booted emulators, cross-wallet send
-./simctl up --android                            # interactive on one emulator
+./fsim test --android regtest_receive
+./fsim test --android regtest_dual_send        # two self-booted emulators, cross-wallet send
+./fsim up --android                            # interactive on one emulator
 ```
 
 Notes:
 - Keep android `--jobs` LOW (start at 1). Each test boots 1–2 emulators; a small box can't take many at once.
-- `./simctl clean` sweeps leftover test emulators + reaps the regtest backend if a run is interrupted.
+- `./fsim clean` sweeps leftover test emulators + reaps the regtest backend if a run is interrupted.
 - The whole-app `shot` + failure screenshots use the app channel (cross-platform); only the host
   timeout-diagnostic screenshot shells `scrot` (hence the dep above).

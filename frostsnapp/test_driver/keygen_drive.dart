@@ -9,7 +9,7 @@ import 'sim_harness.dart';
 // (or an app-copy desync the flow targets by label) surfaces here.
 //
 // Devices are driven over the APP channel (driver-data → the FRB pool), the same on host and
-// emulator — see `createWallet`. Run: `./simctl test keygen`. Needs a display (Xvfb on Linux CI).
+// emulator — see `createWallet`. Run: `./fsim test keygen`. Needs a display (Xvfb on Linux CI).
 
 const _confirmX = 120;
 const _confirmY = 215;

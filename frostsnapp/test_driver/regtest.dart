@@ -7,7 +7,7 @@ import 'package:frostsnap/sim_faucet.dart';
 import 'sim_harness.dart' show simTmpRoot;
 
 // The Dart side of the regtest faucet (regtest-bitcoin-receiving): manage the standalone
-// `sim_regtest` backend (`./simctl regtest up|down|status`) and drive its faucet over the
+// `sim_regtest` backend (`./fsim regtest up|down|status`) and drive its faucet over the
 // control socket (`fund`/`mine`/`balance`/`address`/`url`). The backend lives ABOVE the app
 // (its own process, shared across sessions), so it's addressed by a well-known socket — not
 // owned by any app instance. The wire client is the shared [SimFaucet] (also used by the in-app
@@ -45,7 +45,7 @@ Future<int?> regtestOwnerPid() => _ownerPidAt(regtestControlSocket);
 /// Whether a faucet backend is live at the well-known control socket (connect + ping).
 Future<bool> regtestLive() async => (await regtestOwnerPid()) != null;
 
-/// `./simctl regtest <up|down|status|fund|mine|balance|address|url>`.
+/// `./fsim regtest <up|down|status|fund|mine|balance|address|url>`.
 Future<void> runRegtest(List<String> args) async {
   final sub = args.isEmpty ? 'status' : args.first;
   final rest = args.skip(1).toList();
@@ -105,7 +105,7 @@ Future<void> runRegtest(List<String> args) async {
 
 Future<void> _withFaucet(Future<void> Function(SimFaucet) body) async {
   if (!await regtestLive()) {
-    stderr.writeln('regtest: no backend running (run `./simctl regtest up`)');
+    stderr.writeln('regtest: no backend running (run `./fsim regtest up`)');
     exit(1);
   }
   final faucet = await SimFaucet.connect(regtestControlSocket);
@@ -116,7 +116,7 @@ Future<void> _withFaucet(Future<void> Function(SimFaucet) body) async {
   }
 }
 
-/// The repo root (the `./simctl` launcher cd's into `frostsnapp`, so the cwd's parent is root).
+/// The repo root (the `./fsim` launcher cd's into `frostsnapp`, so the cwd's parent is root).
 String _repoRoot() => Directory.current.parent.path;
 
 /// Build the `sim_regtest` binary (idempotent; the first run downloads the pinned bitcoind +
@@ -178,7 +178,7 @@ Future<Process> _spawnRegtest(
 }
 
 int get _regtestWaitSecs =>
-    int.tryParse(Platform.environment['SIMCTL_REGTEST_WAIT_SECS'] ?? '') ?? 600;
+    int.tryParse(Platform.environment['FSIM_REGTEST_WAIT_SECS'] ?? '') ?? 600;
 
 /// Wait until a backend is serving at [controlSocket] (reports a PID) AND its [urlFile] is written;
 /// return that live PID. Throws on timeout.
@@ -200,9 +200,9 @@ Future<int> _waitRegtestReady(
 
 /// Ensure a regtest backend is up and return its electrum URL plus whether THIS call started it
 /// (`owned: true`) or attached to a live one (`owned: false`). The node is a PERSISTENT shared
-/// resource: callers (`SimHarness.launch`, `./simctl regtest up`) only start-or-attach and NEVER
-/// stop it — it's reaped only by `./simctl regtest down` / `./simctl clean`. `owned` exists just so
-/// `./simctl regtest up` can report started-vs-attached. Throws on build/startup failure.
+/// resource: callers (`SimHarness.launch`, `./fsim regtest up`) only start-or-attach and NEVER
+/// stop it — it's reaped only by `./fsim regtest down` / `./fsim clean`. `owned` exists just so
+/// `./fsim regtest up` can report started-vs-attached. Throws on build/startup failure.
 Future<({String url, bool owned})> ensureRegtestBackend() async {
   if (await regtestLive()) {
     return (

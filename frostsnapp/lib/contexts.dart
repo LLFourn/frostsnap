@@ -19,7 +19,7 @@ class FrostsnapContext extends InheritedWidget {
   final AppCtx appCtx;
 
   /// The network new wallets default to: mainnet normally, Regtest in a sim wired to the faucet
-  /// (so funds from `./simctl regtest fund` land). Decided once at the composition root so the
+  /// (so funds from `./fsim regtest fund` land). Decided once at the composition root so the
   /// sim/env branch stays out of the wallet-creation flow.
   final BitcoinNetwork defaultNetwork;
 

@@ -71,7 +71,7 @@ void main() {
   // bind_control_socket singleton — the live backend reports its PID (`ping`) and a caller owns it
   // only if that PID is the child it spawned, so concurrent auto-starts elect exactly ONE owner
   // (used only to report started-vs-attached, NOT a teardown duty). (2) Persistence: the node is
-  // reaped ONLY by an explicit `./simctl regtest down` / `clean` — a session teardown NEVER stops
+  // reaped ONLY by an explicit `./fsim regtest down` / `clean` — a session teardown NEVER stops
   // it (SimHarness no longer reaps the backend). Spawns REAL bitcoind+electrs (the race is decided
   // by the OS socket bind + real PIDs, which a fake socket can't reproduce), so it is heavy.
   test(
@@ -137,7 +137,7 @@ void main() {
           reason: 'the shared node stays up — sessions never reap it',
         );
 
-        // It is reaped ONLY by an explicit `./simctl regtest down` / `clean`, modelled here by a
+        // It is reaped ONLY by an explicit `./fsim regtest down` / `clean`, modelled here by a
         // direct stopRegtestBackend().
         await stopRegtestBackend();
         for (var i = 0; i < 40 && await regtestLive(); i++) {

@@ -1,5 +1,5 @@
 //! The faucet control socket: a unix-socket server that exposes the [`Regtest`] faucet over a
-//! JSON line protocol, so the Dart `./simctl` layer can drive it (fund the app's wallet, mine,
+//! JSON line protocol, so the Dart `./fsim` layer can drive it (fund the app's wallet, mine,
 //! query balance). The regtest faucet keeps its own control socket (it is NOT a device transport —
 //! the device-input sockets were retired in app-channel-only-device-driving).
 //!
@@ -20,7 +20,7 @@
 //! Single-threaded + serial (one connection at a time): the faucet is low-throughput and its
 //! ops mutate one chain, so there are no handler threads holding references — the caller keeps
 //! sole ownership of [`Regtest`], which drops (and reaps bitcoind/electrs) the moment `serve`
-//! returns. Clients (the `./simctl` forwarder, the tray) send a command and close, so serial
+//! returns. Clients (the `./fsim` forwarder, the tray) send a command and close, so serial
 //! handling is not a bottleneck.
 
 use std::io::{BufRead, BufReader, Write};

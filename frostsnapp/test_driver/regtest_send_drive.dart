@@ -14,7 +14,7 @@ import 'sim_harness.dart';
 // single payment. Instead we send to a FRESH node address and assert ITS electrs (per-script)
 // balance equals the sent amount — coinbase-immune proof the funds left the wallet and arrived.
 //
-// Run: `./simctl test regtest_send`. Needs a display (Xvfb on Linux CI); first run downloads
+// Run: `./fsim test regtest_send`. Needs a display (Xvfb on Linux CI); first run downloads
 // bitcoind + electrs.
 
 /// A 2-of-3 wallet: three devices, two required to sign.

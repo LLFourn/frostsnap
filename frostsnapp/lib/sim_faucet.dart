@@ -5,7 +5,7 @@ import 'dart:io';
 
 /// Client for the `sim_regtest` faucet control socket (JSON request/reply lines). The faucet
 /// backend lives ABOVE the app in its own process (shared across sessions); both the in-app sim
-/// tray and the `./simctl` harness drive it through this ONE client, so the wire protocol has a
+/// tray and the `./fsim` harness drive it through this ONE client, so the wire protocol has a
 /// single implementation that can't drift. The server handles one connection at a time, so each
 /// caller opens a short-lived connection (connect → request(s) → close) rather than holding the
 /// socket and starving other clients.

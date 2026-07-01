@@ -59,10 +59,10 @@ Flutter will give you an option of running on an android device if one is connec
 Run the simulator end-to-end suite from the repository root:
 
 ```sh
-./simctl test --android --jobs 2 --test-timeout 900 --junit build/simctl-junit.xml
+./fsim test --android --jobs 2 --test-timeout 900 --junit build/fsim-junit.xml
 ```
 
-`./simctl test` exits zero only when every run test passes. Failures and
+`./fsim test` exits zero only when every run test passes. Failures and
 timeouts exit non-zero and print a cargo-test-style summary. Raw child output
 for every test is captured at `frostsnapp/build/sim-failures/<test>/output.log`;
 non-pass tests keep extra diagnostics in that same directory (screenshots,

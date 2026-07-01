@@ -1,5 +1,5 @@
 //! `sim_regtest` binary: the regtest faucet backend as a standalone, long-lived process
-//! (spawned by `./simctl regtest up`, or auto-spawned by a sim session). It spawns
+//! (spawned by `./fsim regtest up`, or auto-spawned by a sim session). It spawns
 //! bitcoind+electrs, publishes the electrum URL to a file, and serves the faucet control
 //! socket until told to stop — a `down` command or SIGINT/SIGTERM — then drops everything,
 //! which reaps the bitcoind/electrs child processes (no orphans).

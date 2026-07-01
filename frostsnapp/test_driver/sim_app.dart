@@ -226,7 +226,7 @@ Future<void> main() {
   // text is emulated through flutter_driver (`driver.enterText` works) and the real
   // keyboard is blocked; when the USER owns it, the real keyboard works and
   // `driver.enterText` does not. The two are mutually exclusive (no hybrid). Defaults to
-  // the agent (the automated test path); `simctl serve` hands the keyboard to a human.
+  // the agent (the automated test path); `fsim serve` hands the keyboard to a human.
   const compileAgentOwnsKeyboard = bool.fromEnvironment(
     'SIM_AGENT_OWNS_KEYBOARD',
     defaultValue: true,

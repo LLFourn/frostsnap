@@ -48,7 +48,7 @@ All three are an out-of-process find/assert losing to a slow app under contentio
 
 ## What today's machinery covers (and doesn't)
 
-- `isTransientFlake` (`simctl.dart`) retries ONLY connection-drop output (`Failed to fulfill
+- `isTransientFlake` (`fsim.dart`) retries ONLY connection-drop output (`Failed to fulfill
   SetFrameSync` / `Lost connection to device`) with no real-assertion signature. **None** of the three
   signatures above match, so they are never retried — they fail outright.
 - Runner default `effJobs = (jobs ?? files.length).clamp(1, files.length)` — every test at once. Not the

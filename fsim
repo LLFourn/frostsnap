@@ -1,11 +1,11 @@
 #!/bin/sh
-# simctl — the app-simulator CLI (sim-14). The single entrypoint for the Frostsnap app sim:
+# fsim — the app-simulator CLI (sim-14). The single entrypoint for the Frostsnap app sim:
 #
-#   ./simctl serve [--devices N] [--android] [--agent-owns-keyboard]   launch the session, keep it
+#   ./fsim serve [--devices N] [--android] [--agent-owns-keyboard]   launch the session, keep it
 #                                                        alive (--android runs on an emulator)
-#   ./simctl <cmd> ...                                   drive the running session (chain,
+#   ./fsim <cmd> ...                                   drive the running session (chain,
 #                                                        disconnect, tap, shot, down, …)
-#   ./simctl test [NAME]                                 run e2e driver test NAME (a
+#   ./fsim test [NAME]                                 run e2e driver test NAME (a
 #                                                        *_drive.dart stem), or all with no NAME
 #
 # `serve` and `test` launch/build the app, so we first run the project's shared gen-ensure
@@ -21,4 +21,4 @@ case "${1:-}" in
 esac
 
 cd "$root/frostsnapp"
-exec dart run test_driver/simctl.dart "$@"
+exec dart run test_driver/fsim.dart "$@"

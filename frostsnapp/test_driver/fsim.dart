@@ -8,11 +8,11 @@ import 'emulator.dart';
 import 'regtest.dart';
 import 'sim_harness.dart';
 
-// simctl: interactively drive the running sim app + devices through the SAME SimHarness
+// fsim: interactively drive the running sim app + devices through the SAME SimHarness
 // methods the keygen test uses — no second implementation that can drift.
 //
-//   simctl serve [--devices N]    launch the app + N devices ONCE, listen for commands
-//   simctl <cmd> ...              run ONE command against the running daemon, exit
+//   fsim serve [--devices N]    launch the app + N devices ONCE, listen for commands
+//   fsim <cmd> ...              run ONE command against the running daemon, exit
 //
 // Device commands take `--device N` (1-based, default 1) to pick which virtual device.
 // By default `serve` hands the keyboard to a human (real typing works; `enter` does not);
@@ -23,7 +23,7 @@ import 'sim_harness.dart';
 // socket, so the app stays alive across commands: send one, see the result, try the
 // next — a failed attempt is just followed by another command on the same live app
 // (no relaunch). `test` runs the driver e2e tests. See `_usage` for commands. Run via the
-// repo-root `./simctl` launcher (e.g. `./simctl serve`, `./simctl test keygen`).
+// repo-root `./fsim` launcher (e.g. `./fsim serve`, `./fsim test keygen`).
 
 String get _socketPath => '${simTmpRoot().path}/control.sock';
 
@@ -33,18 +33,18 @@ String get _socketPath => '${simTmpRoot().path}/control.sock';
 const _hostPlatforms = {'macos', 'linux', 'windows'};
 
 const _usage = '''
-simctl — drive the running sim app/devices through SimHarness.
-  simctl serve [--devices N] [--android] [--platform <d>] [--agent-owns-keyboard] [--no-regtest]
+fsim — drive the running sim app/devices through SimHarness.
+  fsim serve [--devices N] [--android] [--platform <d>] [--agent-owns-keyboard] [--no-regtest]
                                               launch app + listen (regtest ON by default;
                                               --no-regtest = offline)
-  simctl up [serve flags]                     idempotently bring the sim up + return once ready
+  fsim up [serve flags]                     idempotently bring the sim up + return once ready
                                               (no backgrounding/polling; reuses a matching live
                                               daemon, refuses a mismatched one — `down` first)
-  simctl up --android [--devices N]           bring the sim up on an Android emulator (boot/provision
+  fsim up --android [--devices N]           bring the sim up on an Android emulator (boot/provision
                                               one if needed) with regtest bridged over adb; drive the
-                                              devices via `./simctl` (below) or the in-app tray
-  simctl info                                 print the running daemon's shape (platform/count/regtest)
-  simctl test [NAMES...] [--android] [--jobs N] [--test-timeout SECS] [--nocapture|-v] [--junit PATH]
+                                              devices via `./fsim` (below) or the in-app tray
+  fsim info                                 print the running daemon's shape (platform/count/regtest)
+  fsim test [NAMES...] [--android] [--jobs N] [--test-timeout SECS] [--nocapture|-v] [--junit PATH]
                                               run e2e driver tests (stems; ALL if none) IN PARALLEL —
                                               host: one `dart run` each; --android: each SELF-BOOTS
                                               its OWN emulator + (if it uses regtest) bridges the
@@ -54,31 +54,31 @@ simctl — drive the running sim app/devices through SimHarness.
                                               TIMEOUT so the run never stalls; raw output goes to
                                               build/sim-failures/<test>/output.log unless
                                               --nocapture/-v streams it live; --junit writes XML
-  simctl regtest up|down|status               manage the shared regtest bitcoind+electrs+faucet
-  simctl regtest fund <addr> <sats> | mine [n] | balance | height | address | url   drive the faucet
-  simctl clean                                remove sim temp artifacts + reap any backend
+  fsim regtest up|down|status               manage the shared regtest bitcoind+electrs+faucet
+  fsim regtest fund <addr> <sats> | mine [n] | balance | height | address | url   drive the faucet
+  fsim clean                                remove sim temp artifacts + reap any backend
                                               (no daemon running)
-  simctl tap <label> [--regex]                tap a control by semantic label
-  simctl tap-until <label> <expect> [--regex] [--regex-expect]
-  simctl enter <label> <text> [--regex]       focus a field + type (agent-owns-keyboard only)
-  simctl wait <label> [--regex]               wait for a label to appear
-  simctl exists <label> [--regex]             report whether a label is present
-  simctl clipboard                            print the app clipboard text (e.g. a copied address)
-  simctl shot [path]                          whole-app screenshot (incl. tray)
-  simctl down                                 tear down (quit app, clean up)
+  fsim tap <label> [--regex]                tap a control by semantic label
+  fsim tap-until <label> <expect> [--regex] [--regex-expect]
+  fsim enter <label> <text> [--regex]       focus a field + type (agent-owns-keyboard only)
+  fsim wait <label> [--regex]               wait for a label to appear
+  fsim exists <label> [--regex]             report whether a label is present
+  fsim clipboard                            print the app clipboard text (e.g. a copied address)
+  fsim shot [path]                          whole-app screenshot (incl. tray)
+  fsim down                                 tear down (quit app, clean up)
  device commands (over the app channel — work on host AND emulator):
-  simctl devices                              list each device (number/id/connected)
-  simctl add-device                           add a device at runtime (joins the chain tail)
-  simctl chain                                print the connected chain order
-  simctl set-chain <n>...                     re-cable to exactly these devices, in order
-  simctl connect <n>                          plug device n into the tail of the chain
-  simctl disconnect <n>                       disconnect device n + everything downstream
-  simctl move-up <n> / move-down <n>          reorder device n within the chain
-  simctl hold <x> <y> [ms] [--device N]       device hold-to-confirm at a point
-  simctl swipe <x1> <y1> <x2> <y2> [ms] [--device N]   device swipe
-  simctl touch <x> <y> <down|up> [--device N]          device raw touch
-  simctl set-connected <true|false> [--device N]       plug/unplug a device
-  simctl screen <path> [--device N]           write the device framebuffer PNG
+  fsim devices                              list each device (number/id/connected)
+  fsim add-device                           add a device at runtime (joins the chain tail)
+  fsim chain                                print the connected chain order
+  fsim set-chain <n>...                     re-cable to exactly these devices, in order
+  fsim connect <n>                          plug device n into the tail of the chain
+  fsim disconnect <n>                       disconnect device n + everything downstream
+  fsim move-up <n> / move-down <n>          reorder device n within the chain
+  fsim hold <x> <y> [ms] [--device N]       device hold-to-confirm at a point
+  fsim swipe <x1> <y1> <x2> <y2> [ms] [--device N]   device swipe
+  fsim touch <x> <y> <down|up> [--device N]          device raw touch
+  fsim set-connected <true|false> [--device N]       plug/unplug a device
+  fsim screen <path> [--device N]           write the device framebuffer PNG
 (--regex matches the label as a substring; default is exact. --device selects the
  virtual device, 1-based, default 1. `serve` gives the keyboard to a human unless
  --agent-owns-keyboard is passed, which the driver needs for `enter`.)''';
@@ -106,11 +106,11 @@ Future<void> main(List<String> args) async {
 /// Remove all sim temp artifacts under the session root (disposable app dirs, screenshots, a
 /// stopped backend's files) and reap any running regtest backend — for clearing residue left by
 /// a killed session. Refuses while a serve daemon is live so it can't nuke an active session;
-/// `./simctl down` first.
+/// `./fsim down` first.
 Future<void> _clean() async {
   if (await _daemonAlive()) {
     stderr.writeln(
-      'simctl: a serve daemon is running — run `./simctl down` first',
+      'fsim: a serve daemon is running — run `./fsim down` first',
     );
     exit(1);
   }
@@ -141,7 +141,7 @@ Future<bool> _daemonAlive() async {
 
 // ---- up: one idempotent command that brings the sim up and returns only once ready ----
 
-/// `simctl up [serve flags]` — idempotent bring-up. If a live daemon already matches the requested
+/// `fsim up [serve flags]` — idempotent bring-up. If a live daemon already matches the requested
 /// shape (device count, regtest, keyboard mode) it's a no-op (`already:true`); on a MISMATCH it
 /// refuses with a clear "down first" error rather than reporting a wrong daemon ready; otherwise it
 /// launches `serve` DETACHED (which self-logs) and returns only once the control socket is live. The
@@ -196,7 +196,7 @@ Future<void> _up(List<String> args) async {
         'error':
             'a different-shape sim daemon is already running '
             '(platform=${live.platform}, count=${live.count}, regtest=${live.regtest}, '
-            'agentOwnsKeyboard=${live.keyboard}); run `./simctl down` first',
+            'agentOwnsKeyboard=${live.keyboard}); run `./fsim down` first',
       }),
     );
     exit(1);
@@ -205,13 +205,13 @@ Future<void> _up(List<String> args) async {
   // No daemon: launch `serve` detached via the repo-root launcher (which runs `just maybe-gen`
   // first, then self-logs every startup step to serve.log). We TAIL that log straight to our stdout,
   // so the caller watches the bring-up live (emulator boot, regtest bridge, gradle build, app
-  // launch) and we return the instant the serve writes its terminal SIMCTL_READY / SIMCTL_FAILED
+  // launch) and we return the instant the serve writes its terminal FSIM_READY / FSIM_FAILED
   // line — no socket polling, and a failure surfaces its real reason instead of a blank timeout.
   final logPath = '${simTmpRoot().path}/serve.log';
   try {
     File(logPath).deleteSync(); // don't tail a stale prior-run log
   } catch (_) {}
-  final launcher = '${Directory.current.parent.path}/simctl';
+  final launcher = '${Directory.current.parent.path}/fsim';
   final serve = await Process.start(launcher, [
     'serve',
     ...args,
@@ -226,7 +226,7 @@ Future<void> _up(List<String> args) async {
       stdout.write(log.substring(shown)); // stream new progress lines live
       shown = log.length;
     }
-    if (log.contains('SIMCTL_READY')) {
+    if (log.contains('FSIM_READY')) {
       stdout.writeln(
         jsonEncode({
           'ok': true,
@@ -237,10 +237,10 @@ Future<void> _up(List<String> args) async {
       );
       exit(0);
     }
-    final failAt = log.indexOf('SIMCTL_FAILED:');
+    final failAt = log.indexOf('FSIM_FAILED:');
     if (failAt >= 0) {
       final reason = log
-          .substring(failAt + 'SIMCTL_FAILED:'.length)
+          .substring(failAt + 'FSIM_FAILED:'.length)
           .split('\n')
           .first
           .trim();
@@ -406,13 +406,13 @@ Future<void> _writeJunit(
   final b = StringBuffer()
     ..writeln('<?xml version="1.0" encoding="UTF-8"?>')
     ..writeln(
-      '<testsuite name="simctl" tests="${results.length}" failures="$failed" '
+      '<testsuite name="fsim" tests="${results.length}" failures="$failed" '
       'errors="$timedOut" skipped="$skipped" retries="$retries" '
       'time="${_junitTime(elapsed)}">',
     );
   for (final r in results) {
     b.writeln(
-      '  <testcase classname="simctl" name="${_xmlEscape(r.test.name)}" '
+      '  <testcase classname="fsim" name="${_xmlEscape(r.test.name)}" '
       'retries="${r.retries}" time="${_junitTime(r.duration)}">',
     );
     if (r.skipped) {
@@ -499,7 +499,7 @@ Future<void> _runTests(List<String> args) async {
       final file = stems[name];
       if (file == null) {
         stderr.writeln(
-          'simctl test: no test "$name". Available: ${available.join(', ')}',
+          'fsim test: no test "$name". Available: ${available.join(', ')}',
         );
         exit(2);
       }
@@ -625,8 +625,8 @@ void _reportRetries(_TestResult r, int retries) {
   final s = retries == 1 ? 'retry' : 'retries';
   stderr.writeln(
     r.passed
-        ? 'simctl: ${r.test.name} recovered after $retries transient-flake $s'
-        : 'simctl: ${r.test.name} FAILED after ${retries + 1} attempts (transient startup flake persisted)',
+        ? 'fsim: ${r.test.name} recovered after $retries transient-flake $s'
+        : 'fsim: ${r.test.name} FAILED after ${retries + 1} attempts (transient startup flake persisted)',
   );
 }
 
@@ -950,7 +950,7 @@ Future<String> _resolvePlatform(List<String> args) async {
   return platform;
 }
 
-/// The interactive simctl-managed AVD (`up`/`serve`); created on first use, reused after.
+/// The interactive fsim-managed AVD (`up`/`serve`); created on first use, reused after.
 const _avdName = 'frostsnap_sim';
 
 /// The interactive emulator's FIXED port — kept clear of the self-booted test emulators' range
@@ -989,7 +989,7 @@ Future<String?> _runningEmulatorSerial(
 }
 
 /// Kill every running self-booted TEST emulator (best-effort) — a crashed test or runner can orphan one
-/// past its own reap, so `simctl clean` sweeps them and none linger.
+/// past its own reap, so `fsim clean` sweeps them and none linger.
 Future<void> _reapTestEmulators(String sdk) async {
   final res = await Process.run('$sdk/platform-tools/adb', ['devices']);
   for (final line in (res.stdout as String).split('\n')) {
@@ -1009,12 +1009,12 @@ Future<String> _ensureEmulatorBooted() async {
     excludeTestEmulators: true,
   );
   if (existing != null) {
-    stderr.writeln('simctl: reusing the running emulator $existing');
+    stderr.writeln('fsim: reusing the running emulator $existing');
     await provisionEmulator(sdk, existing);
     return existing;
   }
   final avd = await ensureAvd(sdk, _avdName);
-  stderr.writeln('simctl: booting emulator AVD "$avd" (cold, clean state) …');
+  stderr.writeln('fsim: booting emulator AVD "$avd" (cold, clean state) …');
   // Boot on the FIXED interactive port (clear of the self-booted test emulators' range) so
   // provisioning/probes target it even when test emulators run concurrently — a warm reuse (above)
   // keeps later `up`s in the same session fast.
@@ -1038,7 +1038,7 @@ Future<void> _serve(List<String> args) async {
   final wantRegtest = !args.contains('--no-regtest');
 
   // SELF-LOG every startup step to serve.log from the very start, ending in a terminal
-  // `SIMCTL_READY` / `SIMCTL_FAILED` line. `up` launches us detached (our stdio -> /dev/null) and
+  // `FSIM_READY` / `FSIM_FAILED` line. `up` launches us detached (our stdio -> /dev/null) and
   // TAILS this file to stream progress to its own stdout and learn the real outcome — so no caller
   // ever has to poll the socket or guess at liveness. `simTmpRoot()` (re)creates the session dir.
   final logSink = File('${simTmpRoot().path}/serve.log').openWrite();
@@ -1066,16 +1066,16 @@ Future<void> _serve(List<String> args) async {
   final extraDefines = <String, String>{};
   ServerSocket? controlProxy;
   try {
-    serveLog('simctl: resolving target …');
+    serveLog('fsim: resolving target …');
     platform = await _resolvePlatform(args);
     isHost = _hostPlatforms.contains(platform);
-    serveLog('simctl: target $platform (${isHost ? 'host' : 'emulator'})');
+    serveLog('fsim: target $platform (${isHost ? 'host' : 'emulator'})');
 
     // Best-effort: a regtest-bridge failure degrades to an OFFLINE session (logged) rather than
     // sinking the whole bring-up.
     if (!isHost && wantRegtest) {
       try {
-        serveLog('simctl: bridging regtest to $platform over adb …');
+        serveLog('fsim: bridging regtest to $platform over adb …');
         final backend = await ensureRegtestBackend();
         final adb = '${androidSdkRoot()}/platform-tools/adb';
         final ePort = electrumPort(backend.url);
@@ -1098,17 +1098,17 @@ Future<void> _serve(List<String> args) async {
         extraDefines['SIM_REGTEST_CONTROL_SOCKET'] =
             '127.0.0.1:${controlProxy.port}';
         serveLog(
-          'simctl: regtest bridged — electrs tcp:$ePort, faucet tcp:${controlProxy.port}',
+          'fsim: regtest bridged — electrs tcp:$ePort, faucet tcp:${controlProxy.port}',
         );
       } catch (e) {
-        serveLog('simctl: regtest bridge failed, continuing OFFLINE: $e');
+        serveLog('fsim: regtest bridge failed, continuing OFFLINE: $e');
         extraDefines.clear();
         await controlProxy?.close();
         controlProxy = null;
       }
     }
 
-    serveLog('simctl: launching the app on $platform (first build is slow) …');
+    serveLog('fsim: launching the app on $platform (first build is slow) …');
     // One session shape now (devices drive over the app channel everywhere); the host/emulator
     // branch is only about regtest — a host session uses _launchApp's shared node directly, an
     // emulator gets regtest via the adb bridge above (extraDefines) with _launchApp's regtest off.
@@ -1139,13 +1139,13 @@ Future<void> _serve(List<String> args) async {
       0,
     );
   } catch (e, st) {
-    serveLog('SIMCTL_FAILED: $e');
+    serveLog('FSIM_FAILED: $e');
     logSink.writeln('$st');
     await logSink.flush();
     exit(1);
   }
-  serveLog('SIMCTL_READY $_socketPath');
-  stdout.writeln('SIMCTL_READY $_socketPath');
+  serveLog('FSIM_READY $_socketPath');
+  stdout.writeln('FSIM_READY $_socketPath');
 
   // Idempotent AND awaitable: `down`, a signal, and the app-death watcher can all race in here;
   // they share ONE cleanup future, so EVERY caller awaits the same cleanup to FINISH before its
@@ -1175,7 +1175,7 @@ Future<void> _serve(List<String> args) async {
 
   // The daemon must not outlive its app: if the app dies (e.g. you close its window — the last
   // window closing terminates it and exits `flutter run`), shut down so the control socket goes
-  // away and `./simctl up` RELAUNCHES instead of reporting already:true. (The captured app output
+  // away and `./fsim up` RELAUNCHES instead of reporting already:true. (The captured app output
   // already logs the app finishing; awaiting shutdown() shares the one cleanup before exit.)
   unawaited(
     harness.appExitCode.then((_) async {
@@ -1251,7 +1251,7 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
               'ok': false,
               'error':
                   'enter is unavailable when a human owns the keyboard; type into the '
-                  'app directly, or relaunch with `./simctl serve --agent-owns-keyboard`',
+                  'app directly, or relaunch with `./fsim serve --agent-owns-keyboard`',
             },
             false,
           );
@@ -1269,7 +1269,7 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
       case 'clipboard':
         return ({'ok': true, 'text': await h.getClipboard()}, false);
       case 'info':
-        // The daemon's LAUNCH shape — `./simctl up` compares `count` against the requested
+        // The daemon's LAUNCH shape — `./fsim up` compares `count` against the requested
         // --devices to decide whether an already-live daemon satisfies the request. It's the
         // launch count, NOT the live count, so runtime adds (tray / add-device) don't flip
         // idempotence. `currentDevices` reports the live fleet (the app-side source of truth) for
@@ -1375,15 +1375,15 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
 // ---- client: run one command against the running daemon ----
 
 /// Connect to the daemon, waiting for it to come up rather than failing instantly:
-/// `./simctl serve` builds + launches the app (cold builds take a while), so a `./simctl <cmd>`
+/// `./fsim serve` builds + launches the app (cold builds take a while), so a `./fsim <cmd>`
 /// fired right after should just block until the control socket is ready — no external
-/// "wait for SIMCTL_READY" polling. Retries until [SIMCTL_WAIT_SECS] (default 300s), then
+/// "wait for FSIM_READY" polling. Retries until [FSIM_WAIT_SECS] (default 300s), then
 /// gives up so a genuine missing-daemon mistake still errors. Announces once so a wait is
 /// visible, not a silent hang.
 Future<Socket> _connectWaiting() async {
   final addr = InternetAddress(_socketPath, type: InternetAddressType.unix);
   final waitSecs =
-      int.tryParse(Platform.environment['SIMCTL_WAIT_SECS'] ?? '') ?? 300;
+      int.tryParse(Platform.environment['FSIM_WAIT_SECS'] ?? '') ?? 300;
   final deadline = DateTime.now().add(Duration(seconds: waitSecs));
   var announced = false;
   while (true) {
@@ -1392,7 +1392,7 @@ Future<Socket> _connectWaiting() async {
     } on SocketException {
       if (DateTime.now().isAfter(deadline)) rethrow;
       if (!announced) {
-        stderr.writeln('simctl: waiting for the sim daemon to come up …');
+        stderr.writeln('fsim: waiting for the sim daemon to come up …');
         announced = true;
       }
       await Future<void>.delayed(const Duration(milliseconds: 500));
@@ -1411,7 +1411,7 @@ Future<void> _client(List<String> args) async {
     socket = await _connectWaiting();
   } catch (e) {
     stderr.writeln(
-      'simctl: no daemon at $_socketPath (run `simctl serve`): $e',
+      'fsim: no daemon at $_socketPath (run `fsim serve`): $e',
     );
     exit(1);
   }
@@ -1427,7 +1427,7 @@ Future<void> _client(List<String> args) async {
   exit((jsonDecode(reply) as Map<String, dynamic>)['ok'] == true ? 0 : 1);
 }
 
-/// Translate `simctl <cmd> ...` argv into the wire command, or null if unrecognized.
+/// Translate `fsim <cmd> ...` argv into the wire command, or null if unrecognized.
 Map<String, dynamic>? _argsToCommand(List<String> args) {
   // Pull the valued option `--device <n>` (the virtual-device selector) out before
   // positional parsing, so its value isn't mistaken for a positional argument.

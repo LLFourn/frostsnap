@@ -5,8 +5,8 @@ import 'sim_harness.dart';
 // e2e wallet RECOVERY: create a 2-of-3 wallet, DELETE it from the app (the coordinator forgets it; the
 // devices keep their shares), then RECOVER it by plugging the devices in one at a time and driving the
 // WalletRecoveryFlow. Asserts the SAME wallet comes back — same name AND same receive address (same key),
-// and 2-of-3 is enforced (one key is "not enough"). Runs on both backends: `./simctl test recovery` (host
-// desktop, needs a display) and `./simctl test recovery --android` (its own self-booted emulator).
+// and 2-of-3 is enforced (one key is "not enough"). Runs on both backends: `./fsim test recovery` (host
+// desktop, needs a display) and `./fsim test recovery --android` (its own self-booted emulator).
 
 /// Open the receive sheet and read the derived address off its keyed Text (per-app, NOT the process-global
 /// clipboard). Returns to wallet home. The address is the wallet's identity here: a given key derives a

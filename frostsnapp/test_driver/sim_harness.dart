@@ -13,7 +13,7 @@
 // the [SimHarness] vs [AppSession] shapes it forced, are gone — see app-channel-only-device-driving.)
 //
 // Lives in test_driver/ so flutter_driver stays a dev dependency. Used by the e2e driver tests and
-// by `simctl`.
+// by `fsim`.
 
 import 'dart:async';
 import 'dart:convert';
@@ -48,7 +48,7 @@ import 'regtest.dart'
 /// PASSED, so a never-ran test can't masquerade as a silent pass.
 const simTestSkippedMarker = 'SIM_TEST_SKIPPED';
 
-/// Root for all sim temp artifacts — disposable app dirs, the simctl control socket,
+/// Root for all sim temp artifacts — disposable app dirs, the fsim control socket,
 /// ad-hoc screenshots — grouped under one folder instead of loose in the system temp
 /// root. Created on demand.
 Directory simTmpRoot() {
@@ -296,7 +296,7 @@ class Scenario {
     await ensureAvd(sdk, avd);
     // This instance OWNS the emulator + bridge only once it hands them to its AppSession (the
     // _emulatorSerial/_unbridge assignment below). Until then nothing else knows this serial — the runner's
-    // slot reap covers only `simctl test` workers, and a direct harness run has no reaper — so any throw
+    // slot reap covers only `fsim test` workers, and a direct harness run has no reaper — so any throw
     // before the transfer must clean up HERE or the emulator + bridge leak.
     Future<void> Function()? unbridge;
     try {
@@ -459,7 +459,7 @@ class AppSession {
 
   /// Resolves when the launched app process exits — e.g. its window was closed, which (with
   /// `applicationShouldTerminateAfterLastWindowClosed`) terminates the launched app process.
-  /// `simctl serve` watches this so the daemon never outlives a dead app (a zombie daemon would answer
+  /// `fsim serve` watches this so the daemon never outlives a dead app (a zombie daemon would answer
   /// `up` with already:true against nothing).
   Future<int> get appExitCode => _appProcess.exitCode;
 
@@ -958,7 +958,7 @@ class AppSession {
   }
 
   /// The app's live device numbers (1..N), via the `device-numbers` driver-data endpoint — the
-  /// app-side source of truth that BOTH the tray + button and `./simctl add-device` grow. App
+  /// app-side source of truth that BOTH the tray + button and `./fsim add-device` grow. App
   /// channel only, so it works on an emulator (no host sockets involved).
   Future<List<int>> deviceNumbers() async {
     final csv = await _requestData('device-numbers');
@@ -1490,7 +1490,7 @@ class AppSession {
 /// An app-channel handle to one virtual device (1-based [_number]): the same method surface the
 /// host-only `device-<n>.sock` client had, but every call goes over the app channel (driver-data → the
 /// in-process `simDevicePool`) — so a scenario drives a device IDENTICALLY on host and emulator, and
-/// `./simctl` device commands are no longer host-only. Returned by [AppSession.device].
+/// `./fsim` device commands are no longer host-only. Returned by [AppSession.device].
 class AppDevice {
   final AppSession _session;
   final int _number;

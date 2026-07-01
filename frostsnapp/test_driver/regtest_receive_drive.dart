@@ -8,7 +8,7 @@ import 'sim_harness.dart';
 // path — no faucet mock, no manual GUI tapping. `withRegtest: true` brings up (or attaches to)
 // the sim_regtest backend and points the app's regtest wallet at its electrs.
 //
-// Run: `./simctl test regtest_receive` (or `dart run test_driver/regtest_receive_drive.dart`).
+// Run: `./fsim test regtest_receive` (or `dart run test_driver/regtest_receive_drive.dart`).
 // Needs a display (Xvfb on Linux CI); first run downloads bitcoind + electrs.
 
 /// The keygen security-code confirm button on the device's KeygenCheck screen (sim-3 calibration).

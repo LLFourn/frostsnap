@@ -71,7 +71,7 @@ class SimTrayContent extends StatefulWidget {
 }
 
 class _SimTrayContentState extends State<SimTrayContent> {
-  // The fleet (which GROWS via the + button or an external simctl/driver-data add) and the
+  // The fleet (which GROWS via the + button or an external fsim/driver-data add) and the
   // chain config (mutable from outside the tray) have no change stream, so poll: every tick
   // re-reads the device list into [_devices] and rebuilds (build() re-reads chain()), so the
   // UI converges for EVERY writer — not just the tray's own mutations.
@@ -711,7 +711,7 @@ class _EmptyHint extends StatelessWidget {
 /// The "Test BTC" faucet card: a live balance read-out + electrum status, a Mine control, and a
 /// generic fund-an-address form. Wallet-agnostic by design — paste any receive address — so the
 /// tray needs no knowledge of the open wallet. Each action opens a short-lived [SimFaucet]
-/// connection (the backend serves one client at a time, so a held socket would starve `./simctl`).
+/// connection (the backend serves one client at a time, so a held socket would starve `./fsim`).
 class _FaucetCard extends StatefulWidget {
   final String socketPath;
 
@@ -1358,7 +1358,7 @@ class _DeviceScreenState extends State<_DeviceScreen> {
   }
 
   // A predominantly VERTICAL drag past the threshold becomes a swipe (the virtual device infers
-  // SlideUp/SlideDown — the same path `./simctl swipe` uses). Horizontal or near-stationary
+  // SlideUp/SlideDown — the same path `./fsim swipe` uses). Horizontal or near-stationary
   // movement finishes the original press as a tap/hold (a horizontal swipe would toggle the
   // device's debug log, which is out of scope here).
   void _pointerUp(Offset local, Size rendered) {

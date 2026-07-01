@@ -202,10 +202,10 @@ legacy-run +ARGS="": maybe-gen
     cd frostsnapp && BUNDLE_FIRMWARE=../../target/riscv32imc-unknown-none-elf/release/legacy.bin \
       flutter run $FLAVOR_FLAG --dart-define=BUILD_COMMIT="$BUILD_COMMIT" --dart-define=BUILD_VERSION="$BUILD_VERSION" {{ARGS}}
 
-# App-simulator tooling is NOT here — it lives in the repo-root `./simctl` CLI (sim-14), so
-# the sim doesn't accrete recipes in this shared justfile. `./simctl serve` runs the
-# interactive session, `./simctl <cmd>` drives it, `./simctl test [NAME]` runs the e2e driver
-# tests (`./simctl test` runs all). It reuses `just maybe-gen` for codegen. See test_driver/simctl.dart.
+# App-simulator tooling is NOT here — it lives in the repo-root `./fsim` CLI (sim-14), so
+# the sim doesn't accrete recipes in this shared justfile. `./fsim serve` runs the
+# interactive session, `./fsim <cmd>` drives it, `./fsim test [NAME]` runs the e2e driver
+# tests (`./fsim test` runs all). It reuses `just maybe-gen` for codegen. See test_driver/fsim.dart.
 # (`simulate`/`demo` below is the unrelated tools/widget_simulator, not this app sim.)
 
 build-appimage +ARGS="":

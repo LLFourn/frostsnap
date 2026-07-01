@@ -8,7 +8,7 @@ import 'sim_harness.dart';
 // It reaches the sheet through the reusable flows (createWallet → openDeviceBackup), then asserts
 // the button sits above the bottom system inset. The assertion needs a REAL bottom inset, so it only
 // catches the bug on the emulator (the 3-button nav bar) — on a desktop host bottomInset is 0 and it
-// trivially passes. Run: `./simctl test android_safe_area --android`.
+// trivially passes. Run: `./fsim test android_safe_area --android`.
 Future<void> main() async {
   await AppSession.runScenario('android-safe-area', (h) async {
     await h.createWallet(name: 'Backup');
