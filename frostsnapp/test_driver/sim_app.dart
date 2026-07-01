@@ -122,6 +122,15 @@ Future<String> _driverData(String? payload) async {
         'topInset': pad.top / dpr,
         'bottomInset': pad.bottom / dpr,
       });
+    case 'delete-wallet':
+      // Forget ALL wallets from the COORDINATOR — the same coord.deleteKey path the "Hold to Delete" UI's
+      // onComplete calls — WITHOUT touching the virtual devices' shares, so the recovery flow can restore
+      // the wallet from those devices. The wallet list is stream-driven (subKeyEvents), so the UI drops it.
+      final toDelete = coord.keyState().keys;
+      for (final key in toDelete) {
+        await coord.deleteKey(keyId: key.keyId());
+      }
+      return toDelete.length.toString();
     default:
       throw 'sim_app: unknown driver data request "$payload"';
   }

@@ -970,6 +970,12 @@ class AppSession {
   /// [SimHarness] overrides this to also connect the new device's host socket.
   Future<int> addDevice() async => int.parse(await _requestData('add-device'));
 
+  /// Delete every wallet from the COORDINATOR (via `coord.deleteKey` — the same path the "Hold to Delete"
+  /// UI triggers) while the virtual devices KEEP their shares, so a recovery flow can restore it from them.
+  /// Returns the number of wallets deleted.
+  Future<int> deleteWallet() async =>
+      int.parse(await _requestData('delete-wallet'));
+
   // ---- device driving over the APP channel (FRB pool) ----
   // These drive the in-process `simDevicePool` via driver-data, so a scenario drives a device the
   // SAME way on host and emulator — the one device transport. Coordinates are
