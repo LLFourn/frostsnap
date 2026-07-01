@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter_driver/flutter_driver.dart';
 
+import 'emulator.dart';
 import 'regtest.dart';
 import 'sim_harness.dart';
 
@@ -45,22 +46,16 @@ simctl — drive the running sim app/devices through SimHarness.
   simctl info                                 print the running daemon's shape (platform/count/regtest)
   simctl test [NAMES...] [--android] [--jobs N] [--test-timeout SECS] [--nocapture|-v] [--junit PATH]
                                               run e2e driver tests (stems; ALL if none) IN PARALLEL —
-                                              host: one `dart run` each; --android: each on its OWN
-                                              pool emulator + (if it uses regtest) its OWN chain
-                                              bridged to that emulator (degrades to however many
-                                              boot). --jobs caps parallelism (default = all at once);
+                                              host: one `dart run` each; --android: each SELF-BOOTS
+                                              its OWN emulator + (if it uses regtest) bridges the
+                                              shared chain to it. --jobs caps parallelism (default =
+                                              all at once);
                                               --test-timeout (default 900s) reaps a wedged test as
                                               TIMEOUT so the run never stalls; raw output goes to
                                               build/sim-failures/<test>/output.log unless
                                               --nocapture/-v streams it live; --junit writes XML
   simctl regtest up|down|status               manage the shared regtest bitcoind+electrs+faucet
   simctl regtest fund <addr> <sats> | mine [n] | balance | height | address | url   drive the faucet
-  simctl pool status|acquire [--cap N]|release <slot>|reconcile|reset
-                                              inspect/manage the test emulator pool (dedicated
-                                              per-test emulators, name-isolated from the interactive
-                                              one); the parallel test runner allocates from it.
-                                              `reconcile` drops leaked (dead-claimant) slots; the
-                                              runner self-heals on acquire, so this is rarely needed
   simctl clean                                remove sim temp artifacts + reap any backend
                                               (no daemon running)
   simctl tap <label> [--regex]                tap a control by semantic label
@@ -101,8 +96,6 @@ Future<void> main(List<String> args) async {
     await _runTests(args.skip(1).toList());
   } else if (args.first == 'regtest') {
     await runRegtest(args.skip(1).toList());
-  } else if (args.first == 'pool') {
-    await _pool(args.skip(1).toList());
   } else if (args.first == 'clean') {
     await _clean();
   } else {
@@ -122,16 +115,10 @@ Future<void> _clean() async {
     exit(1);
   }
   await stopRegtestBackend();
-  // Reap any pooled emulators before deleting their lockfile registry, else they orphan.
-  // Best-effort: a no-op when there's no Android SDK (host-only checkout).
+  // Reap any leftover self-booted test emulators (a crashed test/runner can orphan one past its own
+  // reap) before wiping tmp. Best-effort: a no-op when there's no Android SDK (host-only checkout).
   try {
-    final claimed = _claimedSlots();
-    if (claimed.isNotEmpty) {
-      final sdk = androidSdkRoot();
-      for (final slot in claimed) {
-        _releaseEmulator(sdk, slot);
-      }
-    }
+    await _reapTestEmulators(androidSdkRoot());
   } catch (_) {}
   final root = simTmpRoot();
   if (await root.exists()) await root.delete(recursive: true);
@@ -459,11 +446,10 @@ String _xmlEscape(String s) => s
 /// fails the whole run. Replaces the per-test justfile recipes — a new test is just a new
 /// `*_drive.dart` file, discovered here automatically.
 Future<void> _runTests(List<String> args) async {
-  // Runs the named tests (or ALL if none) IN PARALLEL. On `--android`, each test runs on its own
-  // DEDICATED pool emulator (Task 1's allocator); on host, each is a self-contained `dart run`. Each
-  // test owns its isolated state (a fresh emulator/app dir + its own per-session regtest chain, bridged
-  // to its emulator on `--android`), so there's no shared state to serialize around. `--jobs N` caps
-  // the parallelism; default = run them all at once (degrading to however many emulators boot).
+  // Runs the named tests (or ALL if none) IN PARALLEL. Each test is a self-contained `dart run` owning
+  // its isolated state (its own app instance(s) + per-session regtest chain); on `--android` each test
+  // SELF-BOOTS its own emulator(s) and bridges the chain to them. No shared state to serialize around.
+  // `--jobs N` caps the parallelism; default = run them all at once.
   final android = args.contains('--android');
   int? jobs; // null = "as many as possible"
   int? testTimeout; // per-test hard deadline, seconds
@@ -520,7 +506,7 @@ Future<void> _runTests(List<String> args) async {
   }
   final tests = _testSpecs(files);
 
-  // Default to running every test at once; the android pool degrades to however many emulators boot.
+  // Default to running every test at once.
   final effJobs = (jobs ?? files.length).clamp(1, files.length);
   // Per-test hard deadline so a wedged test (frozen app / unbounded wait) can't stall the run — it's
   // reaped and reported TIMEOUT instead. Generous by default: Android workers can queue behind a
@@ -529,34 +515,40 @@ Future<void> _runTests(List<String> args) async {
   final results = <_TestResult>[];
   final started = DateTime.now();
   stdout.writeln('running ${tests.length} tests');
-  if (android) {
-    await _runAndroidPool(tests, effJobs, results, deadline, noCapture);
-  } else {
-    // Build once before spawning workers, then each child direct-launches the same debug app binary
-    // with per-test runtime env. That keeps host `--jobs N` from serializing on `flutter run`.
-    final hostAppBinary = Platform.isMacOS
-        ? await AppSession.ensureMacosSimAppBuilt(logSink: stderr)
-        : null;
-    // Host: each test is a self-contained `dart run` (owns its PRIVATE per-session regtest chain), so
-    // up to `effJobs` run concurrently with no shared state. Concurrent output is captured + printed
-    // grouped on completion (interleaved live streams would be unreadable); a single test streams live.
-    await _runBounded(tests, effJobs, (test, workerSlot) async {
-      final (r, retries) = await runWithRetry<_TestResult>(
-        (_) => _runOneTest(
-          test,
-          hostAppBinary: hostAppBinary,
-          windowSlot: workerSlot,
-          capture: !noCapture,
-          deadline: deadline,
-        ),
-        (res) => res.failed && isTransientFlake(res.output),
-      );
-      r.retries = retries;
-      _printResult(r);
-      _reportRetries(r, retries);
-      results.add(r);
-    });
-  }
+  // Build the app ONCE up front (host binary / android APK), then run every test as a self-contained
+  // `dart run` owning its PRIVATE per-session regtest chain — up to `effJobs` concurrently, no shared
+  // state. Android tests SELF-BOOT their own emulator(s) from the worker slot (no pre-booted pool);
+  // that keeps host and android on the ONE dispatch path. Concurrent output is captured + printed grouped
+  // on completion (interleaved live streams would be unreadable); a single test streams live.
+  final hostAppBinary = !android && Platform.isMacOS
+      ? await AppSession.ensureMacosSimAppBuilt(logSink: stderr)
+      : null;
+  final androidAppBinary = android
+      ? await AppSession.ensureAndroidSimApkBuilt(logSink: stderr)
+      : null;
+  final sdk = android ? androidSdkRoot() : null;
+  await _runBounded(tests, effJobs, (test, workerSlot) async {
+    final (r, retries) = await runWithRetry<_TestResult>(
+      (_) => _runOneTest(
+        test,
+        flutterDevice: android ? 'android' : null,
+        sdk: sdk,
+        hostAppBinary: hostAppBinary,
+        androidAppBinary: androidAppBinary,
+        windowSlot: workerSlot,
+        capture: !noCapture,
+        deadline: deadline,
+      ),
+      (res) => res.failed && isTransientFlake(res.output),
+    );
+    // Android: reap the emulator(s) this slot self-booted — belt-and-suspenders so a timed-out/killed
+    // test (whose own teardown didn't run) can't orphan one. Deterministic serials from the slot.
+    if (android && sdk != null) await _reapSlotEmulators(sdk, workerSlot);
+    r.retries = retries;
+    _printResult(r);
+    _reportRetries(r, retries);
+    results.add(r);
+  });
 
   final failures = results.where((r) => !r.passed && !r.skipped).toList();
   _printFailures(failures);
@@ -566,100 +558,12 @@ Future<void> _runTests(List<String> args) async {
   exit(failures.isEmpty ? 0 : 1);
 }
 
-/// Run [files] across the emulator POOL: spawn up to [jobs] workers, each acquiring its OWN dedicated
-/// pool emulator (Task 1's allocator) and running queued tests on it (`pm clear` between for fresh
-/// app state), releasing it on finish. A worker that can't boot an emulator drops out — so this
-/// DEGRADES to however many emulators actually boot (down to one = serial) rather than failing. Per-
-/// test output is captured + printed grouped (workers interleave) when more than one test runs.
-Future<void> _runAndroidPool(
-  List<_TestSpec> tests,
-  int jobs,
-  List<_TestResult> results,
-  Duration deadline,
-  bool noCapture,
-) async {
-  final sdk = androidSdkRoot();
-  final adb = '$sdk/platform-tools/adb';
-  final queue = [...tests];
-  final workers = jobs.clamp(1, tests.length);
-
-  // Self-heal a pool poisoned by a previously crashed/killed run before any worker acquires, so a
-  // leaked claim never counts against the cap and shows up as "exhausted". (Acquire reconciles too;
-  // this just sweeps it once up front and reports it.)
-  final swept = _reconcilePool(sdk);
-  if (swept.isNotEmpty) {
-    stderr.writeln(
-      'simctl: reconciled ${swept.length} stale pool slot(s) $swept',
-    );
-  }
-
-  // Build the shared sim APK once up front; workers install it (`flutter run --use-application-binary`)
-  // instead of each running a Gradle build, so the build no longer serializes per test — only the slow
-  // test EXECUTION overlaps.
-  final androidAppBinary = await AppSession.ensureAndroidSimApkBuilt(
-    logSink: stderr,
-  );
-
-  var acquiredAny = false;
-
-  Future<void> runOne(String serial, _TestSpec test) async {
-    final (r, retries) = await runWithRetry<_TestResult>((_) async {
-      await Process.run(adb, [
-        '-s',
-        serial,
-        'shell',
-        'pm',
-        'clear',
-        'com.frostsnap',
-      ]);
-      return _runOneTest(
-        test,
-        serial: serial,
-        sdk: sdk,
-        androidAppBinary: androidAppBinary,
-        capture: !noCapture,
-        deadline: deadline,
-      );
-    }, (res) => res.failed && isTransientFlake(res.output));
-    r.retries = retries;
-    _printResult(r);
-    _reportRetries(r, retries);
-    results.add(r);
-  }
-
-  await Future.wait(
-    List.generate(workers, (_) async {
-      ({int slot, String serial}) emu;
-      try {
-        emu = await _acquireEmulator(sdk, cap: workers);
-      } catch (e) {
-        stderr.writeln(
-          'simctl: a pool worker could not boot an emulator ($e) — running with fewer in parallel',
-        );
-        return;
-      }
-      acquiredAny = true;
-      try {
-        while (queue.isNotEmpty) {
-          await runOne(emu.serial, queue.removeAt(0));
-        }
-      } finally {
-        _releaseEmulator(sdk, emu.slot);
-      }
-    }),
-  );
-
-  if (!acquiredAny) {
-    stderr.writeln('simctl: could not boot ANY pool emulator');
-    for (final test in queue) {
-      final r = await _recordSyntheticFailure(
-        test,
-        'FAILED',
-        'could not boot ANY pool emulator',
-      );
-      _printResult(r);
-      results.add(r);
-    }
+/// Kill any emulators worker [slot] could have self-booted (its device-index range), so a timed-out or
+/// killed test — whose own teardown didn't run — never orphans one. Idempotent (a harmless no-op for an
+/// index that never booted); deterministic serials keep it independent of the dead test process.
+Future<void> _reapSlotEmulators(String sdk, int slot) async {
+  for (var i = 0; i < maxInstancesPerTest; i++) {
+    await killEmulator(sdk, emulatorSerial(slot * maxInstancesPerTest + i));
   }
 }
 
@@ -723,7 +627,7 @@ void _reportRetries(_TestResult r, int retries) {
 /// [capture] the child's output is buffered (returned for grouped printing); else it inherits stdio.
 Future<_TestResult> _runOneTest(
   _TestSpec test, {
-  String? serial,
+  String? flutterDevice,
   String? sdk,
   String? hostAppBinary,
   String? androidAppBinary,
@@ -740,8 +644,10 @@ Future<_TestResult> _runOneTest(
     environment: {
       'SIM_TEST_NAME': test.name,
       'SIM_TEST_ARTIFACTS_DIR': test.artifactsDir.absolute.path,
-      if (serial != null) 'SIM_FLUTTER_DEVICE': serial,
-      if (serial != null) 'SIM_REQUIRE_FLUTTER_DEVICE': '1',
+      // For android, this is the generic 'android' — the TEST self-boots its own emulator(s) from the
+      // slot (sim-unify-app-host); for host it's unset (the test defaults to macos).
+      if (flutterDevice != null) 'SIM_FLUTTER_DEVICE': flutterDevice,
+      if (flutterDevice != null) 'SIM_REQUIRE_FLUTTER_DEVICE': '1',
       if (hostAppBinary != null) 'SIM_HOST_APP_BINARY': hostAppBinary,
       if (androidAppBinary != null) 'SIM_ANDROID_APP_BINARY': androidAppBinary,
       if (windowSlot != null) 'FROSTSNAP_SIM_WINDOW_SLOT': '$windowSlot',
@@ -767,14 +673,16 @@ Future<_TestResult> _runOneTest(
     timedOut = true;
     reason = 'timed out after ${deadline.inSeconds}s';
     await _writeOutputLog(test.artifactsDir, buf.toString());
+    // Self-booted android emulators (if any) are reaped by the caller from the slot; here just kill the
+    // dart process + its regtest dir (serial null → skip the emulator-specific adb reaping).
     await _captureTimeoutDiagnostics(
       test.artifactsDir,
       output: buf.toString(),
-      serial: serial,
+      serial: null,
       sdk: sdk,
       deadline: deadline,
     );
-    await _reapHungTest(proc, serial, sdk);
+    await _reapHungTest(proc, null, sdk);
     code = await proc.exitCode.timeout(_diagnosticTimeout, onTimeout: () => -1);
   }
   await Future.wait(
@@ -803,23 +711,6 @@ Future<_TestResult> _runOneTest(
     status: status,
     output: output,
     duration: DateTime.now().difference(started),
-    reason: reason,
-  );
-}
-
-Future<_TestResult> _recordSyntheticFailure(
-  _TestSpec test,
-  String status,
-  String reason,
-) async {
-  await _clearArtifacts(test.artifactsDir);
-  await _writeOutputLog(test.artifactsDir, '');
-  await _writeErrorIfAbsent(test.artifactsDir, '$status: $reason\n');
-  return _TestResult(
-    test: test,
-    status: status,
-    output: '',
-    duration: Duration.zero,
     reason: reason,
   );
 }
@@ -1050,12 +941,16 @@ Future<String> _resolvePlatform(List<String> args) async {
   return platform;
 }
 
-/// The simctl-managed AVD; created on first use, reused after.
+/// The interactive simctl-managed AVD (`up`/`serve`); created on first use, reused after.
 const _avdName = 'frostsnap_sim';
 
-/// Whether [serial] is running a pool AVD (the `frostsnap_sim_pool` prefix). The interactive path
-/// uses this to skip pool emulators — true AVD ownership, not a port/serial guess.
-Future<bool> _isPoolEmulator(String sdk, String serial) async {
+/// The interactive emulator's FIXED port — kept clear of the self-booted test emulators' range
+/// ([emulatorBasePort]+) so interactive bring-up never collides with a running test emulator.
+const _interactivePort = 5554;
+
+/// Whether [serial] is running a self-booted TEST emulator (the `frostsnap_sim_pool` AVD prefix that
+/// [emulatorAvd] assigns), so the interactive path can skip it — true AVD ownership, not a port guess.
+Future<bool> _isTestEmulator(String sdk, String serial) async {
   final r = await Process.run('$sdk/platform-tools/adb', [
     '-s',
     serial,
@@ -1068,476 +963,55 @@ Future<bool> _isPoolEmulator(String sdk, String serial) async {
 }
 
 /// The serial of a running INTERACTIVE emulator (e.g. `emulator-5554`), or null if none is up. With
-/// [excludePool], skips pool-owned emulators (by AVD name) so `up`/`serve` can never reuse one.
+/// [excludeTestEmulators], skips self-booted test emulators (by AVD name) so `up`/`serve` never reuses one.
 Future<String?> _runningEmulatorSerial(
   String sdk, {
-  bool excludePool = false,
+  bool excludeTestEmulators = false,
 }) async {
   final res = await Process.run('$sdk/platform-tools/adb', ['devices']);
   for (final line in (res.stdout as String).split('\n')) {
     final m = RegExp(r'^(emulator-\d+)\s+device$').firstMatch(line.trim());
     if (m == null) continue;
     final serial = m.group(1)!;
-    if (excludePool && await _isPoolEmulator(sdk, serial)) continue;
+    if (excludeTestEmulators && await _isTestEmulator(sdk, serial)) continue;
     return serial;
   }
   return null;
+}
+
+/// Kill every running self-booted TEST emulator (best-effort) — a crashed test or runner can orphan one
+/// past its own reap, so `simctl clean` sweeps them and none linger.
+Future<void> _reapTestEmulators(String sdk) async {
+  final res = await Process.run('$sdk/platform-tools/adb', ['devices']);
+  for (final line in (res.stdout as String).split('\n')) {
+    final m = RegExp(r'^(emulator-\d+)\s+device$').firstMatch(line.trim());
+    if (m == null) continue;
+    final serial = m.group(1)!;
+    if (await _isTestEmulator(sdk, serial)) await killEmulator(sdk, serial);
+  }
 }
 
 /// Boot an emulator (reusing a running one, else provisioning + booting [_avdName]) and return its
 /// serial once `sys.boot_completed` is set.
 Future<String> _ensureEmulatorBooted() async {
   final sdk = androidSdkRoot();
-  final existing = await _runningEmulatorSerial(sdk, excludePool: true);
+  final existing = await _runningEmulatorSerial(
+    sdk,
+    excludeTestEmulators: true,
+  );
   if (existing != null) {
     stderr.writeln('simctl: reusing the running emulator $existing');
-    await _provisionEmulator(sdk, existing);
+    await provisionEmulator(sdk, existing);
     return existing;
   }
-  final avd = await _ensureAvd(sdk);
+  final avd = await ensureAvd(sdk, _avdName);
   stderr.writeln('simctl: booting emulator AVD "$avd" (cold, clean state) …');
-  // Boot on the FIXED interactive port (clear of the pool's `_poolBasePort`+), so every wait/probe
-  // below targets `_interactiveSerial`. An untargeted `adb wait-for-device`/`adb shell` would return
-  // for / fail against a concurrently-running pool emulator ("more than one device"), so the
-  // interactive bring-up must not depend on being the only emulator connected.
-  //
-  // `-wipe-data` cold-boots a CLEAN package DB. Repeated `flutter run` installs otherwise corrupt
-  // the package state on a long-lived emulator — the launcher activity stops resolving (am start ->
-  // -92), so the app never launches and bring-up dies on the VM-service timeout. A clean boot is
-  // reliable; a warm reuse (above) keeps later `up`s in the same session fast.
-  await Process.start('$sdk/emulator/emulator', [
-    '-avd',
-    avd,
-    '-port',
-    '$_interactivePort',
-    '-no-snapshot',
-    '-wipe-data',
-    '-no-boot-anim',
-    '-gpu',
-    'auto',
-  ], mode: ProcessStartMode.detached);
-  await _waitForBoot(sdk, serial: _interactiveSerial);
-  await _provisionEmulator(sdk, _interactiveSerial);
-  return _interactiveSerial;
-}
-
-/// Put a booted emulator into the state the sim needs, BEFORE the app launches. Best-effort and
-/// idempotent (it runs on every bring-up, reused emulator or fresh boot):
-///   - a secure lock-screen PIN (0000) — Frostsnap requires a secure lock, as it keystores secrets
-///     behind device authentication;
-///   - the device left UNLOCKED and kept awake — a locked device gives the app no focused window,
-///     which ANRs it on launch ("Input dispatching timed out"); `stayon` stops it re-locking during
-///     the slow build/launch;
-///   - 3-button navigation — the app draws edge-to-edge, so the nav bar overlapping content is
-///     exactly the case we want exercised (a common source of safe-area bugs).
-Future<void> _provisionEmulator(String sdk, String serial) async {
-  final adb = '$sdk/platform-tools/adb';
-  Future<void> sh(List<String> cmd) =>
-      Process.run(adb, ['-s', serial, 'shell', ...cmd]);
-
-  // Keep the screen awake so the device can't sleep + re-lock during the build/launch.
-  await sh(['svc', 'power', 'stayon', 'true']);
-  await sh(['input', 'keyevent', 'KEYCODE_WAKEUP']);
-  // Unlock past the keyguard. Feed the PIN to the bouncer ONLY when the device is actually locked (a
-  // secure PIN set AND the keyguard engaged) — `dumpsys trust` reports `deviceLocked=1` exactly then.
-  // Typing it unconditionally was a bug: on a fresh emulator (no PIN, keyguard already dismissed) the
-  // `0000` has no PIN field, so it lands on whatever IS focused — the launcher's Google search box —
-  // and fires a stray web search. `deviceLocked` is 0 for an insecure/already-unlocked device, so the
-  // guard correctly skips it there and only types into a real bouncer.
-  await sh(['wm', 'dismiss-keyguard']);
-  final trust = await Process.run(adb, [
-    '-s',
-    serial,
-    'shell',
-    'dumpsys',
-    'trust',
-  ]);
-  if ((trust.stdout as String).contains('deviceLocked=1')) {
-    await sh(['input', 'text', '0000']);
-    await sh(['input', 'keyevent', 'KEYCODE_ENTER']);
-  }
-  // Set the PIN while unlocked + awake, so it's configured but the session stays unlocked (a no-op
-  // exit if one already exists). This is REQUIRED, not cosmetic: the app's SecureKeyManager
-  // (getOrCreateKey) fails fast with NO_LOCK_SCREEN unless `isDeviceSecure`, because its signing key
-  // is `setUserAuthenticationRequired(true)` — so the sim can't keygen/sign without a secure lock.
-  await sh(['locksettings', 'set-pin', '0000']);
-  // enable-exclusive --category disables the other nav-bar overlays (gestural/two-button) so we
-  // land on three-button cleanly rather than leaving several enabled.
-  await sh([
-    'cmd',
-    'overlay',
-    'enable-exclusive',
-    '--category',
-    'com.android.internal.systemui.navbar.threebutton',
-  ]);
-}
-
-String get _sysImage =>
-    'system-images;android-34;google_apis;${_hostArchIsArm() ? 'arm64-v8a' : 'x86_64'}';
-
-/// Install the emulator package + system image once (idempotent; gated on the image already being
-/// present, so per-AVD callers don't re-run the slow check). The first run is a large download.
-Future<void> _ensureSdkPackages(String sdk) async {
-  final abi = _hostArchIsArm() ? 'arm64-v8a' : 'x86_64';
-  if (File('$sdk/emulator/emulator').existsSync() &&
-      Directory(
-        '$sdk/system-images/android-34/google_apis/$abi',
-      ).existsSync()) {
-    return;
-  }
-  final sdkmanager = '$sdk/cmdline-tools/latest/bin/sdkmanager';
-  stderr.writeln(
-    'simctl: provisioning emulator + $_sysImage (one-time, large download) …',
-  );
-  // Accept any pending licenses, then install (feeding "y" covers per-package license prompts).
-  await _runFeeding(sdkmanager, ['--licenses'], 'y\n' * 50);
-  await _runFeeding(sdkmanager, [
-    '--install',
-    'emulator',
-    'platform-tools',
-    _sysImage,
-  ], 'y\n' * 50);
-}
-
-/// Ensure AVD [avd] exists (creating it if missing), installing the SDK packages first if needed.
-/// Idempotent. Used for the interactive AVD and for each pool AVD.
-Future<String> _ensureAvd(String sdk, {String avd = _avdName}) async {
-  final avdIni = '${Platform.environment['HOME']}/.android/avd/$avd.ini';
-  if (File(avdIni).existsSync()) return avd;
-  await _ensureSdkPackages(sdk);
-  final avdmanager = '$sdk/cmdline-tools/latest/bin/avdmanager';
-  stderr.writeln('simctl: creating AVD "$avd" …');
-  // "no" declines the custom-hardware-profile prompt.
-  await _runFeeding(avdmanager, [
-    'create',
-    'avd',
-    '-n',
-    avd,
-    '-k',
-    _sysImage,
-    '--device',
-    'pixel_6',
-    '--force',
-  ], 'no\n');
-  return avd;
-}
-
-bool _hostArchIsArm() {
-  try {
-    return (Process.runSync('uname', ['-m']).stdout as String).trim() ==
-        'arm64';
-  } catch (_) {
-    return false;
-  }
-}
-
-/// adb wait-for-device + poll `sys.boot_completed` for the SPECIFIC [serial] (every emulator boots on
-/// a known fixed port, so we always target one device). Targeting matters: an untargeted poll fails
-/// with "more than one device" once the pool and the interactive emulator run concurrently.
-Future<void> _waitForBoot(String sdk, {required String serial}) async {
-  final adb = '$sdk/platform-tools/adb';
-  await _run(adb, ['-s', serial, 'wait-for-device']);
-  final deadline = DateTime.now().add(const Duration(minutes: 5));
-  while (DateTime.now().isBefore(deadline)) {
-    final r = await Process.run(adb, [
-      '-s',
-      serial,
-      'shell',
-      'getprop',
-      'sys.boot_completed',
-    ]);
-    if ((r.stdout as String).trim() == '1') return;
-    await Future<void>.delayed(const Duration(seconds: 2));
-  }
-  throw StateError('emulator $serial did not finish booting within 5 minutes');
-}
-
-// ---- test emulator pool: a DEDICATED emulator per concurrent test (parallel-android-tests) ----
-
-/// The interactive emulator's FIXED port + serial. Kept below `_poolBasePort` so it never collides
-/// with a pool slot, and fixed so interactive bring-up can target it even when pool emulators run.
-const _interactivePort = 5554;
-const _interactiveSerial = 'emulator-$_interactivePort';
-
-/// Pool AVD name for slot [s] — the `frostsnap_sim_pool` prefix keeps it NAME-isolated from the
-/// interactive `frostsnap_sim` AVD, so a pooled test can never boot/clear the interactive wallet.
-String _poolAvd(int slot) => 'frostsnap_sim_pool_$slot';
-
-/// First pool emulator port. Kept clear of the interactive emulator's default 5554 so the pool can
-/// never collide with it. Slot s → port `_poolBasePort + 2s` → serial `emulator-(port)` (the
-/// emulator assigns the serial from `-port`), so each slot has a DETERMINISTIC serial — no
-/// boot-order/serial-diff race.
-const _poolBasePort = 5582;
-int _poolPort(int slot) => _poolBasePort + slot * 2;
-String _poolSerial(int slot) => 'emulator-${_poolPort(slot)}';
-Directory _poolDir() =>
-    Directory('${simTmpRoot().path}/pool')..createSync(recursive: true);
-
-/// The OS start-time of process [p] (`ps -o lstart`), or null if it is gone. Constant for a given
-/// process, so a RECYCLED pid — a new process that happens to reuse the number — reports a different
-/// start-time. Recorded with the claim and re-checked, this distinguishes the original claimant from
-/// an unrelated process that later inherited its pid.
-String? _pidStarted(int p) {
-  try {
-    final r = Process.runSync('ps', ['-p', '$p', '-o', 'lstart=']);
-    final s = (r.stdout as String).trim();
-    return r.exitCode == 0 && s.isNotEmpty ? s : null;
-  } catch (_) {
-    return null;
-  }
-}
-
-/// What a slot lock records: the claiming runner's PID, that PID's start-time (to catch pid reuse),
-/// the slot's serial (legibility / `pool status`), and when. JSON so the registry stays legible.
-String _slotClaimRecord(int slot) => jsonEncode({
-  'pid': pid,
-  'started': _pidStarted(pid),
-  'serial': _poolSerial(slot),
-  'ts': DateTime.now().millisecondsSinceEpoch,
-});
-
-/// True if slot [slot]'s lock is STALE — its claimant is gone, OR its pid was recycled by a different
-/// process (recorded start-time no longer matches) — so the lock leaked and the slot is safe to
-/// reclaim. A claimant mid-cold-boot is a live pid whose start-time still matches, so a booting slot is
-/// never reclaimed (this is why liveness is pid identity, not `adb devices`, which a booting emulator
-/// has not joined yet). A lock with no readable pid (empty / pre-format / corrupt) is reclaimed only
-/// once it has aged past the brief create→write window, so a lock being written right now is not stolen.
-bool _slotStale(int slot) {
-  final lock = File('${_poolDir().path}/slot-$slot.lock');
-  Map? rec;
-  try {
-    rec = jsonDecode(lock.readAsStringSync()) as Map;
-  } catch (_) {
-    rec = null;
-  }
-  final claimant = rec?['pid'] as int?;
-  if (claimant != null) {
-    final current = _pidStarted(claimant);
-    if (current == null) return true; // claimant gone
-    final recorded = rec!['started'] as String?;
-    // If the start-time wasn't captured at claim time, trust the live pid. Otherwise the claimant is
-    // live only if it's the SAME process that claimed (start-time matches) — a recycled pid reports a
-    // different start-time and reads as stale.
-    return recorded != null && current != recorded;
-  }
-  try {
-    return DateTime.now().difference(lock.lastModifiedSync()) >
-        const Duration(seconds: 30);
-  } catch (_) {
-    return false; // vanished under us — nothing to reclaim
-  }
-}
-
-/// Reclaim every leaked (stale) slot: kill any orphaned emulator and free the lock. MUST run holding
-/// the pool mutex. Returns the slots it reclaimed. This is what makes a stale claim from a crashed or
-/// killed run self-heal instead of wedging the pool until a manual `pool reset`.
-List<int> _reconcileStaleSlots(String sdk) {
-  final reclaimed = <int>[];
-  for (final slot in _claimedSlots()) {
-    if (_slotStale(slot)) {
-      stderr.writeln(
-        'simctl: reclaiming stale pool slot $slot (dead claimant)',
-      );
-      _releaseEmulator(
-        sdk,
-        slot,
-      ); // adb emu kill (no-op if already gone) + delete the lock
-      reclaimed.add(slot);
-    }
-  }
-  return reclaimed;
-}
-
-/// Run [body] holding an exclusive lock on the pool mutex, so reconcile+claim is atomic across
-/// concurrent runners (no two can reclaim or claim the same slot at once). The advisory lock is an
-/// OS file lock — released automatically if a runner dies — so the mutex itself can never leak the
-/// way the slot lockfiles can.
-T _withPoolLock<T>(T Function() body) {
-  final raf = File(
-    '${_poolDir().path}/pool.mutex',
-  ).openSync(mode: FileMode.write);
-  try {
-    raf.lockSync(FileLock.exclusive);
-    return body();
-  } finally {
-    try {
-      raf.unlockSync();
-    } catch (_) {}
-    raf.closeSync();
-  }
-}
-
-/// Atomically claim the lowest free pool slot in `[0, cap)`, or null if all are GENUINELY busy.
-/// Reconciles leaked (dead-claimant) slots first, so a stale lock self-heals on the next acquire
-/// rather than reporting the pool exhausted; the whole reconcile+claim runs under the pool mutex.
-int? _claimSlot(String sdk, int cap) => _withPoolLock<int?>(() {
-  _reconcileStaleSlots(sdk);
-  for (var slot = 0; slot < cap; slot++) {
-    final lock = File('${_poolDir().path}/slot-$slot.lock');
-    if (!lock.existsSync()) {
-      lock.writeAsStringSync(_slotClaimRecord(slot));
-      return slot;
-    }
-  }
-  return null;
-});
-
-/// Reconcile leaked slots outside of an acquire — the `pool reconcile` command and the test runner's
-/// startup sweep. Same self-heal as [_claimSlot] does inline, run for its side effect under the pool
-/// mutex. Returns the slots it reclaimed.
-List<int> _reconcilePool(String sdk) =>
-    _withPoolLock(() => _reconcileStaleSlots(sdk));
-
-void _releaseSlot(int slot) {
-  try {
-    File('${_poolDir().path}/slot-$slot.lock').deleteSync();
-  } catch (_) {}
-}
-
-Future<bool> _serialRunning(String sdk, String serial) async {
-  final res = await Process.run('$sdk/platform-tools/adb', ['devices']);
-  return (res.stdout as String)
-      .split('\n')
-      .any((l) => l.trim().startsWith('$serial\t'));
-}
-
-/// Acquire a DEDICATED test emulator: claim a free slot, ensure its pool AVD, cold-boot it on the
-/// slot's fixed port (deterministic serial), provision it. Returns the slot + serial. The caller MUST
-/// `_releaseEmulator(slot)` it (try/finally) to kill the instance and free the slot.
-Future<({int slot, String serial})> _acquireEmulator(
-  String sdk, {
-  required int cap,
-}) async {
-  final slot = _claimSlot(sdk, cap);
-  if (slot == null) throw StateError('emulator pool exhausted (cap $cap)');
-  final serial = _poolSerial(slot);
-  try {
-    await _ensureAvd(sdk, avd: _poolAvd(slot));
-    if (!await _serialRunning(sdk, serial)) {
-      stderr.writeln(
-        'simctl: pool slot $slot booting ${_poolAvd(slot)} → $serial …',
-      );
-      await Process.start('$sdk/emulator/emulator', [
-        '-avd',
-        _poolAvd(slot),
-        '-port',
-        '${_poolPort(slot)}',
-        '-no-snapshot',
-        '-wipe-data',
-        '-no-boot-anim',
-        '-gpu',
-        'auto',
-      ], mode: ProcessStartMode.detached);
-      await _waitForBoot(sdk, serial: serial);
-    }
-    await _provisionEmulator(sdk, serial);
-    return (slot: slot, serial: serial);
-  } catch (_) {
-    // KILL the instance before freeing the slot: if `Process.start` already booted it but boot/
-    // provision then threw, releasing only the lock would orphan a running emulator that
-    // `release`/`reset` can no longer reap (no claim). `emu kill` is a harmless no-op if unstarted.
-    _releaseEmulator(sdk, slot);
-    rethrow;
-  }
-}
-
-/// Kill the slot's emulator and free the slot (idempotent — safe to call on a failed acquire).
-void _releaseEmulator(String sdk, int slot) {
-  Process.runSync('$sdk/platform-tools/adb', [
-    '-s',
-    _poolSerial(slot),
-    'emu',
-    'kill',
-  ]);
-  _releaseSlot(slot);
-}
-
-/// The currently-claimed pool slots (from the lockfile registry), sorted.
-List<int> _claimedSlots() {
-  final dir = _poolDir();
-  if (!dir.existsSync()) return const [];
-  return dir
-      .listSync()
-      .map((e) => RegExp(r'slot-(\d+)\.lock$').firstMatch(e.path)?.group(1))
-      .whereType<String>()
-      .map(int.parse)
-      .toList()
-    ..sort();
-}
-
-/// `./simctl pool <status|acquire|release|reset>` — inspect/manage the test emulator pool (the
-/// allocator the parallel test runner uses). Separate from the interactive emulator by AVD name +
-/// this lockfile registry, so it can never touch the interactive wallet.
-Future<void> _pool(List<String> args) async {
-  final sdk = androidSdkRoot();
-  switch (args.isEmpty ? 'status' : args.first) {
-    case 'status':
-      stdout.writeln(
-        jsonEncode({
-          'ok': true,
-          'claimed': [
-            for (final s in _claimedSlots())
-              {'slot': s, 'serial': _poolSerial(s), 'stale': _slotStale(s)},
-          ],
-        }),
-      );
-    case 'acquire':
-      var cap = 4;
-      for (var i = 0; i < args.length - 1; i++) {
-        if (args[i] == '--cap') cap = int.parse(args[i + 1]);
-      }
-      final emu = await _acquireEmulator(sdk, cap: cap);
-      stdout.writeln(
-        jsonEncode({'ok': true, 'slot': emu.slot, 'serial': emu.serial}),
-      );
-    case 'release':
-      final slot = int.parse(args[1]);
-      _releaseEmulator(sdk, slot);
-      stdout.writeln(jsonEncode({'ok': true, 'released': slot}));
-    case 'reconcile':
-      // Drop leaked (dead-claimant) slots without disturbing live ones — recovery without the
-      // sledgehammer `reset`, which kills EVERY emulator including ones an active run is using.
-      stdout.writeln(
-        jsonEncode({'ok': true, 'reconciled': _reconcilePool(sdk)}),
-      );
-    case 'reset':
-      for (final slot in _claimedSlots()) {
-        _releaseEmulator(sdk, slot);
-      }
-      stdout.writeln(jsonEncode({'ok': true, 'reset': true}));
-    default:
-      stderr.writeln(
-        'simctl pool <status | acquire [--cap N] | release <slot> | reconcile | reset>',
-      );
-      exit(2);
-  }
-}
-
-/// Run a command, streaming its output; throw on non-zero exit.
-Future<void> _run(String exe, List<String> args) async {
-  final p = await Process.start(exe, args, mode: ProcessStartMode.inheritStdio);
-  if (await p.exitCode != 0) {
-    throw StateError('command failed: $exe ${args.join(' ')}');
-  }
-}
-
-/// Run a command, feeding [stdinText] to its stdin (for license/prompt acceptance), streaming its
-/// output. Best-effort: a non-zero exit logs but does not throw (e.g. `--licenses` exits non-zero
-/// when there is nothing to accept).
-Future<void> _runFeeding(
-  String exe,
-  List<String> args,
-  String stdinText,
-) async {
-  final p = await Process.start(exe, args);
-  p.stdin.write(stdinText);
-  await p.stdin.close();
-  unawaited(stdout.addStream(p.stdout));
-  unawaited(stderr.addStream(p.stderr));
-  final code = await p.exitCode;
-  if (code != 0) {
-    stderr.writeln('simctl: `$exe ${args.first}` exited $code (continuing)');
-  }
+  // Boot on the FIXED interactive port (clear of the self-booted test emulators' range) so
+  // provisioning/probes target it even when test emulators run concurrently — a warm reuse (above)
+  // keeps later `up`s in the same session fast.
+  final serial = await bootEmulator(sdk, avd: avd, port: _interactivePort);
+  await provisionEmulator(sdk, serial);
+  return serial;
 }
 
 // ---- daemon: holds one SimHarness, forwards commands to it ----
@@ -1596,7 +1070,7 @@ Future<void> _serve(List<String> args) async {
         final backend = await ensureRegtestBackend();
         final adb = '${androidSdkRoot()}/platform-tools/adb';
         final ePort = electrumPort(backend.url);
-        await _run(adb, [
+        await runInheritStdio(adb, [
           '-s',
           platform,
           'reverse',
@@ -1605,7 +1079,7 @@ Future<void> _serve(List<String> args) async {
         ]);
         extraDefines['SIM_REGTEST_ELECTRUM_URL'] = backend.url;
         controlProxy = await bridgeUnixOverTcp(regtestControlSocket);
-        await _run(adb, [
+        await runInheritStdio(adb, [
           '-s',
           platform,
           'reverse',

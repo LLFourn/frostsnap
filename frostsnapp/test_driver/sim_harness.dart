@@ -22,6 +22,16 @@ import 'dart:io';
 import 'package:flutter_driver/flutter_driver.dart';
 import 'package:frostsnap/sim_faucet.dart';
 
+import 'emulator.dart'
+    show
+        bootEmulator,
+        emulatorAvd,
+        emulatorPort,
+        emulatorSerial,
+        ensureAvd,
+        killEmulator,
+        maxInstancesPerTest,
+        provisionEmulator;
 import 'regtest.dart'
     show
         RegtestSession,
@@ -76,27 +86,19 @@ Future<void> growFleetTo(
 }
 
 /// A scenario's PRIVATE regtest chain (its own backend), OWNED by the [Scenario] and reaped on
-/// teardown. App instances launched against the scenario BORROW it (they never reap it). On Android
-/// the app's endpoints are bridged to its emulator; [_unbridge] tears that bridge down (null on host,
-/// where the app reaches the session's unix socket + electrum directly).
+/// teardown. App instances launched against the scenario BORROW it (they never reap it). On Android the
+/// app reaches it over a per-instance adb-reverse bridge set up + torn down by each [AppSession]; on host
+/// the app reaches the session's unix socket + electrum directly.
 class _ScenarioRegtest {
   final RegtestSession session;
 
-  /// The launch config that points the app's regtest wallet + tray faucet at THIS session.
+  /// The launch config that points the app's regtest wallet + tray faucet at THIS session (host: the
+  /// real endpoints; android: the fixed bridge loopback ports each emulator adb-reverses to the session).
   final Map<String, String> defines;
 
-  /// On Android, tears down the emulator bridge (close the faucet proxy + remove the adb reverses).
-  /// Null on host, where the app reaches the session's endpoints directly.
-  final Future<void> Function()? _unbridge;
+  _ScenarioRegtest(this.session, this.defines);
 
-  _ScenarioRegtest(this.session, this.defines, [this._unbridge]);
-
-  Future<void> stop() async {
-    try {
-      await _unbridge?.call();
-    } catch (_) {}
-    await session.stop();
-  }
+  Future<void> stop() => session.stop();
 }
 
 /// A running scenario: it owns the optional per-session regtest CHAIN and every app instance launched
@@ -151,35 +153,59 @@ class Scenario {
     }
   }
 
-  /// Run a DUAL-instance scenario: two app instances (A, B) that share ONE regtest chain — the
-  /// cross-wallet send/receive shape. HOST-ONLY: two instances of one app package can't coexist on a
-  /// single Android emulator (one install, one VM service, the fixed bridge ports collide), so off-host
-  /// this prints [simTestSkippedMarker] and returns WITHOUT running (the runner counts it skipped, not a
-  /// silent pass). Each instance gets a distinct window slot + diagnostics label and borrows the chain.
+  static bool _isHost(String device) =>
+      const {'macos', 'linux', 'windows'}.contains(device);
+
+  /// Run a scenario with [instances] app instances (each provisioned via [provisionInstance] — the ONE
+  /// backend-aware seam) sharing one regtest chain. The body is backend-AGNOSTIC: it drives the given
+  /// [AppSession]s identically whether each is a host window or its own android emulator. Runs on every
+  /// backend at any instance count up to [_maxInstances] (host = N windows, android = N emulators).
+  static Future<void> runInstances(
+    String name,
+    int instances,
+    Future<void> Function(List<AppSession> apps, Scenario s) body, {
+    int deviceCount = 1,
+    String? flutterDevice,
+    bool withRegtest = false,
+    Map<String, String> extraDartDefines = const {},
+  }) async {
+    if (instances > _maxInstances) {
+      throw StateError(
+        'runInstances($name): $instances instances exceeds the fixed max $_maxInstances — bump '
+        'Scenario._maxInstances (and provision more AVDs).',
+      );
+    }
+    await run(name, flutterDevice: flutterDevice, withRegtest: withRegtest, (
+      s,
+    ) async {
+      final apps = <AppSession>[];
+      for (var i = 0; i < instances; i++) {
+        apps.add(
+          await s.provisionInstance(
+            i,
+            totalInstances: instances,
+            deviceCount: deviceCount,
+            extraDartDefines: extraDartDefines,
+          ),
+        );
+      }
+      await body(apps, s);
+    });
+  }
+
+  /// Two app instances (A, B) sharing ONE regtest chain — the cross-wallet send/receive shape. A thin
+  /// [runInstances] wrapper (host = two windows, android = two emulators).
   static Future<void> runDual(
     String name,
     Future<void> Function(AppSession a, AppSession b, Scenario s) body, {
     String? flutterDevice,
-  }) async {
-    final device =
-        flutterDevice ?? Platform.environment['SIM_FLUTTER_DEVICE'] ?? 'macos';
-    if (!const {'macos', 'linux', 'windows'}.contains(device)) {
-      stdout.writeln(
-        '$simTestSkippedMarker: $name is host-only (two instances need two windows; got $device)',
-      );
-      return;
-    }
-    // Two windows in ONE test process: derive distinct slots from the worker's base slot so they don't
-    // stack (host-visual only; overlap is harmless).
-    final base =
-        int.tryParse(Platform.environment['FROSTSNAP_SIM_WINDOW_SLOT'] ?? '') ??
-        0;
-    await run(name, flutterDevice: flutterDevice, withRegtest: true, (s) async {
-      final a = await s.launch(windowSlot: base * 2, diagLabel: 'a');
-      final b = await s.launch(windowSlot: base * 2 + 1, diagLabel: 'b');
-      await body(a, b, s);
-    });
-  }
+  }) => runInstances(
+    name,
+    2,
+    (apps, s) => body(apps[0], apps[1], s),
+    flutterDevice: flutterDevice,
+    withRegtest: true,
+  );
 
   /// The scenario's shared faucet (its chain). The test drives funding/mining here. Throws if the
   /// scenario ran without regtest.
@@ -203,11 +229,12 @@ class Scenario {
     Map<String, String> extraDartDefines = const {},
     int? windowSlot,
     String? diagLabel,
+    String? device,
   }) async {
     final defines = {...extraDartDefines, ...?_regtest?.defines};
     final h = await AppSession.launch(
       deviceCount: deviceCount,
-      flutterDevice: flutterDevice,
+      flutterDevice: device ?? flutterDevice,
       extraDartDefines: defines,
       windowSlot: windowSlot,
     );
@@ -225,6 +252,80 @@ class Scenario {
     // keygen, so flows never race the per-device UI (e.g. the "Device name N" field) under load.
     await h._awaitChainRecognized();
     return h;
+  }
+
+  /// The FIXED stride for the per-instance device index (shared with the runner), so an emulator's
+  /// port/AVD (or a host window slot) never collides across concurrent workers OR instances.
+  static const _maxInstances = maxInstancesPerTest;
+
+  /// Provision app instance [index] of [totalInstances] for this scenario — THE single backend-aware
+  /// seam. HOST: a window-slot app on the shared machine. ANDROID: THIS instance's own emulator — boot it,
+  /// bridge the shared chain to it (per-serial adb-reverse), and run the app on it; its emulator + bridge
+  /// are reaped in [AppSession.tearDown]. The scenario body that receives these AppSessions is
+  /// backend-AGNOSTIC — the same code drives a host window or an android emulator (sim-unify-app-host).
+  Future<AppSession> provisionInstance(
+    int index, {
+    required int totalInstances,
+    int deviceCount = 1,
+    Map<String, String> extraDartDefines = const {},
+  }) async {
+    // A global device index: worker-slot × maxInstances + instance. Collision-free (fixed stride) across
+    // concurrent workers and instances, so each android emulator gets a distinct port/AVD.
+    final base =
+        int.tryParse(Platform.environment['FROSTSNAP_SIM_WINDOW_SLOT'] ?? '') ??
+        0;
+    final deviceIndex = base * _maxInstances + index;
+    final diagLabel = totalInstances > 1
+        ? String.fromCharCode('a'.codeUnitAt(0) + index)
+        : null;
+
+    if (_isHost(flutterDevice)) {
+      // Single-instance host inherits the worker's slot as-is (the common case); multi uses the derived
+      // slot so windows don't stack (host-visual only; overlap is harmless).
+      return launch(
+        deviceCount: deviceCount,
+        extraDartDefines: extraDartDefines,
+        windowSlot: totalInstances == 1 ? null : deviceIndex,
+        diagLabel: diagLabel,
+      );
+    }
+
+    final sdk = androidSdkRoot();
+    final avd = emulatorAvd(deviceIndex);
+    final serial = emulatorSerial(deviceIndex);
+    await ensureAvd(sdk, avd);
+    // This instance OWNS the emulator + bridge only once it hands them to its AppSession (the
+    // _emulatorSerial/_unbridge assignment below). Until then nothing else knows this serial — the runner's
+    // slot reap covers only `simctl test` workers, and a direct harness run has no reaper — so any throw
+    // before the transfer must clean up HERE or the emulator + bridge leak.
+    Future<void> Function()? unbridge;
+    try {
+      await bootEmulator(sdk, avd: avd, port: emulatorPort(deviceIndex));
+      await provisionEmulator(sdk, serial);
+      if (_regtest != null) {
+        unbridge = (await bridgeRegtestToEmulator(
+          _regtest.session,
+          serial,
+        )).unbridge;
+      }
+      final h = await launch(
+        deviceCount: deviceCount,
+        extraDartDefines: extraDartDefines,
+        diagLabel: diagLabel,
+        device: serial,
+      );
+      h._emulatorSerial = serial;
+      h._unbridge = unbridge;
+      return h;
+    } catch (_) {
+      try {
+        await unbridge?.call();
+      } catch (_) {}
+      try {
+        await killEmulator(sdk, serial);
+      } catch (_) {}
+      rethrow;
+    }
   }
 
   /// When `SIM_PAUSE_ON_FAILURE=1`, hold the launched app window(s) alive for `SIM_PAUSE_SECS` (default
@@ -289,21 +390,22 @@ class Scenario {
     final session = await startRegtestSession(
       Directory('${simTmpRoot().path}/rt-$pid'),
     );
-    final isHost = const {'macos', 'linux', 'windows'}.contains(device);
-    if (isHost) {
-      return _ScenarioRegtest(session, {
-        'SIM_REGTEST_ELECTRUM_URL': session.url,
-        'SIM_REGTEST_CONTROL_SOCKET': session.controlSocket,
-      });
-    }
-    try {
-      final bridge = await bridgeRegtestToEmulator(session, device);
-      return _ScenarioRegtest(session, bridge.defines, bridge.unbridge);
-    } catch (_) {
-      await session
-          .stop(); // bridge failed → reap the backend so it can't orphan
-      rethrow;
-    }
+    // The app's regtest endpoints: on host, the session's real electrum/control-socket directly; on
+    // android, the FIXED bridge loopback ports the shared APK bakes in — each instance's own emulator gets
+    // a per-serial adb-reverse of them to this session in [provisionInstance] (so N emulators share one
+    // chain without colliding). No bridge here anymore: the emulator(s) don't exist until provisioned.
+    return _ScenarioRegtest(
+      session,
+      _isHost(device)
+          ? {
+              'SIM_REGTEST_ELECTRUM_URL': session.url,
+              'SIM_REGTEST_CONTROL_SOCKET': session.controlSocket,
+            }
+          : {
+              'SIM_REGTEST_ELECTRUM_URL': androidBridgeElectrumUrl,
+              'SIM_REGTEST_CONTROL_SOCKET': androidBridgeControlSocket,
+            },
+    );
   }
 }
 
@@ -328,6 +430,12 @@ class AppSession {
   /// instance's artifacts under `<dir>/<label>/` so instances don't clobber each other; null keeps the
   /// flat single-instance layout.
   String? _diagLabel;
+
+  /// When this instance provisioned its OWN android emulator (the app-instance seam on android), the
+  /// emulator's serial + the teardown of its per-serial regtest bridge — reaped in [tearDown]. Both null
+  /// on host (a window instance) and on android tests without a chain (no bridge).
+  String? _emulatorSerial;
+  Future<void> Function()? _unbridge;
 
   AppSession(
     this._appProcess,
@@ -975,17 +1083,14 @@ class AppSession {
     String? flutterDevice,
     bool withRegtest = false,
     Map<String, String> extraDartDefines = const {},
-  }) => Scenario.run(
+  }) => Scenario.runInstances(
     name,
-    (s) async {
-      final h = await s.launch(
-        deviceCount: deviceCount,
-        extraDartDefines: extraDartDefines,
-      );
-      await body(h);
-    },
+    1,
+    (apps, s) => body(apps.single),
+    deviceCount: deviceCount,
     flutterDevice: flutterDevice,
     withRegtest: withRegtest,
+    extraDartDefines: extraDartDefines,
   );
 
   /// Device-screen point of the keygen security-code confirm button (the KeygenCheck screen, sim-3).
@@ -1238,15 +1343,17 @@ class AppSession {
       await tap('Close');
       return;
     }
-    final serial = Platform.environment['SIM_FLUTTER_DEVICE'];
-    if (serial == null) {
+    // No Close button → android: send BACK to THIS instance's OWN emulator. Use the instance's serial
+    // ([flutterDevice]), NOT the global SIM_FLUTTER_DEVICE — under the app-instance seam that env is the
+    // generic 'android' and each instance self-boots its own distinct emulator (a dual test has two).
+    if (Scenario._isHost(flutterDevice)) {
       throw StateError(
-        'no Close button and no SIM_FLUTTER_DEVICE: cannot dismiss the sheet',
+        'no Close button on host device "$flutterDevice": cannot dismiss the sheet',
       );
     }
     await Process.run('${androidSdkRoot()}/platform-tools/adb', [
       '-s',
-      serial,
+      flutterDevice,
       'shell',
       'input',
       'keyevent',
@@ -1333,6 +1440,17 @@ class AppSession {
       proc: _appProcess,
       appDir: appDir,
     );
+    // If this instance owns an android emulator: remove its regtest bridge, then kill the emulator (after
+    // the app is down). Best-effort so a bridge/kill hiccup never masks the app-cleanup error.
+    try {
+      await _unbridge?.call();
+    } catch (_) {}
+    final serial = _emulatorSerial;
+    if (serial != null) {
+      try {
+        await killEmulator(androidSdkRoot(), serial);
+      } catch (_) {}
+    }
     if (err != null) throw err;
   }
 }
