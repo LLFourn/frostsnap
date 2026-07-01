@@ -25,7 +25,7 @@ Future<void> main() async {
   await Scenario.runDual('regtest_dual_send', (a, b, s) async {
     // 1. A: create a (Regtest) 1-of-1 wallet and receive 1 BTC, confirmed.
     await a.createWallet(name: 'WalletA', devicePrefix: 'DevA');
-    final aAddr = await _openReceiveCopyAddress(a);
+    final aAddr = await _openReceiveAddress(a);
 
     final faucet = await s.faucet();
     try {
@@ -39,22 +39,26 @@ Future<void> main() async {
       await a.dismissSheetOrDialog();
       await a.waitForAbsent(RegExp('Share Address'));
 
-      // 2. B: create its own wallet and copy out a receive address. Read it into a Dart var NOW — the
-      //    host clipboard is SHARED by both app processes, so a later a.setClipboard would clobber it.
+      // 2. B: create its own wallet and read its receive address (per-app; see _openReceiveAddress).
       await b.createWallet(name: 'WalletB', devicePrefix: 'DevB');
-      final bAddr = await _openReceiveCopyAddress(b);
+      final bAddr = await _openReceiveAddress(b);
       await b.dismissSheetOrDialog();
       await b.waitForAbsent(RegExp('Share Address'));
 
-      // 3. A: send HALF to B's address. Seed the recipient via the (shared) clipboard, then paste.
-      await a.setClipboard(bAddr);
+      // 3. A: send HALF to B's address. TYPE it into A's autofocused recipient field (per-app), NOT the
+      //    shared clipboard — the macOS pasteboard is process-global, so under --jobs N the other parallel
+      //    tests clobber it and a Paste can send to the WRONG address (got-0).
       await a.tap('Send');
       await a.waitFor(
         RegExp('Paste|Later'),
         timeout: const Duration(seconds: 30),
       );
       if (await a.exists('Later')) await a.tap('Later');
-      await a.tapUntil('Paste', RegExp('Send Max|Custom'));
+      await a.waitFor(
+        'Paste',
+      ); // recipient step shown; its field is autofocused
+      await a.enterFocusedText(bAddr);
+      await a.tapUntil('Confirm recipient', RegExp('Send Max|Custom'));
       // Optional feerate dialog (only when no feerate is set): the custom tile is always selectable.
       if (await a.exists(RegExp('Custom'))) {
         await a.tapUntil(RegExp('Custom'), 'Confirm');
@@ -73,8 +77,13 @@ Future<void> main() async {
       await a.tap(RegExp('Sign transaction'));
 
       // 4. Sign on A's single device: plug it, swipe the review screens up to the 3s hold-to-sign, and
-      //    wait for the share counter to reach 1/1 (don't key off "Broadcast": its control prebuilds in
-      //    a faded cross-fade and can read as present before signing is actually done).
+      //    wait for the tx to reach the persistent "Signed" state. DON'T key off the "1/1" share counter:
+      //    this is the last (here, only) share, so the moment it lands signing is DONE and the UI replaces
+      //    the counter with "Signed" — the "1/1" frame can vanish before any paint captures it (with the
+      //    sim's 1Hz forced-frame heartbeat a sub-second state may never be painted at all). DON'T key off
+      //    "Broadcast" either: that control prebuilds in a faded cross-fade and reads present before signing
+      //    is done. "Signed" only renders once signingDone (wallet_tx_details.dart) and stays up until we
+      //    broadcast, so it is both correct and observable.
       await a.plug(1);
       var signed = false;
       for (var round = 0; round < 8 && !signed; round++) {
@@ -88,11 +97,11 @@ Future<void> main() async {
               _confirmY,
               const Duration(milliseconds: 3200),
             );
-        signed = await a.exists(RegExp(r'1/1'));
+        signed = await a.exists(RegExp('Signed'));
       }
       if (!signed) {
         throw StateError(
-          'A device did not contribute its signature share (1/1)',
+          'A device did not sign the transaction (never reached the Signed state)',
         );
       }
       await a.tap(RegExp('Broadcast'));
@@ -131,17 +140,19 @@ Future<void> main() async {
 }
 
 /// Open [h]'s Receive sheet (dismissing the fresh-wallet "secure your wallet" nudge with Later) and
-/// return the wallet's regtest (bcrt1) address, read off the clipboard after its Copy button. The
-/// address Text has no stable semantic label, so the clipboard is the portable way to extract it.
-Future<String> _openReceiveCopyAddress(AppSession h) async {
+/// return the wallet's regtest (bcrt1) address, read PER-APP off the Share Address sheet's keyed Text —
+/// NOT via Copy→system clipboard, which is process-global and raced by the other parallel test apps.
+Future<String> _openReceiveAddress(AppSession h) async {
   await h.tap(RegExp('Receive'));
   await h.waitFor('Later');
   await h.tap('Later');
   await h.waitFor(RegExp('Share Address'));
-  await h.tap('Copy');
   var address = '';
   for (var i = 0; i < 10 && !address.startsWith('bcrt1'); i++) {
-    address = (await h.getClipboard()).trim();
+    // spacedHex groups the address with whitespace; strip it back to the raw address.
+    address = (await h.getTextByKey(
+      'receiveAddress',
+    )).replaceAll(RegExp(r'\s'), '');
     if (!address.startsWith('bcrt1')) {
       await Future<void>.delayed(const Duration(milliseconds: 300));
     }

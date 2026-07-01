@@ -64,15 +64,18 @@ Future<void> main() async {
       await h.waitFor(RegExp('Receive'));
 
       // 2. Receive 1 BTC to the wallet's real address. Open Receive (a "secure your wallet" nudge
-      //    intercepts a fresh wallet — choose Later), copy the address off the clipboard.
+      //    intercepts a fresh wallet — choose Later), then read the address off the Share Address sheet.
       await h.tap(RegExp('Receive'));
       await h.waitFor('Later');
       await h.tap('Later');
       await h.waitFor(RegExp('Share Address'));
-      await h.tap('Copy');
       var address = '';
       for (var i = 0; i < 10 && !address.startsWith('bcrt1'); i++) {
-        address = (await h.getClipboard()).trim();
+        // Read the address per-app off its keyed Text (spacedHex groups it with whitespace) — NOT via
+        // Copy→system clipboard, which is process-global and raced by the other parallel test apps.
+        address = (await h.getTextByKey(
+          'receiveAddress',
+        )).replaceAll(RegExp(r'\s'), '');
         if (!address.startsWith('bcrt1')) {
           await Future<void>.delayed(const Duration(milliseconds: 300));
         }
@@ -106,19 +109,25 @@ Future<void> main() async {
         final nodeAddr = await faucet.faucetAddress();
         final signers = [1, 2];
 
-        // The app's recipient field is pasted from the clipboard — seed it portably (no pbcopy/xclip).
-        await h.setClipboard(nodeAddr);
-
-        // Open Send (the same backup nudge may intercept; choose Later), paste the recipient.
+        // Open Send (the same backup nudge may intercept; choose Later).
         await h.tap('Send');
         await h.waitFor(
           RegExp('Paste|Later'),
           timeout: const Duration(seconds: 30),
         );
         if (await h.exists('Later')) await h.tap('Later');
-        // Paste advances to the amount step — unless no feerate is set yet, in which case a feerate
-        // dialog intercepts first (regtest's fallbackfee usually pre-sets one, so it's optional).
-        await h.tapUntil('Paste', RegExp('Send Max|Custom'));
+        await h.waitFor(
+          'Paste',
+        ); // recipient step shown; its field is autofocused
+        // TYPE the recipient into the autofocused field via this app's OWN VM service — do NOT go through
+        // the system clipboard. The macOS pasteboard is PROCESS-GLOBAL, so under --jobs N the parallel test
+        // apps share one clipboard: a setClipboard+Paste could land ANOTHER test's node address, paying it
+        // instead and leaving this test's nodeAddr at 0 (the got-0 root cause). nodeAddr is straight from
+        // the faucet, so typing it is race-free.
+        await h.enterFocusedText(nodeAddr);
+        // "Confirm recipient" advances to the amount step — unless no feerate is set yet, in which case a
+        // feerate dialog intercepts first (regtest's fallbackfee usually pre-sets one, so it's optional).
+        await h.tapUntil('Confirm recipient', RegExp('Send Max|Custom'));
 
         // Feerate dialog (only when no feerate is set): the ETA tiles need fee estimates regtest may
         // lack, but the custom tile is always selectable — pick it and confirm its pre-filled value.
@@ -145,15 +154,21 @@ Future<void> main() async {
 
         // 4. Confirm the tx ON each signing device, ONE CONNECTED AT A TIME (as on real hardware): plug
         //    it (unplugging the previous), swipe up through the review screens to the 3s hold-to-sign,
-        //    and wait for the gotShares/threshold counter to tick to THIS signer's share. EVERY signer
-        //    must land its share — the last reaches "$_threshold/$_threshold" (all shares in) — before
-        //    we broadcast. NB: don't key the last signer off "Broadcast": that control is prebuilt in a
-        //    faded AnimatedCrossFade branch whose semantics leak on Android, so it reads as "present"
-        //    before signing is actually done — keying off it lets the loop broadcast an UNSIGNED tx.
+        //    and wait for this signer's share to land. INTERMEDIATE signers tick the gotShares/threshold
+        //    counter ("1/$_threshold", ...) which STAYS up because signing isn't done yet. The LAST signer
+        //    completes signing, which flips the tile to "Signed" and REMOVES the counter — so its
+        //    "$_threshold/$_threshold" frame can vanish before any paint captures it (with the sim's 1Hz
+        //    forced-frame heartbeat a sub-second state may never be painted at all). Key the last share off
+        //    the persistent "Signed" state instead. NOT "Broadcast": that control is prebuilt in a faded
+        //    AnimatedCrossFade branch whose semantics leak on Android, so it reads "present" before signing
+        //    is done; "Signed" only renders once signingDone (wallet_tx_details.dart) and stays until broadcast.
         for (var i = 0; i < signers.length; i++) {
           if (i > 0) await h.unplug(signers[i - 1]);
           await h.plug(signers[i]);
-          final signed = RegExp('${i + 1}/$_threshold');
+          final isLast = i == signers.length - 1;
+          final signal = isLast
+              ? RegExp('Signed')
+              : RegExp('${i + 1}/$_threshold');
           var ok = false;
           for (var round = 0; round < 8 && !ok; round++) {
             await h
@@ -166,12 +181,12 @@ Future<void> main() async {
                   _confirmY,
                   const Duration(milliseconds: 3200),
                 );
-            ok = await h.exists(signed);
+            ok = await h.exists(signal);
           }
           if (!ok) {
             throw StateError(
               'signer ${signers[i]} did not contribute its signature share '
-              '(threshold counter never reached ${i + 1}/$_threshold)',
+              '(${isLast ? 'never reached the Signed state' : 'counter never reached ${i + 1}/$_threshold'})',
             );
           }
         }

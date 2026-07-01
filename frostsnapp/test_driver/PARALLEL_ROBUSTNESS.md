@@ -115,3 +115,146 @@ P1 is concrete and feasible, and the connection-recognition-synchronous design i
 primitive that waits, so no test re-implements the wait). Recommend a SEPARATE implementation plan —
 recognition-synchronous `connect`/`disconnect` first, then the positive semantics-ready gate — keeping
 this investigation analysis-only per its non-goals.
+
+---
+
+## Validation results (sim-harness-readiness-gates, Task 3)
+
+Measured on host (18c/128 GiB) with 2 unrelated Frostsnap apps live — mild extra render load; the
+before/after comparison is fair (load constant across both). Full suite; before = pre-fix baseline
+(`12ec1f5^`), after = recognition-sync + semantics-ready gates.
+
+### Before vs after at `--jobs 5` (3 reps each)
+
+| version | failed per rep (/6) | total |
+|---|---|---|
+| before | 0, 2, 3 | 5 failed / 18 |
+| after  | 2, 3, 0 | 5 failed / 18 |
+
+No change in rate — BUT the failure SIGNATURES shifted. The launch races the gates target —
+`No root widget is attached`, `Device name N never appeared` — are GONE after the fix. The residual
+after-fix failures are a DIFFERENT class the gates don't address: `device never confirmed the security
+code` (the keygen hold-to-confirm gesture not registering) and 20–90s `waitFor`/driver timeouts (the
+apps are simply too slow under load). Before-fix failures included those PLUS the now-eliminated launch
+races and slow-sync `waitFor` timeouts.
+
+### After-fix calibration (highest reliable parallelism)
+
+| `--jobs` | reps | result |
+|---|---|---|
+| 1 | many (whole session) | reliable — always green |
+| 2 | 2+ | flaky (a rep failed 1) |
+| 3 | 3 | flaky (a rep failed 2) |
+| 5 | 3 | flaky (most reps fail) |
+
+Only `--jobs 1` is reliable on this (contended) host. An idle host would raise the ceiling, but not
+measured.
+
+### Conclusion — the ACTUAL root cause (supersedes the "render ceiling / cap to serial" guesses above)
+
+Both the "fragility" framing AND the later "render-throughput ceiling → cap to serial / render-quiescence"
+reading were WRONG — and inverted: the problem is not too MUCH rendering, it's too LITTLE.
+
+Tracing a reproduced `device never confirmed` failure with reliable (forced-frame) screenshots showed the
+app had actually reached `Confirm on device ✓` and was stuck *before* the "Final check / Yes" dialog —
+then RECOVERED ~48s later as load lifted (so: not a hang, a stall). The stall is in `wallet_create.dart`
+keygen: `await keygenController.removeActionNeeded(id)` → `awaitDismissed()` blocks on the action dialog's
+POP, which only advances on a PAINTED frame (the dialog pops itself via a frame-gated `ListenableBuilder`
++ exit animation). The sim window launches backgrounded (`NO_ACTIVATE`), and macOS PAUSES vsync for a
+backgrounded/occluded window — so under load it stops painting: the dialog never dismisses, the keygen
+`await` never returns, and (same cause) the `flutter_driver` semantics tree the harness searches goes
+stale. ONE condition — a non-painting window — produced ALL three symptoms (stale screenshots, stale
+finds, stuck keygen). The heavy concurrent tests (`regtest_send`/`regtest_dual_send` signing) just
+desynchronize the phases so a confirm overlaps a load spike; homogeneous ×10 runs never hit it.
+
+**Fix (landed; sim-harness only — NO production keygen change):** a slow **1 Hz `scheduleForcedFrame()`
+heartbeat** in agent-driven sim mode (`sim_app.dart`) keeps the frame pipeline alive even when the engine
+has disabled frames (`framesEnabled == false`), so frame-gated work un-sticks without a 60fps burn. Plus
+the failure-diagnostics screenshot now renders OFF-SCREEN via `RenderRepaintBoundary.toImage` and forces a
+frame first, so a capture is fresh regardless of window state (the old `driver.screenshot()` + osascript
+foreground returned stale frames and broke for multi-window scenarios).
+
+**Consequence — the heartbeat sets an OBSERVATION FLOOR (and this is the residual signing flake):** a
+backgrounded window now repaints only on the 1 Hz beat, so the semantics tree is at most ~1 s stale. Any
+BOUNDED "is it there now?" read SHORTER than a beat can poll entirely within the gap and miss a state that
+already changed but hasn't repainted. The gate reviewer reproduced exactly this where I'd overclaimed
+"reliable": `regtest_dual_send` failing 2/2 at `--jobs 5` with `A device did not contribute its signature
+share (1/1)` (passes standalone) — the share HAD landed, but the signing loop's `exists('1/1')` was an
+**800 ms** check that expired before the next forced frame painted the counter, so it gave up. (My own ~17
+reps stayed green only by luck — the beat happened to land inside the 800 ms.) So the heartbeat fixed the
+frame-STARVATION class but, at 1 Hz, ANY sub-second semantics read becomes a heartbeat race. The earlier
+"12/12 / parallel reliable" headline was therefore premature.
+
+**Follow-up fix (the floor made explicit):** `sim_harness.dart` now has `_heartbeat` (1 s) and `_minObserve`
+(2 s = 2 beats, for margin) constants, and every bounded semantics read is raised to ≥ a beat — `exists`
+800 ms → 2 s, the `tapUntil` re-check 500 ms → 2 s, and `_settledBottomRight`'s sample interval 120 ms → 1 s
+(so two "settled" reads come from DIFFERENT frames). Reads that bypass the semantics tree and hit
+coordinator state directly over the VM service (`recognized-device-ids`, `chain`) are unaffected — their
+100 ms polls stay. No scenario changed; the fix is in the harness primitives, so it covers every `exists`
+caller at once. The MECHANISM is the proof here: a sub-beat read cannot reliably observe a once-per-beat
+repaint; raising it past a beat removes the race.
+
+**What the re-measurement actually found (and a real app bug it surfaced):** the first `--jobs 5` rep after
+the floor fix had `regtest_dual_send` reach `DRIVE_OK` — i.e. the signing-share race did NOT recur; the
+floor fix worked — yet the rep was still marked FAILED. The cause was a SEPARATE, pre-existing app bug, not
+a harness issue: `_WalletSendPageState.scrollToTop` (`wallet_send.dart`) guarded a post-delay scroll with
+`if (context.mounted)`, but that method has no `context` parameter, so `context` is the `State.context`
+GETTER — which THROWS "this widget has been unmounted" on a defunct State. The send page is popped during
+the `Future.delayed` (the send just finished), so the callback fired post-dispose and the guard itself threw
+an unhandled exception. flutter_driver surfaces an app-side unhandled exception to the driving process, so
+the test correctly went non-zero (loose exceptions SHOULD fail the test). Fixed by using the State's own
+non-throwing `mounted`. This is exactly the harness earning its keep: the parallel load shook out a latent
+production crash that single-runs hid.
+
+- The recognition-sync + semantics-ready gates and the heartbeat all stay; this floor fix is what makes the
+  heartbeat actually deliver parallel reliability rather than trade one race for another.
+- `--jobs` default: **left as-is (all-at-once)** (resolves the earlier doc-vs-code default mismatch: the doc
+  no longer claims a serial default).
+- `SIM_PAUSE_ON_FAILURE=1` (hold a failed window alive + capture a screenshot trail) is kept as the
+  diagnostic that made the stall observable — it's what showed the stall recovering rather than hanging.
+
+### Task 3 continued — the signing false-negative (the ACTUAL dual_send fix) + the got-0 clipboard race (FIXED)
+
+The floor fix above did NOT resolve `regtest_dual_send`. Re-measuring after it, dual_send reached `DRIVE_OK`
+in some reps but still failed `A device did not contribute its signature share (1/1)` in others. Reliable
+forced-frame screenshots settled it: at the failure the app had **fully signed** — "Signed", "Tap to
+broadcast", confetti — signing WORKED. The failure was a harness FALSE NEGATIVE: the signing loop keyed off
+the **transient `1/1` share-counter**, which the 1 Hz heartbeat can skip painting entirely (a sub-heartbeat
+UI state may never be composited between two forced frames), so `exists('1/1')` never saw it even though
+signing had completed and the UI had already advanced to "Signed".
+
+The rule this teaches is stronger than the floor fix: **you can only reliably observe UI states that PERSIST
+for ≥ one heartbeat.** The `1/1` counter doesn't. Fix: key the LAST share off the persistent `'Signed'`
+completion state (renders only once `signingDone` — `wallet_tx_details.dart` — and stays until broadcast),
+not the transient counter; INTERMEDIATE shares keep the `i/threshold` counter (it stays up while signing is
+unfinished). Applied to `regtest_dual_send_drive.dart` (1-of-1) and `regtest_send_drive.dart` (last of the
+2-of-3). Validation: `regtest_dual_send` green **5/5 at `--jobs 5`** (was ~3/5 reps failing); signing passes
+every rep.
+
+**got-0 — ROOT-CAUSED and FIXED (a shared-clipboard race).** With signing reliable, `regtest_send` reached
+its post-broadcast on-chain cross-check every run, where it intermittently threw `node address should have
+received ~1 BTC; got 0` (~1/4 at `--jobs 5`, reproduced on a clean host). It is NOT electrs indexing lag
+(that hypothesis was refuted — an instrumented per-second poll showed the balance present and correct on the
+FIRST poll even with 15/18 cores burned) and NOT signing. The captured `GOT0-DIAG` timeline was decisive:
+`received=0` flat for the full 30 s at a CONSTANT height, while the app had already shown `'Sent'` — so the
+app's tx confirmed at that height, just did not pay `nodeAddr`.
+
+Root cause: the harness seeds the recipient with `setClipboard(addr)` + tap **Paste**, and reads receive
+addresses with tap **Copy** + `getClipboard`. Flutter's `Clipboard` is the macOS **system pasteboard — one
+global object shared by all N app processes** under `--jobs N`. So parallel tests RACE it: a concurrent
+`setClipboard` clobbers another test's recipient between its set and its Paste → that test pays the WRONG
+(another test's) address → its own `nodeAddr` stays 0. Every fact fits: `'Sent'` (paid, wrong address), flat
+0 (never received), only under parallel load, ~1/4.
+
+Fix — **no clipboard in any address path**, both directions:
+- WRITE (recipient): `autofocus: true` on the send recipient field (`wallet_send.dart`, matching the amount
+  field) so the harness **types** the address in (`enterFocusedText`) via each app's OWN VM service.
+- READ (receive address): key the address Text (`ValueKey('receiveAddress')`, `wallet_receive.dart`) and read
+  it per-app with a new `getTextByKey` (`spacedHex` groups it, so strip whitespace) — no Copy, no clipboard.
+- Applied across `regtest_send`, `regtest_dual_send`, `regtest_receive`.
+
+Validation: full suite **16/16 green at `--jobs 5`** (two ×8 rounds), zero got-0 — vs ~1/4 failing before.
+
+`--jobs` default: **all-at-once, and now genuinely reliable** — the last parallel-load failure class is gone.
+Net across the plan: recognition/semantics gates + 1 Hz heartbeat + observation floor + the wallet_send crash
+fix + the persistent-signal signing fix + clipboard-free address transfer. Parallel sim runs are reliable.

@@ -247,6 +247,11 @@ class _SimTrayContentState extends State<SimTrayContent> {
 /// scrim, opened by a right-edge handle. In BOTH modes the console renders ABOVE the app's
 /// Navigator (the shell is mounted by `MaterialApp.builder`), so it overlays in-app dialogs and
 /// stays interactable while one is up.
+/// The harness captures the whole sim surface (app + tray) by `toImage`-ing this RepaintBoundary
+/// OFF-SCREEN (see sim_app.dart `app-screenshot`) — fresh regardless of window foreground state and
+/// per-instance, replacing the macOS osascript-foreground `driver.screenshot()` hack.
+final GlobalKey simAppScreenshotKey = GlobalKey();
+
 class SimTrayShell extends StatefulWidget {
   final Widget app;
   final DevicePool pool;
@@ -336,85 +341,87 @@ class _SimTrayShellState extends State<SimTrayShell>
     final width = MediaQuery.sizeOf(context).width;
     final narrow = _forceNarrow || width < _narrowBreakpoint;
 
+    final Widget surface;
     if (!narrow) {
-      return Row(
+      surface = Row(
         textDirection: TextDirection.ltr,
         children: [
           Expanded(child: widget.app),
           SizedBox(width: _trayWidth, child: _content()),
         ],
       );
-    }
-
-    // Narrow: app full-bleed; the console slides in from the right over a scrim. The panel is only
-    // in the tree while open/animating, so a closed tray streams no device frames.
-    final panelWidth = (width * 0.88).clamp(0.0, _trayWidth + 24).toDouble();
-    return Stack(
-      textDirection: TextDirection.ltr,
-      children: [
-        widget.app,
-        AnimatedBuilder(
-          animation: _anim,
-          builder: (context, _) {
-            final t = _anim.value;
-            return Stack(
-              children: [
-                if (t > 0)
-                  Positioned.fill(
-                    key: const ValueKey('sim-tray-scrim'),
-                    child: GestureDetector(
-                      onTap: _close,
-                      child: ColoredBox(
-                        color: Colors.black.withValues(alpha: 0.5 * t),
+    } else {
+      // Narrow: app full-bleed; the console slides in from the right over a scrim. The panel is only
+      // in the tree while open/animating, so a closed tray streams no device frames.
+      final panelWidth = (width * 0.88).clamp(0.0, _trayWidth + 24).toDouble();
+      surface = Stack(
+        textDirection: TextDirection.ltr,
+        children: [
+          widget.app,
+          AnimatedBuilder(
+            animation: _anim,
+            builder: (context, _) {
+              final t = _anim.value;
+              return Stack(
+                children: [
+                  if (t > 0)
+                    Positioned.fill(
+                      key: const ValueKey('sim-tray-scrim'),
+                      child: GestureDetector(
+                        onTap: _close,
+                        child: ColoredBox(
+                          color: Colors.black.withValues(alpha: 0.5 * t),
+                        ),
                       ),
                     ),
-                  ),
-                if (t < 1)
-                  Positioned(
-                    key: const ValueKey('sim-tray-handle'),
-                    top: 0,
-                    bottom: 0,
-                    right: 0,
-                    child: Center(
-                      // Tap the handle to open, or drag it inward (from the edge) to pull the
-                      // panel in with your finger.
-                      child: GestureDetector(
-                        onHorizontalDragUpdate: (d) => _onDrag(d, panelWidth),
-                        onHorizontalDragEnd: (d) => _onDragEnd(d, panelWidth),
-                        child: Opacity(
-                          opacity: 1 - t,
-                          child: _EdgeHandle(
-                            deviceCount: _deviceCount,
-                            onOpen: _open,
+                  if (t < 1)
+                    Positioned(
+                      key: const ValueKey('sim-tray-handle'),
+                      top: 0,
+                      bottom: 0,
+                      right: 0,
+                      child: Center(
+                        // Tap the handle to open, or drag it inward (from the edge) to pull the
+                        // panel in with your finger.
+                        child: GestureDetector(
+                          onHorizontalDragUpdate: (d) => _onDrag(d, panelWidth),
+                          onHorizontalDragEnd: (d) => _onDragEnd(d, panelWidth),
+                          child: Opacity(
+                            opacity: 1 - t,
+                            child: _EdgeHandle(
+                              deviceCount: _deviceCount,
+                              onOpen: _open,
+                            ),
                           ),
                         ),
                       ),
                     ),
-                  ),
-                if (t > 0)
-                  Positioned(
-                    key: const ValueKey('sim-tray-panel'),
-                    top: 0,
-                    bottom: 0,
-                    right: (t - 1) * panelWidth,
-                    width: panelWidth,
-                    // Swipe the panel right to dismiss it (a horizontal drag; the content's own
-                    // vertical scroll and taps are a different gesture axis, so they don't clash).
-                    child: GestureDetector(
-                      onHorizontalDragUpdate: (d) => _onDrag(d, panelWidth),
-                      onHorizontalDragEnd: (d) => _onDragEnd(d, panelWidth),
-                      child: Material(
-                        elevation: 16,
-                        child: _content(onClose: _close),
+                  if (t > 0)
+                    Positioned(
+                      key: const ValueKey('sim-tray-panel'),
+                      top: 0,
+                      bottom: 0,
+                      right: (t - 1) * panelWidth,
+                      width: panelWidth,
+                      // Swipe the panel right to dismiss it (a horizontal drag; the content's own
+                      // vertical scroll and taps are a different gesture axis, so they don't clash).
+                      child: GestureDetector(
+                        onHorizontalDragUpdate: (d) => _onDrag(d, panelWidth),
+                        onHorizontalDragEnd: (d) => _onDragEnd(d, panelWidth),
+                        child: Material(
+                          elevation: 16,
+                          child: _content(onClose: _close),
+                        ),
                       ),
                     ),
-                  ),
-              ],
-            );
-          },
-        ),
-      ],
-    );
+                ],
+              );
+            },
+          ),
+        ],
+      );
+    }
+    return RepaintBoundary(key: simAppScreenshotKey, child: surface);
   }
 }
 

@@ -3,11 +3,15 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' as ui;
 
+import 'package:flutter/rendering.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_driver/driver_extension.dart';
 import 'package:frostsnap/global.dart';
+import 'package:frostsnap/id_ext.dart';
 import 'package:frostsnap/main.dart' as app;
+import 'package:frostsnap/sim_device_tray.dart';
 
 /// Driver data channel for things the harness can't get off the widget tree by semantic label.
 /// `clipboard` reads the app clipboard (e.g. a wallet receive address after its Copy button);
@@ -65,6 +69,47 @@ Future<String> _driverData(String? payload) async {
       final pool = simDevicePool;
       if (pool == null) throw 'sim_app: no device pool (not a sim build?)';
       return pool.chain().join(',');
+    case 'recognized-device-ids':
+      // The ids (lowercase hex) of devices the COORDINATOR has recognized (announce handshake done) —
+      // ITS device list, a DISTINCT and later gate than sim-pool/chain membership. The keygen
+      // "Device name N" field and signer availability are built from THIS list and exist only once a
+      // device is in it. Same id form as device-id:<n> (DeviceId Display == toHex), so the harness can
+      // wait the recognized SET to the connected chain's ids — a same-cardinality re-cable (1→2) is then
+      // NOT satisfied by stale recognition of the old device.
+      return coord.deviceListState().devices.map((d) => d.id.toHex()).join(',');
+    case 'app-screenshot':
+      // Render the whole sim surface (app + tray) OFF-SCREEN through the render tree (toImage), NOT the
+      // OS window — so it's fresh even when the window is backgrounded (macOS pauses a backgrounded
+      // window's compositing, the reason driver.screenshot() returned stale frames and needed an
+      // osascript foreground) and it works per-instance. Mirrors how `device-screen` reads the device
+      // framebuffer directly rather than screenshotting a window.
+      //
+      // FORCE a synchronous frame first: toImage captures the last PAINTED frame, but a backgrounded/
+      // idle desktop window has vsync paused, so a state change (e.g. a just-arrived keygen confirm)
+      // rebuilds the widget tree without ever painting it — the capture would then predate the change.
+      // Pump one ourselves (the scheduler is idle inside this driver handler) so the shot is CURRENT.
+      final shotBinding = WidgetsBinding.instance;
+      if (shotBinding.schedulerPhase == SchedulerPhase.idle) {
+        shotBinding.handleBeginFrame(null);
+        shotBinding.handleDrawFrame();
+      }
+      final appBoundary =
+          simAppScreenshotKey.currentContext?.findRenderObject()
+              as RenderRepaintBoundary?;
+      if (appBoundary == null) {
+        throw 'sim_app: no app screenshot boundary (not a sim build?)';
+      }
+      final appShotDpr = WidgetsBinding
+          .instance
+          .platformDispatcher
+          .views
+          .first
+          .devicePixelRatio;
+      final appShot = await appBoundary.toImage(pixelRatio: appShotDpr);
+      final appShotPng = await appShot.toByteData(
+        format: ui.ImageByteFormat.png,
+      );
+      return base64Encode(appShotPng!.buffer.asUint8List());
     case 'metrics':
       // The app's FlutterView size + system insets in LOGICAL px — the truth the occlusion check
       // compares a widget's screen rect against (e.g. the emulator's 3-button nav bar = bottomInset).
@@ -185,5 +230,20 @@ Future<void> main() {
     handler: _driverData,
     enableTextEntryEmulation: agentOwnsKeyboard,
   );
+  if (agentOwnsKeyboard) {
+    // Keep the frame pipeline alive while the agent drives a (likely backgrounded) sim window. macOS
+    // PAUSES vsync for an occluded/backgrounded window, which freezes everything that only advances on a
+    // painted frame: dialog dismiss animations (so a frame-gated action dialog lingers and blocks the
+    // keygen flow that `await`s its dismissal), and the flutter_driver semantics tree the harness finds
+    // against. `scheduleForcedFrame` produces a frame even when the engine has disabled them
+    // (`framesEnabled == false`). A slow 1Hz heartbeat is enough: it only needs to UN-STICK frame-gated
+    // work, not render smoothly — a dismiss animation is timestamp-driven so it completes in the next
+    // forced frame, and finds only need semantics within the harness's second-scale waits. (During
+    // active device animation the SimFrame stream already drives finer repaints.) Agent-driven only;
+    // interactive `serve` is foregrounded by a human and paints normally.
+    Timer.periodic(const Duration(seconds: 1), (_) {
+      WidgetsBinding.instance.scheduleForcedFrame();
+    });
+  }
   return app.main();
 }

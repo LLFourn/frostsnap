@@ -46,20 +46,22 @@ Future<void> main() async {
 
     // 2. Open Receive and copy the wallet's address. A fresh wallet has incomplete backups, so a
     //    "secure your wallet" nudge intercepts Receive; choosing "Later" makes the wallet proceed
-    //    to open the receive sheet. The address Text has no stable label, so read it from the
-    //    clipboard via the Copy button.
+    //    to open the receive sheet, where we read the address off its keyed Text per-app (NOT the
+    //    process-global system clipboard, which parallel test apps race).
     await h.tap(RegExp('Receive'));
     await h.waitFor('Later');
     await h.tap('Later');
     // The Share Address tile merges its title with the trailing "Address #N" into one composite
     // semantics label, so match a substring.
     await h.waitFor(RegExp('Share Address'));
-    await h.tap('Copy');
 
-    // Copy is async; poll the clipboard until the address lands.
+    // The address takes a moment to derive; poll the keyed Text until it lands (spacedHex groups it
+    // with whitespace, so strip that back to the raw address).
     var address = '';
     for (var i = 0; i < 10 && !address.startsWith('bcrt1'); i++) {
-      address = (await h.getClipboard()).trim();
+      address = (await h.getTextByKey(
+        'receiveAddress',
+      )).replaceAll(RegExp(r'\s'), '');
       if (!address.startsWith('bcrt1')) {
         await Future<void>.delayed(const Duration(milliseconds: 300));
       }

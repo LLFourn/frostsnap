@@ -281,6 +281,7 @@ class _WalletSendPageState extends State<WalletSendPage> {
           children: [
             AddressInput(
               controller: addrController,
+              autofocus: true,
               onSubmitted: (_) => recipientDone(context),
               decoration: InputDecoration(
                 filled: false,
@@ -640,7 +641,10 @@ class _WalletSendPageState extends State<WalletSendPage> {
 
   scrollToTop() {
     Future.delayed(Durations.long3).then((_) async {
-      if (context.mounted) {
+      // `mounted`, not `context.mounted`: there is no `context` parameter here, so `context` is the
+      // State.context getter, which THROWS on a defunct State — the guard would crash before reading
+      // `.mounted`. This fires after a delay during which the page can be popped (e.g. the send finished).
+      if (mounted) {
         await scrollController.animateTo(
           0,
           duration: Durations.short3,

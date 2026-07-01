@@ -139,6 +139,7 @@ class Scenario {
       for (final h in s._sessions) {
         await h._captureFailure(name, error, stack);
       }
+      await s._pauseForInspection();
       rethrow;
     } finally {
       await s._tearDown();
@@ -219,7 +220,41 @@ class Scenario {
       () async => (await h.deviceNumbers()).length,
       h.addDevice,
     );
+    // Pool membership is not coordinator recognition: wait until every launch-connected device has
+    // finished the announce handshake (recognized SET == connected chain) before the scenario drives
+    // keygen, so flows never race the per-device UI (e.g. the "Device name N" field) under load.
+    await h._awaitChainRecognized();
     return h;
+  }
+
+  /// When `SIM_PAUSE_ON_FAILURE=1`, hold the launched app window(s) alive for `SIM_PAUSE_SECS` (default
+  /// 120) after a failure instead of tearing down — so a human can WATCH the failed UI live, and we get
+  /// a timestamped screenshot trail (`paused-N.png`) showing whether a stuck dialog RECOVERS as the
+  /// parallel load lifts (a load-induced lag) or stays stuck forever (a real deadlock). Diagnostic only.
+  Future<void> _pauseForInspection() async {
+    if (Platform.environment['SIM_PAUSE_ON_FAILURE'] != '1') return;
+    final secs =
+        int.tryParse(Platform.environment['SIM_PAUSE_SECS'] ?? '') ?? 120;
+    final artifactsDir = Platform.environment['SIM_TEST_ARTIFACTS_DIR'];
+    stderr.writeln(
+      'SIM_PAUSE_ON_FAILURE: holding ${_sessions.length} window(s) alive ${secs}s '
+      'for inspection (watch whether the stuck UI recovers as load lifts)',
+    );
+    final deadline = DateTime.now().add(Duration(seconds: secs));
+    for (var i = 0; DateTime.now().isBefore(deadline); i++) {
+      await Future<void>.delayed(const Duration(seconds: 3));
+      for (final h in _sessions) {
+        final label = h._diagLabel == null ? '' : '${h._diagLabel}-';
+        try {
+          await h.screenshot(
+            'paused-$i',
+            keep: artifactsDir != null && artifactsDir.isNotEmpty
+                ? '$artifactsDir/${label}paused-$i.png'
+                : null,
+          );
+        } catch (_) {}
+      }
+    }
   }
 
   Future<void> _tearDown() async {
@@ -705,22 +740,37 @@ class AppSession {
         });
       }
       driver = await FlutterDriver.connect(dartVmServiceUrl: url);
-      // Build the semantics tree so find.bySemanticsLabel resolves (it isn't generated without an
-      // a11y client otherwise). On Android setSemantics throws until runApp has attached the root
-      // widget (a startup race: "No root widget is attached"), so RETRY until it takes — find/tap/
-      // geometry all need it. Only give up (logged) after a generous window, so a genuinely broken
-      // app doesn't hang forever.
-      var semanticsOn = false;
-      for (var i = 0; i < 60 && !semanticsOn; i++) {
+      final drv = driver;
+      // Build the semantics tree, then wait for a POSITIVE readiness signal — find.bySemanticsLabel
+      // actually RESOLVING a known always-present marker — not merely for setSemantics to stop throwing.
+      // setSemantics throws "No root widget is attached" until runApp attaches; and even once it
+      // succeeds the tree may not be built/usable yet, so under load a scenario's first find/tap can
+      // race a half-up app (the parallel-robustness flake). The sim shell wraps the app on EVERY screen,
+      // so its marker is layout-independent: 'SIMULATOR' (wide/host docked panel) or 'Open simulator'
+      // (narrow/emulator edge handle). Retry BOTH setSemantics and the marker wait until it resolves;
+      // past a generous window fail fast with a clear cause rather than proceed into a broken tree.
+      final readyMarker = RegExp('SIMULATOR|Open simulator');
+      var semanticsReady = false;
+      final semanticsDeadline = DateTime.now().add(const Duration(seconds: 60));
+      while (!semanticsReady && DateTime.now().isBefore(semanticsDeadline)) {
         try {
-          await driver.setSemantics(true);
-          semanticsOn = true;
+          await drv.setSemantics(true);
+          await drv.runUnsynchronized(
+            () => drv.waitFor(
+              find.bySemanticsLabel(readyMarker),
+              timeout: const Duration(seconds: 2),
+            ),
+          );
+          semanticsReady = true;
         } catch (_) {
-          await Future<void>.delayed(const Duration(milliseconds: 500));
+          await Future<void>.delayed(const Duration(milliseconds: 250));
         }
       }
-      if (!semanticsOn) {
-        log('[harness] setSemantics never took — find-by-label will not work');
+      if (!semanticsReady) {
+        throw StateError(
+          'sim app semantics never became usable — find.bySemanticsLabel("$readyMarker") did not '
+          'resolve within 60s (the app tree never finished attaching)',
+        );
       }
 
       final launchedProc = proc;
@@ -828,6 +878,48 @@ class AppSession {
 
   /// Disconnect [number] AND everything downstream (pulling a daisy-chain device cuts those below).
   Future<void> disconnect(int number) => device(number).setConnected(false);
+
+  // ---- device RECOGNITION (coordinator-side) — a DISTINCT gate from pool/chain membership ----
+  // A device joins the sim pool/chain the instant it's plugged, but the COORDINATOR only knows it after
+  // the announce handshake — and the UI built from the coordinator's list (the keygen "Device name N"
+  // field, signer availability) appears only then. Flows must gate on recognition, not pool membership,
+  // or they race a slow handshake under load. connect/disconnect and the initial fleet do this for the
+  // caller (see [AppDevice.setConnected], [Scenario.launch]), so no scenario sprinkles its own wait.
+
+  /// The ids (lowercase hex) of devices the coordinator has recognized, via `recognized-device-ids` —
+  /// the SAME id form [AppDevice.deviceId] returns, so the two sets are directly comparable.
+  Future<Set<String>> _recognizedIds() async {
+    final csv = await _requestData('recognized-device-ids');
+    return csv.isEmpty ? <String>{} : csv.split(',').toSet();
+  }
+
+  /// Wait until the coordinator's recognized id SET equals the CURRENT connected chain's id set, so a
+  /// connect/disconnect/re-cable is recognition-synchronous. Compares the actual id SET (not a count),
+  /// so a same-cardinality re-cable (e.g. chain 1 → 2) is NOT satisfied by stale recognition of the old
+  /// device. Reads [chain] once (it already reflects a daisy-chain disconnect CASCADE) — the gate is the
+  /// resulting connected set, not just the toggled device. Bounded timeout throws a clear error (never
+  /// hangs); near-instant no-op on host where recognition is quick.
+  Future<void> _awaitChainRecognized({
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    final expected = <String>{};
+    for (final n in await chain()) {
+      expected.add(await device(n).deviceId());
+    }
+    final deadline = DateTime.now().add(timeout);
+    for (;;) {
+      final got = await _recognizedIds();
+      if (got.length == expected.length && got.containsAll(expected)) return;
+      if (DateTime.now().isAfter(deadline)) {
+        throw StateError(
+          'coordinator recognized {${got.join(',')}} but the connected chain is '
+          '{${expected.join(',')}} after ${timeout.inSeconds}s '
+          '(device announce/recognition did not settle)',
+        );
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+  }
 
   /// Move [number] one position toward the head (the coordinator end).
   Future<void> moveUp(int number) async {
@@ -990,7 +1082,9 @@ class AppSession {
         return br;
       }
       prev = br.dy;
-      await Future<void>.delayed(const Duration(milliseconds: 120));
+      // Sample a heartbeat apart: a backgrounded window only advances the slide-in on each forced
+      // frame, so two reads within one beat are the SAME un-repainted frame and would falsely "settle".
+      await Future<void>.delayed(_heartbeat);
     }
   }
 
@@ -1008,6 +1102,19 @@ class AppSession {
 
   /// Per-command timeout for app interactions.
   static const Duration _cmdTimeout = Duration(seconds: 20);
+
+  /// The sim_app.dart forced-frame heartbeat period (its `main()` pumps one beat this often while the
+  /// agent drives a backgrounded window). macOS paints a backgrounded/occluded window ONLY on this beat,
+  /// so the flutter_driver semantics tree is at most this stale. Keep in sync with the heartbeat there.
+  static const Duration _heartbeat = Duration(seconds: 1);
+
+  /// Floor for any BOUNDED "is it there now?" semantics read ([exists], a re-check inside [tapUntil]).
+  /// It must span at least one [_heartbeat] — we use 2x for margin — or it can poll ENTIRELY within the
+  /// gap between two beats and see only the stale tree, missing a state that already changed but hasn't
+  /// repainted. That is exactly the signing-share `1/1` flake under parallel load: the share landed but
+  /// an 800ms check expired before the next forced frame painted the counter. No bounded read here may
+  /// be shorter than this.
+  static const Duration _minObserve = Duration(seconds: 2);
 
   Future<T> _driverCall<T>(Future<T> Function() call, [Duration? timeout]) =>
       driver.runUnsynchronized(call).timeout(timeout ?? _cmdTimeout);
@@ -1033,8 +1140,10 @@ class AppSession {
     for (var i = 0; i < tries; i++) {
       await tap(label);
       if (await _appears(expect, const Duration(seconds: 3))) return;
-      // Tap took effect (button gone) but the result is slow — wait it out.
-      if (!await _appears(label, const Duration(milliseconds: 500))) {
+      // Tap took effect (button gone) but the result is slow — wait it out. This re-check reads the
+      // semantics tree, so it must span a forced-frame [_heartbeat] ([_minObserve]) or a backgrounded
+      // window could still show the stale (pre-tap) button and we'd wrongly re-tap.
+      if (!await _appears(label, _minObserve)) {
         await waitFor(expect, timeout: settle);
         return;
       }
@@ -1071,6 +1180,13 @@ class AppSession {
     () => driver.getText(find.bySemanticsLabel(label), timeout: _cmdTimeout),
   );
 
+  /// Text of the widget with `ValueKey(key)` — for content that has no stable semantic label (e.g. an
+  /// address string, whose label IS the value we're trying to read). Reads this app's own widget tree,
+  /// so it's per-app and can't be raced like the process-global system clipboard.
+  Future<String> getTextByKey(String key) => _driverCall(
+    () => driver.getText(find.byValueKey(key), timeout: _cmdTimeout),
+  );
+
   /// The app clipboard, via the sim_app driver data handler — e.g. to read a wallet receive
   /// address after tapping its Copy button (the address Text has no stable label to target).
   Future<String> getClipboard() => _requestData('clipboard');
@@ -1096,15 +1212,15 @@ class AppSession {
     timeout + const Duration(seconds: 1),
   );
 
-  /// Whether a control with semantic [label] is present right now.
+  /// Whether a control with semantic [label] is present right now. Reads the semantics tree, so it waits
+  /// [_minObserve] (≥ one forced-frame [_heartbeat]); a shorter check races the heartbeat and can miss a
+  /// just-changed-but-unpainted state.
   Future<bool> exists(Pattern label) async {
     try {
       await _driverCall(
-        () => driver.waitFor(
-          find.bySemanticsLabel(label),
-          timeout: const Duration(milliseconds: 800),
-        ),
-        const Duration(seconds: 2),
+        () =>
+            driver.waitFor(find.bySemanticsLabel(label), timeout: _minObserve),
+        _minObserve + const Duration(seconds: 1),
       );
       return true;
     } catch (_) {
@@ -1144,36 +1260,16 @@ class AppSession {
   /// file is removed with everything else on [tearDown]; pass [keep] for a path
   /// outside the app dir to retain a shot. Returns the written path.
   ///
-  /// Brings the app window to the foreground first: macOS pauses a backgrounded window's
-  /// render loop, so `driver.screenshot()` would otherwise return the last on-screen frame
-  /// (e.g. a chain edit made via the socket would not appear, even though the tray's widget
-  /// tree already reflects it). Foregrounding resumes rendering so the shot is current.
+  /// Renders OFF-SCREEN through the render tree (the `app-screenshot` endpoint's
+  /// RenderRepaintBoundary.toImage), NOT the OS window — so the shot is fresh even when the window is
+  /// backgrounded (macOS pauses a backgrounded window's compositing; `driver.screenshot()` would
+  /// otherwise return a stale frame, which is why this used to osascript-foreground the window) and it
+  /// works per-instance for multi-app scenarios. Same idea as the device-framebuffer snapshot.
   Future<String> screenshot(String name, {String? keep}) async {
-    await _bringAppToFront();
-    // `screenshot` takes no `timeout:`, so bound it client-side — keeps the failure-diagnostics path
-    // from turning a bounded command failure back into an unbounded FlutterDriver wait on a stuck app.
-    final png = await driver
-        .runUnsynchronized(() => driver.screenshot())
-        .timeout(_cmdTimeout);
+    final png = base64Decode(await _requestData('app-screenshot'));
     final path = keep ?? '${appDir.path}/screenshots/${_shotSeq++}-$name.png';
     await File(path).writeAsBytes(png);
     return path;
-  }
-
-  /// Best-effort: raise the macOS app window so its render loop resumes and the next
-  /// screenshot is a fresh frame. A no-op (silently) off macOS or if osascript is absent.
-  Future<void> _bringAppToFront() async {
-    if (!Platform.isMacOS || flutterDevice != 'macos') return;
-    try {
-      await Process.run('osascript', [
-        '-e',
-        'tell application "Frostsnap" to activate',
-      ]);
-      // Give the embedder a moment to resume and render a frame before capturing.
-      await Future<void>.delayed(const Duration(milliseconds: 400));
-    } catch (_) {
-      // Foregrounding is a convenience; never fail a screenshot over it.
-    }
   }
 
   // ---- failure diagnostics ----
@@ -1276,10 +1372,15 @@ class AppDevice {
   Future<void> touch(int x, int y, {required bool liftUp}) =>
       _session._device('device-touch:$_number:$x:$y:${liftUp ? 'up' : 'down'}');
 
-  /// Plug this device into / out of the chain (the router applies daisy-chain semantics).
-  Future<void> setConnected(bool connected) => _session._device(
-    'device-${connected ? 'connect' : 'disconnect'}:$_number',
-  );
+  /// Plug this device into / out of the chain (the router applies daisy-chain semantics) and WAIT until
+  /// the coordinator's recognized set has caught up — so "connected" means connected AND recognized, and
+  /// no caller races the per-device UI that only renders post-recognition.
+  Future<void> setConnected(bool connected) async {
+    await _session._device(
+      'device-${connected ? 'connect' : 'disconnect'}:$_number',
+    );
+    await _session._awaitChainRecognized();
+  }
 
   /// Whether this device is connected (its number is in the chain).
   Future<bool> isConnected() async =>
@@ -1291,9 +1392,12 @@ class AppDevice {
     return csv.isEmpty ? <int>[] : csv.split(',').map(int.parse).toList();
   }
 
-  /// Re-cable the chain to exactly these 1-based numbers, in order (pool-level).
-  Future<void> setChain(List<int> order) =>
-      _session._device('device-set-chain:${order.join(',')}');
+  /// Re-cable the chain to exactly these 1-based numbers, in order (pool-level), and WAIT until the
+  /// coordinator's recognized set matches the resulting chain.
+  Future<void> setChain(List<int> order) async {
+    await _session._device('device-set-chain:${order.join(',')}');
+    await _session._awaitChainRecognized();
+  }
 
   Future<String> deviceId() => _session._deviceQuery('device-id:$_number');
 
