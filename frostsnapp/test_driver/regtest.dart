@@ -501,7 +501,7 @@ Future<ServerSocket> bridgeUnixOverTcp(String unixPath) async {
   return server;
 }
 
-/// The Android SDK root from ANDROID_HOME / ANDROID_SDK_ROOT / android/local.properties / the macOS
+/// The Android SDK root from ANDROID_HOME / ANDROID_SDK_ROOT / android/local.properties / the per-OS IDE
 /// default. Throws a clear error if none resolves.
 String androidSdkRoot() {
   for (final v in [
@@ -519,8 +519,14 @@ String androidSdkRoot() {
       }
     }
   }
-  final fallback = '${Platform.environment['HOME']}/Library/Android/sdk';
-  if (Directory(fallback).existsSync()) return fallback;
+  // Last resort: the platform's default Android-Studio SDK location.
+  final home = Platform.environment['HOME'];
+  for (final fallback in [
+    if (Platform.isMacOS) '$home/Library/Android/sdk',
+    if (Platform.isLinux) '$home/Android/Sdk',
+  ]) {
+    if (Directory(fallback).existsSync()) return fallback;
+  }
   throw StateError(
     'Android SDK not found — set ANDROID_HOME or android/local.properties sdk.dir',
   );

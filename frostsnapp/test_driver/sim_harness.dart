@@ -500,15 +500,29 @@ class AppSession {
 
   static const _macosSimAppBinary =
       'build/macos/Build/Products/Debug/Frostsnap.app/Contents/MacOS/Frostsnap';
+  // The linux bundle executable is `Frostsnap` (capital F): `linux/CMakeLists.txt` sets BINARY_NAME.
+  static const _linuxSimAppBinary = 'build/linux/x64/debug/bundle/Frostsnap';
 
   /// Build the macOS debug sim app once. Parallel workers direct-launch this binary so they don't
   /// serialize on `flutter run`'s shared build directory.
-  static Future<String> ensureMacosSimAppBuilt({
+  static Future<String> ensureMacosSimAppBuilt({IOSink? logSink}) =>
+      _ensureDesktopSimAppBuilt('macos', _macosSimAppBinary, logSink: logSink);
+
+  /// Build the Linux debug sim app once (the host-desktop equivalent of [ensureMacosSimAppBuilt]).
+  static Future<String> ensureLinuxSimAppBuilt({IOSink? logSink}) =>
+      _ensureDesktopSimAppBuilt('linux', _linuxSimAppBinary, logSink: logSink);
+
+  /// `flutter build <target> --debug` the sim app ONCE (macOS/Linux desktop) and return its absolute
+  /// bundle-binary path, so parallel workers direct-launch the prebuilt binary instead of each running a
+  /// `flutter run` build (which would serialize on the shared build dir).
+  static Future<String> _ensureDesktopSimAppBuilt(
+    String target,
+    String binaryPath, {
     IOSink? logSink,
   }) => _withFlutterBuildLock(() async {
     final proc = await Process.start('flutter', [
       'build',
-      'macos',
+      target,
       '--debug',
       '-t',
       'test_driver/sim_app.dart',
@@ -534,12 +548,12 @@ class AppSession {
     final code = await proc.exitCode;
     await Future.wait(drains);
     if (code != 0) {
-      throw StateError('flutter build macos failed with exit $code\n$output');
+      throw StateError('flutter build $target failed with exit $code\n$output');
     }
-    final binary = File(_macosSimAppBinary);
+    final binary = File(binaryPath);
     if (!await binary.exists()) {
       throw StateError(
-        'flutter build macos succeeded but $_macosSimAppBinary does not exist',
+        'flutter build $target succeeded but $binaryPath does not exist',
       );
     }
     return binary.absolute.path;
@@ -649,7 +663,10 @@ class AppSession {
     };
   }
 
-  static Map<String, String> _macosVmServiceEnvironment() {
+  /// Engine switches that make a DIRECTLY-launched (not via `flutter run`) desktop debug app open its VM
+  /// service on a random port, so flutter_driver can attach + the URL parse picks it up. Engine-general —
+  /// used for both the macOS and the Linux direct-launch.
+  static Map<String, String> _desktopVmServiceEnvironment() {
     final switches = <String>[
       'enable-dart-profiling=true',
       'vm-service-port=0',
@@ -784,28 +801,37 @@ class AppSession {
       }
 
       late final String url;
-      final directMacosLaunch =
-          shareHostAppDir && flutterDevice == 'macos' && Platform.isMacOS;
+      // Direct-launch the prebuilt desktop binary on its native host OS (macOS/Linux); the VM-service
+      // engine switches + stdout URL parse are engine-general, not macOS-specific.
+      final directDesktopLaunch =
+          shareHostAppDir &&
+          ((flutterDevice == 'macos' && Platform.isMacOS) ||
+              (flutterDevice == 'linux' && Platform.isLinux));
       final androidAppBinary = Platform.environment['SIM_ANDROID_APP_BINARY'];
       final usePrebuiltApk =
           !shareHostAppDir &&
           androidAppBinary != null &&
           androidAppBinary.isNotEmpty;
-      if (directMacosLaunch) {
+      if (directDesktopLaunch) {
         final configuredBinary = Platform.environment['SIM_HOST_APP_BINARY'];
         final binary = configuredBinary != null && configuredBinary.isNotEmpty
             ? configuredBinary
-            : await ensureMacosSimAppBuilt(logSink: logSink);
+            : Platform.isMacOS
+            ? await ensureMacosSimAppBuilt(logSink: logSink)
+            : await ensureLinuxSimAppBuilt(logSink: logSink);
         if (!await File(binary).exists()) {
           throw StateError('SIM_HOST_APP_BINARY does not exist: $binary');
         }
         proc = await Process.start(
           binary,
           const <String>[],
-          environment: {...launchEnvironment, ..._macosVmServiceEnvironment()},
+          environment: {
+            ...launchEnvironment,
+            ..._desktopVmServiceEnvironment(),
+          },
         );
         wireProcessLogs(proc);
-        log('[harness] launched macOS sim app binary: $binary');
+        log('[harness] launched desktop sim app binary: $binary');
         url = await vmUrl.future.timeout(const Duration(minutes: 5));
       } else if (usePrebuiltApk) {
         if (!await File(androidAppBinary).exists()) {

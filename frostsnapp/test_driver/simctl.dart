@@ -148,7 +148,9 @@ Future<bool> _daemonAlive() async {
 /// whole point: one command, no backgrounding or readiness polling by the caller.
 Future<void> _up(List<String> args) async {
   var count = 1;
-  var wantPlatform = 'macos';
+  // Default to the host desktop OS so it matches what `serve`/_resolvePlatform would launch (else `up` on
+  // Linux would read the launched linux daemon as an incompatible-platform mismatch).
+  var wantPlatform = Platform.isLinux ? 'linux' : 'macos';
   for (var i = 0; i < args.length - 1; i++) {
     if (args[i] == '--devices') count = int.parse(args[i + 1]);
     if (args[i] == '--platform') wantPlatform = args[i + 1];
@@ -520,18 +522,25 @@ Future<void> _runTests(List<String> args) async {
   // state. Android tests SELF-BOOT their own emulator(s) from the worker slot (no pre-booted pool);
   // that keeps host and android on the ONE dispatch path. Concurrent output is captured + printed grouped
   // on completion (interleaved live streams would be unreadable); a single test streams live.
-  final hostAppBinary = !android && Platform.isMacOS
+  final hostAppBinary = android
+      ? null
+      : Platform.isMacOS
       ? await AppSession.ensureMacosSimAppBuilt(logSink: stderr)
+      : Platform.isLinux
+      ? await AppSession.ensureLinuxSimAppBuilt(logSink: stderr)
       : null;
   final androidAppBinary = android
       ? await AppSession.ensureAndroidSimApkBuilt(logSink: stderr)
       : null;
   final sdk = android ? androidSdkRoot() : null;
+  // Host device: null on macOS (the test defaults to 'macos' — unchanged); 'linux' on Linux so the test
+  // targets the Linux desktop app + the prebuilt binary built above. Android self-boots ('android').
+  final hostDevice = Platform.isLinux ? 'linux' : null;
   await _runBounded(tests, effJobs, (test, workerSlot) async {
     final (r, retries) = await runWithRetry<_TestResult>(
       (_) => _runOneTest(
         test,
-        flutterDevice: android ? 'android' : null,
+        flutterDevice: android ? 'android' : hostDevice,
         sdk: sdk,
         hostAppBinary: hostAppBinary,
         androidAppBinary: androidAppBinary,
@@ -931,10 +940,10 @@ Future<void> _runBounded(
 
 /// The flutter device a launch targets. `--android` boots (or reuses) an emulator and returns its
 /// serial — so the sim runs on a phone, driven via the slide-in tray; device-channel CLI commands
-/// are then host-only. Otherwise `--platform <d>` (default macos), the desktop sim.
+/// are then host-only. Otherwise `--platform <d>` (default: the host desktop OS), the desktop sim.
 Future<String> _resolvePlatform(List<String> args) async {
   if (args.contains('--android')) return _ensureEmulatorBooted();
-  var platform = 'macos';
+  var platform = Platform.isLinux ? 'linux' : 'macos';
   for (var i = 0; i < args.length - 1; i++) {
     if (args[i] == '--platform') platform = args[i + 1];
   }
