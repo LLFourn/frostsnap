@@ -208,3 +208,14 @@ String emulatorSerial(int deviceIndex) =>
 /// Deterministic AVD name for a device index — NAME-isolated from the interactive `frostsnap_sim` AVD so
 /// a test's self-booted emulator can never boot/clear the interactive wallet.
 String emulatorAvd(int deviceIndex) => 'frostsnap_sim_pool_$deviceIndex';
+
+/// Interactive `up --android` SESSION emulator slots: a DEDICATED range for directory-scoped sessions, so
+/// two concurrent `up --android` in different dirs each get their own emulator. Grown DOWNWARD from the top
+/// of the emulator/adb console-port range (5554–5682), away from the test pool ([emulatorBasePort]+, growing
+/// up) and the single legacy interactive emulator (5554) — a running test suite is never disturbed. Bounded;
+/// the claim probes `adb devices` and the port bind arbitrates a race (see fsim's slot claim).
+const maxInteractiveSessions = 8;
+int interactiveSessionPort(int slot) => 5680 - slot * 2;
+String interactiveSessionSerial(int slot) =>
+    'emulator-${interactiveSessionPort(slot)}';
+String interactiveSessionAvd(int slot) => 'frostsnap_sim_session_$slot';

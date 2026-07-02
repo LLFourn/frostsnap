@@ -13,9 +13,15 @@ import 'sim_harness.dart' show simTmpRoot;
 // owned by any app instance. The wire client is the shared [SimFaucet] (also used by the in-app
 // tray), so the protocol has one implementation.
 
-/// Well-known paths for the shared regtest backend (one per sim-temp-root).
+/// When set (by the interactive fsim path in `main`), the `fsim regtest` commands + [ensureRegtestBackend]
+/// operate on THIS session's regtest dir (`<session>/.fsim/regtest`) instead of the shared
+/// `${simTmpRoot()}/regtest`. The test runner leaves it null and drives its own [startRegtestSession] chains
+/// by dir directly.
+Directory? regtestDirOverride;
+
+/// The regtest backend dir: this session's (when [regtestDirOverride] is set) else the shared one.
 Directory _regtestDir() {
-  final dir = Directory('${simTmpRoot().path}/regtest');
+  final dir = regtestDirOverride ?? Directory('${simTmpRoot().path}/regtest');
   dir.createSync(recursive: true);
   return dir;
 }

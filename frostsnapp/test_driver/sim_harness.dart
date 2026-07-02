@@ -474,6 +474,9 @@ class AppSession {
     Map<String, String> extraDartDefines = const {},
     int? windowSlot,
     IOSink? logSink,
+    // Root under which the disposable app dir (+ its screenshots) is created. Interactive `fsim serve`
+    // passes its session state root (`<dir>/.fsim`); the test runner leaves it null → the shared temp root.
+    Directory? appDirRoot,
   }) async {
     // An AppSession holds no host device sockets, but the launch shape still depends on whether the
     // target shares the host filesystem: a desktop host uses our disposable appDir (and has no build
@@ -494,6 +497,7 @@ class AppSession {
       flavor: hostPlatform ? null : 'direct',
       windowSlot: windowSlot,
       logSink: logSink,
+      appDirRoot: appDirRoot,
     );
     return AppSession(proc, dir, drv, log, flutterDevice);
   }
@@ -733,6 +737,8 @@ class AppSession {
     // process from stacking. Null inherits the worker's slot from the env.
     int? windowSlot,
     IOSink? logSink,
+    // Root for the disposable app dir (+ its screenshots); null → the shared temp root (test runner).
+    Directory? appDirRoot,
   }) async {
     // Bring up (or attach to) the shared regtest backend BEFORE the app, so its electrum URL can
     // be seeded into the app at launch.
@@ -743,7 +749,7 @@ class AppSession {
       regtestElectrumUrl = (await ensureRegtestBackend()).url;
     }
 
-    final appDir = await simTmpRoot().createTemp('app-');
+    final appDir = await (appDirRoot ?? simTmpRoot()).createTemp('app-');
     // Ring buffer of recent app stdout/stderr, dumped into the failure artifacts.
     final appLog = <String>[];
     void log(String line) {

@@ -14,6 +14,12 @@
 # commands talk to an already-running app, so they skip gen-ensure (and stay fast).
 set -e
 
+# Capture the INVOCATION cwd before we cd into the package: it's the default session identity, so a
+# session's state root is <invocation-cwd>/.fsim. Dart reads FSIM_INVOCATION_CWD (never Directory.current,
+# which the `cd` below moves to the package dir). `--dir <path>` overrides it.
+FSIM_INVOCATION_CWD="$PWD"
+export FSIM_INVOCATION_CWD
+
 root="$(cd "$(dirname "$0")" && pwd)"
 
 case "${1:-}" in

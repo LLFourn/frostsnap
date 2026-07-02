@@ -31,6 +31,32 @@ import 'package:frostsnap/src/rust/api/settings.dart';
 import 'package:frostsnap/src/rust/api/log.dart';
 import 'package:frostsnap/src/rust/frb_generated.dart';
 
+/// Hold a connection to the serve daemon's liveness socket and [exit] when it closes, so a hard-killed
+/// serve (which skips graceful teardown) doesn't leave this window orphaned. The serve binds this socket
+/// BEFORE launching us, so a configured socket we CANNOT reach (after a brief retry for the startup race)
+/// means the owner is already gone — exit too, rather than run orphaned.
+Future<void> _exitWhenServeDies(String socketPath) async {
+  Socket? conn;
+  for (var attempt = 0; attempt < 15 && conn == null; attempt++) {
+    try {
+      conn = await Socket.connect(
+        InternetAddress(socketPath, type: InternetAddressType.unix),
+        0,
+      );
+    } catch (_) {
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+  }
+  if (conn == null) {
+    exit(0); // owner never reachable across ~3s → it's gone; don't run orphaned
+  }
+  // The serve never writes; any completion (EOF on its death, or an error) means the owner is gone.
+  try {
+    await conn.drain<void>();
+  } catch (_) {}
+  exit(0);
+}
+
 Future<void> main() async {
   // enable this if you're trying to figure out why things are displaying in
   // certain positions/sizes
@@ -64,6 +90,17 @@ Future<void> main() async {
     final appDir = await getApplicationSupportDirectory();
     final appDirPath = appDir.path;
     if (kSim) {
+      // If the serve daemon passed a liveness socket, hold it open and exit when it drops — a
+      // hard-killed serve otherwise leaves this window orphaned. Host desktop only (unset on emulator,
+      // where the app can't reach a host unix socket and the emulator owns its own lifetime).
+      const compileLiveness = String.fromEnvironment(
+        'SIM_SERVE_LIVENESS_SOCKET',
+      );
+      final livenessSock =
+          Platform.environment['SIM_SERVE_LIVENESS_SOCKET'] ?? compileLiveness;
+      if (livenessSock.isNotEmpty) {
+        unawaited(_exitWhenServeDies(livenessSock));
+      }
       // Point the sim at a disposable app dir (clean DB per run, and the device
       // channel's socket lives here too) via SIM_APP_DIR; defaults to the app-support dir.
       const compileSimAppDir = String.fromEnvironment('SIM_APP_DIR');

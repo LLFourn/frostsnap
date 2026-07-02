@@ -25,7 +25,58 @@ import 'sim_harness.dart';
 // (no relaunch). `test` runs the driver e2e tests. See `_usage` for commands. Run via the
 // repo-root `./fsim` launcher (e.g. `./fsim serve`, `./fsim test keygen`).
 
-String get _socketPath => '${simTmpRoot().path}/control.sock';
+/// This session's STATE ROOT: `<identity>/.fsim`, holding its control socket, serve.log, app dir, and
+/// screenshots. Identity = `--dir <path>` if given, else the INVOCATION cwd (FSIM_INVOCATION_CWD, captured
+/// by the `./fsim` wrapper BEFORE it cd's into the package — `Directory.current` is the package dir, not
+/// where the user ran fsim). The directory IS the session id, so two fsim runs in different dirs never
+/// collide. Set once by [main] via [_resolveStateRoot].
+late final Directory _stateRoot;
+
+/// Resolve [_stateRoot] from `--dir`/FSIM_INVOCATION_CWD, stripping `--dir <path>` out of [args] and
+/// returning the rest. Fails fast if the longest unix socket under the root would exceed the OS `sun_path`
+/// limit (rather than truncating or hashing).
+List<String> _resolveStateRoot(List<String> args) {
+  String? dir;
+  final rest = <String>[];
+  for (var i = 0; i < args.length; i++) {
+    if (args[i] == '--dir' && i + 1 < args.length) {
+      dir = args[++i];
+    } else {
+      rest.add(args[i]);
+    }
+  }
+  final invocationCwd =
+      Platform.environment['FSIM_INVOCATION_CWD'] ?? Directory.current.path;
+  // A relative `--dir` is relative to WHERE THE USER RAN fsim (the invocation cwd), NOT the package dir the
+  // wrapper cd'd into. No `--dir` → the invocation cwd itself.
+  var identity = dir == null
+      ? invocationCwd
+      : (dir.startsWith('/') ? dir : '$invocationCwd/$dir');
+  // Canonicalize so the same directory always maps to the same session (resolve symlinks/`..` when it
+  // exists; else normalize the absolute path of a not-yet-created --dir).
+  try {
+    identity = Directory(identity).resolveSymbolicLinksSync();
+  } catch (_) {
+    identity = Directory(identity).absolute.path;
+  }
+  final root = Directory('$identity/.fsim');
+  // The regtest control socket is the longest unix-socket path under the root, and startRegtestSession
+  // guards THAT path at 100 chars (a conservative margin under macOS's 104-byte sun_path); match it here so
+  // an over-long dir fails at resolution with a clear message rather than inside serve.
+  final longest = '${root.path}/regtest/control.sock';
+  const limit = 100;
+  if (longest.length > limit) {
+    stderr.writeln(
+      'fsim: session dir too long for a unix socket (${longest.length} > $limit chars): $longest\n'
+      '  use a shorter --dir',
+    );
+    exit(2);
+  }
+  _stateRoot = root;
+  return rest;
+}
+
+String get _socketPath => '${_stateRoot.path}/control.sock';
 
 /// flutter device ids whose app shares the host filesystem — so the device-input `device-<n>.sock`s
 /// are reachable and a full [SimHarness] (with device channels) can run. Anything else (an Android
@@ -34,6 +85,8 @@ const _hostPlatforms = {'macos', 'linux', 'windows'};
 
 const _usage = '''
 fsim — drive the running sim app/devices through SimHarness.
+  Session-scoped: state lives in <dir>/.fsim (--dir <path> sets the dir, default the invocation cwd) — so
+  concurrent fsim sessions in different dirs are isolated. `clean` deletes only that <dir>/.fsim.
   fsim serve [--devices N] [--android] [--platform <d>] [--agent-owns-keyboard] [--no-regtest]
                                               launch app + listen (regtest ON by default;
                                               --no-regtest = offline)
@@ -47,16 +100,18 @@ fsim — drive the running sim app/devices through SimHarness.
   fsim test [NAMES...] [--android] [--jobs N] [--test-timeout SECS] [--nocapture|-v] [--junit PATH]
                                               run e2e driver tests (stems; ALL if none) IN PARALLEL —
                                               host: one `dart run` each; --android: each SELF-BOOTS
-                                              its OWN emulator + (if it uses regtest) bridges the
-                                              shared chain to it. --jobs caps parallelism (default =
-                                              all at once);
+                                              its OWN emulator + (if it uses regtest) bridges its OWN
+                                              per-worker chain (rt-<pid>) to it. --jobs caps parallelism
+                                              (default = all at once);
                                               --test-timeout (default 900s) reaps a wedged test as
                                               TIMEOUT so the run never stalls; raw output goes to
                                               build/sim-failures/<test>/output.log unless
                                               --nocapture/-v streams it live; --junit writes XML
-  fsim regtest up|down|status               manage the shared regtest bitcoind+electrs+faucet
+  fsim regtest up|down|status               manage THIS session's regtest (<dir>/.fsim/regtest) — the
+                                              serve auto-starts it; bitcoind+electrs+faucet
   fsim regtest fund <addr> <sats> | mine [n] | balance | height | address | url   drive the faucet
-  fsim clean                                remove sim temp artifacts + reap any backend
+  fsim clean                                reap + delete ONLY this session's <dir>/.fsim (socket, regtest,
+                                              app dir, emulator) — never another session or a test run
                                               (no daemon running)
   fsim tap <label> [--regex]                tap a control by semantic label
   fsim tap-until <label> <expect> [--regex] [--regex-expect]
@@ -88,12 +143,25 @@ Future<void> main(List<String> args) async {
     stderr.writeln(_usage);
     exit(2);
   }
+  // Two ISOLATION MODELS, deliberately non-overlapping so an interactive `clean` and a concurrent `fsim
+  // test` never disturb each other: the test runner scopes per worker under the shared root
+  // (simTmpRoot/rt-<pid> chains + `frostsnap_sim_pool_*` emulators at 5582↑), while every interactive command
+  // scopes to <dir>/.fsim (its own socket/regtest/app-dir + `frostsnap_sim_session_*` emulators at 5680↓,
+  // claimed by probe). `clean` deletes ONLY <dir>/.fsim and the runner reaps ONLY its own slots — so this
+  // dispatch returns BEFORE resolving any interactive session root.
+  if (args.first == 'test') {
+    await _runTests(args.skip(1).toList());
+    return;
+  }
+  // Every interactive command scopes to the session state root (`<--dir or invocation-cwd>/.fsim`).
+  args = _resolveStateRoot(args);
+  // The interactive regtest — serve's backend AND the `fsim regtest` commands — is this session's own,
+  // under the state root, not the shared node.
+  regtestDirOverride = Directory('${_stateRoot.path}/regtest');
   if (args.first == 'serve') {
     await _serve(args.skip(1).toList());
   } else if (args.first == 'up') {
     await _up(args.skip(1).toList());
-  } else if (args.first == 'test') {
-    await _runTests(args.skip(1).toList());
   } else if (args.first == 'regtest') {
     await runRegtest(args.skip(1).toList());
   } else if (args.first == 'clean') {
@@ -109,18 +177,26 @@ Future<void> main(List<String> args) async {
 /// `./fsim down` first.
 Future<void> _clean() async {
   if (await _daemonAlive()) {
-    stderr.writeln(
-      'fsim: a serve daemon is running — run `./fsim down` first',
-    );
+    stderr.writeln('fsim: a serve daemon is running — run `./fsim down` first');
     exit(1);
   }
-  await stopRegtestBackend();
-  // Reap any leftover self-booted test emulators (a crashed test/runner can orphan one past its own
-  // reap) before wiping tmp. Best-effort: a no-op when there's no Android SDK (host-only checkout).
-  try {
-    await _reapTestEmulators(androidSdkRoot());
-  } catch (_) {}
-  final root = simTmpRoot();
+  // Reap THIS session's regtest (a graceful `down` already self-reaped it; this catches a killed session's
+  // leftover) — scoped to <dir>/.fsim/regtest, so it never touches another session's backend.
+  await reapRegtestSessionDir(Directory('${_stateRoot.path}/regtest'));
+  // Reap THIS session's self-booted android emulator if a hard-killed session left one (recorded serial) —
+  // scoped to this session, NEVER a global sweep that could kill a concurrent test run's pool emulator.
+  final emSerialFile = File('${_stateRoot.path}/emulator-serial');
+  if (await emSerialFile.exists()) {
+    final serial = (await emSerialFile.readAsString()).trim();
+    if (serial.isNotEmpty) {
+      try {
+        await killEmulator(androidSdkRoot(), serial);
+      } catch (_) {}
+    }
+  }
+  // Delete ONLY this session's state root (`<dir>/.fsim`) — never the cwd/worktree or a shared root, so a
+  // `clean` in one session can't nuke another's (the per-session regtest reaping is Task 2).
+  final root = _stateRoot;
   if (await root.exists()) await root.delete(recursive: true);
   stdout.writeln(jsonEncode({'ok': true, 'cleaned': root.path}));
 }
@@ -207,13 +283,19 @@ Future<void> _up(List<String> args) async {
   // so the caller watches the bring-up live (emulator boot, regtest bridge, gradle build, app
   // launch) and we return the instant the serve writes its terminal FSIM_READY / FSIM_FAILED
   // line — no socket polling, and a failure surfaces its real reason instead of a blank timeout.
-  final logPath = '${simTmpRoot().path}/serve.log';
+  _stateRoot.createSync(recursive: true);
+  final logPath = '${_stateRoot.path}/serve.log';
   try {
     File(logPath).deleteSync(); // don't tail a stale prior-run log
   } catch (_) {}
   final launcher = '${Directory.current.parent.path}/fsim';
+  // Forward this session's identity as `--dir`: the detached serve re-runs the wrapper, whose
+  // FSIM_INVOCATION_CWD would be OUR cwd (the package dir), so `--dir` is what pins the daemon to the SAME
+  // state root this client resolved.
   final serve = await Process.start(launcher, [
     'serve',
+    '--dir',
+    _stateRoot.parent.path,
     ...args,
   ], mode: ProcessStartMode.detached);
 
@@ -942,7 +1024,7 @@ Future<void> _runBounded(
 /// serial — so the sim runs on a phone, driven via the slide-in tray; device-channel CLI commands
 /// are then host-only. Otherwise `--platform <d>` (default: the host desktop OS), the desktop sim.
 Future<String> _resolvePlatform(List<String> args) async {
-  if (args.contains('--android')) return _ensureEmulatorBooted();
+  if (args.contains('--android')) return _claimAndBootSessionEmulator();
   var platform = Platform.isLinux ? 'linux' : 'macos';
   for (var i = 0; i < args.length - 1; i++) {
     if (args[i] == '--platform') platform = args[i + 1];
@@ -950,77 +1032,120 @@ Future<String> _resolvePlatform(List<String> args) async {
   return platform;
 }
 
-/// The interactive fsim-managed AVD (`up`/`serve`); created on first use, reused after.
-const _avdName = 'frostsnap_sim';
-
-/// The interactive emulator's FIXED port — kept clear of the self-booted test emulators' range
-/// ([emulatorBasePort]+) so interactive bring-up never collides with a running test emulator.
-const _interactivePort = 5554;
-
-/// Whether [serial] is running a self-booted TEST emulator (the `frostsnap_sim_pool` AVD prefix that
-/// [emulatorAvd] assigns), so the interactive path can skip it — true AVD ownership, not a port guess.
-Future<bool> _isTestEmulator(String sdk, String serial) async {
-  final r = await Process.run('$sdk/platform-tools/adb', [
-    '-s',
-    serial,
-    'emu',
-    'avd',
-    'name',
-  ]);
-  final name = (r.stdout as String).trim().split('\n').first.trim();
-  return name.startsWith('frostsnap_sim_pool');
-}
-
-/// The serial of a running INTERACTIVE emulator (e.g. `emulator-5554`), or null if none is up. With
-/// [excludeTestEmulators], skips self-booted test emulators (by AVD name) so `up`/`serve` never reuses one.
-Future<String?> _runningEmulatorSerial(
-  String sdk, {
-  bool excludeTestEmulators = false,
-}) async {
+/// Every running emulator serial (`emulator-<port>`) per `adb devices`.
+Future<Set<String>> _runningSerials(String sdk) async {
   final res = await Process.run('$sdk/platform-tools/adb', ['devices']);
+  final serials = <String>{};
   for (final line in (res.stdout as String).split('\n')) {
     final m = RegExp(r'^(emulator-\d+)\s+device$').firstMatch(line.trim());
-    if (m == null) continue;
-    final serial = m.group(1)!;
-    if (excludeTestEmulators && await _isTestEmulator(sdk, serial)) continue;
-    return serial;
+    if (m != null) serials.add(m.group(1)!);
   }
-  return null;
+  return serials;
 }
 
-/// Kill every running self-booted TEST emulator (best-effort) — a crashed test or runner can orphan one
-/// past its own reap, so `fsim clean` sweeps them and none linger.
-Future<void> _reapTestEmulators(String sdk) async {
-  final res = await Process.run('$sdk/platform-tools/adb', ['devices']);
-  for (final line in (res.stdout as String).split('\n')) {
-    final m = RegExp(r'^(emulator-\d+)\s+device$').firstMatch(line.trim());
-    if (m == null) continue;
-    final serial = m.group(1)!;
-    if (await _isTestEmulator(sdk, serial)) await killEmulator(sdk, serial);
+/// Grace for an EMPTY lock (created, but its owner pid not yet written) before it counts as abandoned —
+/// generously longer than the microsecond create→write gap, so a live mid-write claim is never stolen.
+const _lockWriteGrace = Duration(seconds: 10);
+
+/// Whether an existing slot lock is STALE — reclaimable. STRICT on live owners: while the recorded owner PID
+/// is alive the lock is NEVER stale, however long its boot / first-run SDK+AVD setup takes — so a second
+/// session can't steal a slow-but-legitimate claimant that may still return the slot. Reclaim only when the
+/// owner PID is gone, or — for a lock whose pid was never written (a claimer that died between create and
+/// write) — once it's older than [_lockWriteGrace].
+bool _lockIsStale(File lock) {
+  int? owner;
+  try {
+    owner = int.tryParse(lock.readAsStringSync().trim());
+  } catch (_) {}
+  if (owner != null) {
+    // A live owner is never stolen; reclaim only once its process is gone (SIGCONT = harmless probe).
+    return !Process.killPid(owner, ProcessSignal.sigcont);
+  }
+  // No pid yet: a claimer mid-write (µs) or one that died between create and write. Reclaim only past the
+  // write grace, which cannot overlap a live mid-write.
+  try {
+    return DateTime.now().difference(lock.statSync().modified) >
+        _lockWriteGrace;
+  } catch (_) {
+    return false; // vanished/unreadable — let the exclusive-create retry decide
   }
 }
 
-/// Boot an emulator (reusing a running one, else provisioning + booting [_avdName]) and return its
-/// serial once `sys.boot_completed` is set.
-Future<String> _ensureEmulatorBooted() async {
+/// Machine-global per-slot lock so only ONE session ever boots a given interactive slot. Probe-then-boot is
+/// otherwise racy: two `up --android` can both see a slot free, both start `-port N`, and the LOSER's
+/// [bootEmulator] then waits on + returns the WINNER's `emulator-N`. Exclusive-create is atomic AND the lock
+/// records the owner PID; a held lock is reclaimed only when [_lockIsStale] — a live boot in progress is
+/// never stolen.
+bool _claimSlotLock(int slot) {
+  final lock = File('${simTmpRoot().path}/interactive-slot-$slot.lock');
+  try {
+    lock.createSync(exclusive: true);
+    lock.writeAsStringSync('$pid'); // owner PID for [_lockIsStale]
+    return true;
+  } catch (_) {
+    if (!_lockIsStale(lock))
+      return false; // live owner mid-boot — don't steal it
+    try {
+      lock.deleteSync();
+      lock.createSync(
+        exclusive: true,
+      ); // reclaim; only one wins the exclusive create
+      lock.writeAsStringSync('$pid');
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
+void _releaseSlotLock(int slot) {
+  try {
+    File('${simTmpRoot().path}/interactive-slot-$slot.lock').deleteSync();
+  } catch (_) {}
+}
+
+/// Claim a free interactive-SESSION emulator slot and boot its OWN emulator (cold, clean), returning the
+/// serial — so each `up --android` session gets a distinct emulator. The per-slot lock ([_claimSlotLock])
+/// makes the claim ATOMIC across sessions; it's held only across the boot. Under the lock we re-check FRESH
+/// `adb devices` for the slot's serial (a snapshot would be stale: a concurrent session can boot the slot +
+/// release its boot-only lock, after which bootEmulator would wait on + return ITS emulator). The AVD per
+/// slot is created on demand + NAME-isolated from the pool and the legacy interactive AVD. Errors if the
+/// range is exhausted.
+Future<String> _claimAndBootSessionEmulator() async {
   final sdk = androidSdkRoot();
-  final existing = await _runningEmulatorSerial(
-    sdk,
-    excludeTestEmulators: true,
-  );
-  if (existing != null) {
-    stderr.writeln('fsim: reusing the running emulator $existing');
-    await provisionEmulator(sdk, existing);
-    return existing;
+  for (var slot = 0; slot < maxInteractiveSessions; slot++) {
+    if (!_claimSlotLock(slot)) continue;
+    try {
+      // Fresh, under the lock: if this slot's emulator is ALREADY running (a concurrent session booted it
+      // then released its lock), it's taken — advance rather than return its serial.
+      if ((await _runningSerials(
+        sdk,
+      )).contains(interactiveSessionSerial(slot))) {
+        continue;
+      }
+      final avd = await ensureAvd(sdk, interactiveSessionAvd(slot));
+      stderr.writeln(
+        'fsim: booting session emulator "$avd" (slot $slot, cold) …',
+      );
+      final serial = await bootEmulator(
+        sdk,
+        avd: avd,
+        port: interactiveSessionPort(slot),
+      );
+      await provisionEmulator(sdk, serial);
+      return serial;
+    } catch (e) {
+      stderr.writeln('fsim: session slot $slot boot failed ($e); next slot …');
+    } finally {
+      // Release the boot-only lock (whether we booted, skipped a running slot, or failed) — the emulator is
+      // now in `adb devices`, so the fresh-serial check keeps other sessions off this slot.
+      _releaseSlotLock(slot);
+    }
   }
-  final avd = await ensureAvd(sdk, _avdName);
-  stderr.writeln('fsim: booting emulator AVD "$avd" (cold, clean state) …');
-  // Boot on the FIXED interactive port (clear of the self-booted test emulators' range) so
-  // provisioning/probes target it even when test emulators run concurrently — a warm reuse (above)
-  // keeps later `up`s in the same session fast.
-  final serial = await bootEmulator(sdk, avd: avd, port: _interactivePort);
-  await provisionEmulator(sdk, serial);
-  return serial;
+  throw StateError(
+    'fsim: all $maxInteractiveSessions interactive android session slots are busy — '
+    '`down` another session first',
+  );
 }
 
 // ---- daemon: holds one SimHarness, forwards commands to it ----
@@ -1040,8 +1165,9 @@ Future<void> _serve(List<String> args) async {
   // SELF-LOG every startup step to serve.log from the very start, ending in a terminal
   // `FSIM_READY` / `FSIM_FAILED` line. `up` launches us detached (our stdio -> /dev/null) and
   // TAILS this file to stream progress to its own stdout and learn the real outcome — so no caller
-  // ever has to poll the socket or guess at liveness. `simTmpRoot()` (re)creates the session dir.
-  final logSink = File('${simTmpRoot().path}/serve.log').openWrite();
+  // ever has to poll the socket or guess at liveness.
+  _stateRoot.createSync(recursive: true);
+  final logSink = File('${_stateRoot.path}/serve.log').openWrite();
   final flushTimer = Timer.periodic(
     const Duration(seconds: 1),
     (_) => unawaited(logSink.flush()),
@@ -1065,71 +1191,114 @@ Future<void> _serve(List<String> args) async {
   // speaks either). The app then runs regtest unaware it's remote.
   final extraDefines = <String, String>{};
   ServerSocket? controlProxy;
+  // This session's OWN regtest backend (under <dir>/.fsim/regtest): started below, held for the daemon's
+  // lifetime so it self-reaps on a hard kill (the death-pipe), and stopped in shutdown() on a graceful down.
+  RegtestSession? rtSession;
+  // Host-only liveness socket the app holds open + exits when it drops, so a hard-killed serve doesn't
+  // orphan the app window (the app-side analogue of the regtest death-pipe). Accepted connections are
+  // RETAINED in [livenessClients] so they aren't GC'd/finalized (which could close one and make the app
+  // exit while we're still alive).
+  ServerSocket? livenessSocket;
+  final livenessClients = <Socket>{};
   try {
     serveLog('fsim: resolving target …');
     platform = await _resolvePlatform(args);
     isHost = _hostPlatforms.contains(platform);
     serveLog('fsim: target $platform (${isHost ? 'host' : 'emulator'})');
+    if (args.contains('--android')) {
+      // Record our self-booted SESSION emulator so `down`/`clean` reap EXACTLY it — even if this daemon is
+      // hard-killed and shutdown() never runs.
+      File('${_stateRoot.path}/emulator-serial').writeAsStringSync(platform);
+    }
 
-    // Best-effort: a regtest-bridge failure degrades to an OFFLINE session (logged) rather than
-    // sinking the whole bring-up.
-    if (!isHost && wantRegtest) {
-      try {
-        serveLog('fsim: bridging regtest to $platform over adb …');
-        final backend = await ensureRegtestBackend();
-        final adb = '${androidSdkRoot()}/platform-tools/adb';
-        final ePort = electrumPort(backend.url);
-        await runInheritStdio(adb, [
-          '-s',
-          platform,
-          'reverse',
-          'tcp:$ePort',
-          'tcp:$ePort',
-        ]);
-        extraDefines['SIM_REGTEST_ELECTRUM_URL'] = backend.url;
-        controlProxy = await bridgeUnixOverTcp(regtestControlSocket);
-        await runInheritStdio(adb, [
-          '-s',
-          platform,
-          'reverse',
-          'tcp:${controlProxy.port}',
-          'tcp:${controlProxy.port}',
-        ]);
-        extraDefines['SIM_REGTEST_CONTROL_SOCKET'] =
-            '127.0.0.1:${controlProxy.port}';
-        serveLog(
-          'fsim: regtest bridged — electrs tcp:$ePort, faucet tcp:${controlProxy.port}',
-        );
-      } catch (e) {
-        serveLog('fsim: regtest bridge failed, continuing OFFLINE: $e');
-        extraDefines.clear();
-        await controlProxy?.close();
-        controlProxy = null;
+    // Regtest: this session owns its OWN backend under <dir>/.fsim/regtest — started here, reaped on
+    // shutdown (or self-reaped via the death-pipe on a hard kill), so `down` leaves no orphan and no shared
+    // node is touched. On host the app reaches its unix control socket + electrum TCP directly; on an
+    // emulator those host endpoints are unreachable, so bridge them over adb (best-effort: a bridge failure
+    // degrades to an OFFLINE session rather than sinking the bring-up).
+    if (wantRegtest) {
+      serveLog(
+        'fsim: starting session regtest under ${_stateRoot.path}/regtest …',
+      );
+      rtSession = await startRegtestSession(
+        Directory('${_stateRoot.path}/regtest'),
+      );
+      if (isHost) {
+        extraDefines['SIM_REGTEST_ELECTRUM_URL'] = rtSession.url;
+        extraDefines['SIM_REGTEST_CONTROL_SOCKET'] = rtSession.controlSocket;
+      } else {
+        try {
+          serveLog('fsim: bridging regtest to $platform over adb …');
+          final adb = '${androidSdkRoot()}/platform-tools/adb';
+          final ePort = electrumPort(rtSession.url);
+          await runInheritStdio(adb, [
+            '-s',
+            platform,
+            'reverse',
+            'tcp:$ePort',
+            'tcp:$ePort',
+          ]);
+          extraDefines['SIM_REGTEST_ELECTRUM_URL'] = rtSession.url;
+          controlProxy = await bridgeUnixOverTcp(rtSession.controlSocket);
+          await runInheritStdio(adb, [
+            '-s',
+            platform,
+            'reverse',
+            'tcp:${controlProxy.port}',
+            'tcp:${controlProxy.port}',
+          ]);
+          extraDefines['SIM_REGTEST_CONTROL_SOCKET'] =
+              '127.0.0.1:${controlProxy.port}';
+          serveLog(
+            'fsim: regtest bridged — electrs tcp:$ePort, faucet tcp:${controlProxy.port}',
+          );
+        } catch (e) {
+          serveLog('fsim: regtest bridge failed, continuing OFFLINE: $e');
+          extraDefines.clear();
+          await controlProxy?.close();
+          controlProxy = null;
+        }
       }
     }
 
+    // Host only: bind a liveness socket the app holds open + exits when it drops, so a hard-killed serve
+    // doesn't orphan the app window. An emulator app can't reach a host unix socket, and its window IS the
+    // emulator (owned separately), so this is host-desktop-only. Wired to the app via the env below.
+    if (isHost) {
+      final livenessPath = '${_stateRoot.path}/liveness.sock';
+      try {
+        File(livenessPath).deleteSync();
+      } catch (_) {}
+      livenessSocket = await ServerSocket.bind(
+        InternetAddress(livenessPath, type: InternetAddressType.unix),
+        0,
+      );
+      // Accept + RETAIN each connection (never read/write): held for the session so it isn't GC'd; dropped
+      // from the set when it closes. When this daemon dies the OS closes the socket → the app reads EOF.
+      livenessSocket.listen((conn) {
+        livenessClients.add(conn);
+        conn.listen(
+          (_) {},
+          onDone: () => livenessClients.remove(conn),
+          onError: (_) => livenessClients.remove(conn),
+          cancelOnError: true,
+        );
+      });
+      extraDefines['SIM_SERVE_LIVENESS_SOCKET'] = livenessPath;
+    }
+
     serveLog('fsim: launching the app on $platform (first build is slow) …');
-    // One session shape now (devices drive over the app channel everywhere); the host/emulator
-    // branch is only about regtest — a host session uses _launchApp's shared node directly, an
-    // emulator gets regtest via the adb bridge above (extraDefines) with _launchApp's regtest off.
-    harness = isHost
-        ? await AppSession.launch(
-            deviceCount: count,
-            flutterDevice: platform,
-            agentOwnsKeyboard: agentOwnsKeyboard,
-            withRegtest: wantRegtest,
-            logSink: logSink,
-          )
-        : await AppSession.launch(
-            deviceCount: count,
-            flutterDevice: platform,
-            agentOwnsKeyboard: agentOwnsKeyboard,
-            // An emulator's regtest is wired via the bridge above (extraDefines), not _launchApp's
-            // internal host-socket path.
-            withRegtest: false,
-            extraDartDefines: extraDefines,
-            logSink: logSink,
-          );
+    // One session shape (devices drive over the app channel everywhere); regtest is wired purely through
+    // extraDefines above (this session's own backend), so _launchApp never touches a shared node.
+    harness = await AppSession.launch(
+      deviceCount: count,
+      flutterDevice: platform,
+      agentOwnsKeyboard: agentOwnsKeyboard,
+      withRegtest: false,
+      extraDartDefines: extraDefines,
+      appDirRoot: _stateRoot,
+      logSink: logSink,
+    );
 
     try {
       File(_socketPath).deleteSync();
@@ -1160,7 +1329,25 @@ Future<void> _serve(List<String> args) async {
       try {
         File(_socketPath).deleteSync();
       } catch (_) {}
+      // tearDown reaps the app orderly on a graceful down; only THEN close the liveness socket, so its
+      // watcher stays a pure hard-kill backstop (never fires mid-teardown).
       await harness.tearDown();
+      for (final c in livenessClients.toList()) {
+        try {
+          await c.close();
+        } catch (_) {}
+      }
+      await livenessSocket?.close();
+      // Gracefully reap this session's regtest (the death-pipe is the backstop for a hard kill).
+      await rtSession?.stop();
+      // Reap our self-booted session emulator (`clean` recovers a hard-killed session's via the recorded
+      // serial).
+      if (args.contains('--android')) {
+        await killEmulator(androidSdkRoot(), platform);
+        try {
+          File('${_stateRoot.path}/emulator-serial').deleteSync();
+        } catch (_) {}
+      }
       await logSink.flush();
       await logSink.close();
     }();
@@ -1410,9 +1597,7 @@ Future<void> _client(List<String> args) async {
   try {
     socket = await _connectWaiting();
   } catch (e) {
-    stderr.writeln(
-      'fsim: no daemon at $_socketPath (run `fsim serve`): $e',
-    );
+    stderr.writeln('fsim: no daemon at $_socketPath (run `fsim serve`): $e');
     exit(1);
   }
   socket.write('${jsonEncode(req)}\n');
