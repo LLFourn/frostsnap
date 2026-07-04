@@ -2,14 +2,33 @@
 
 `fsim eval "<dart>"` ships a live Dart snippet to the running daemon (`fsim up`) and evaluates it against the
 console scope — the SAME harness the e2e tests drive, so there is no second command vocabulary to drift. A
-snippet is a Dart **expression** (its value is printed); you may `await` in it; state persists across calls
-(the daemon isolate is long-lived — a stateful console). For multi-statement snippets, imports, or top-level
-declarations, use `fsim test <file>` instead. `fsim repl` opens this same console interactively — one line at
-a time, state persisting between lines.
+snippet is a Dart **expression** (its value is printed); you may `await` in it.
+
+The live SESSION state persists across evals — drive actions accumulate (`await session.connect(2)` in one
+eval, `session.chain()` reflects it in the next; the app's wallet/chain carry). Each snippet is otherwise a
+fresh expression: to thread a VALUE from one eval into another, capture it in the shell and pass it back with
+`-a name=value` (see below), or inline it into one expression. For imports, multi-statement bodies, or
+top-level type/function declarations, use `fsim test <file>`. `fsim repl` opens this same console interactively
+— one line at a time, the session persisting between lines.
 
 This file is the exhaustive reference; `fsim eval --help` prints a cheat-sheet pointing here. It mirrors the
 harness API — `AppSession` / `AppDevice` in `test_driver/sim_harness.dart`, `SimFaucet` in `lib/sim_faucet.dart`
 — and `test/console_commands_documented_test.dart` fails if a public method here goes undocumented.
+
+## Passing values — `-a` / `--arg`
+
+`fsim eval -a name=value [-a n2=v2 …] "<snippet>"` binds each `name` in the snippet's scope to the string
+`value`. This is the clean way to reuse a captured value across evals — the shell holds it, no daemon-side var
+store:
+
+```
+addr=$(fsim eval "await (await session.faucet()).faucetAddress()")              # capture in a shell var
+fsim eval -a addr="$addr" "await (await session.faucet()).fund(addr, 100000)"   # pass it into the next eval
+```
+
+The value is bound as a `String` (parse it in the snippet if you need a number — `int.parse(n)`) and is never
+interpreted as code — `-a 's=a$b'` binds the literal `a$b`. Names must be a plain letter-initial identifier,
+not a keyword or a console name (`session`/`instances`/…).
 
 ## The console scope
 

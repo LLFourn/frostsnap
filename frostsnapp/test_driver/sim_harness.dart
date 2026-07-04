@@ -401,10 +401,7 @@ class Scenario {
     return _ScenarioRegtest(
       session,
       _isHost(device)
-          ? {
-              'SIM_REGTEST_ELECTRUM_URL': session.url,
-              'SIM_REGTEST_CONTROL_SOCKET': session.controlSocket,
-            }
+          ? session.hostDefines
           : {
               'SIM_REGTEST_ELECTRUM_URL': androidBridgeElectrumUrl,
               'SIM_REGTEST_CONTROL_SOCKET': androidBridgeControlSocket,

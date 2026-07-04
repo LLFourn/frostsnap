@@ -279,6 +279,14 @@ class RegtestSession {
 
   Future<SimFaucet> faucet() => SimFaucet.connect(controlSocket);
 
+  /// The `--dart-define`s that point a HOST app's regtest wallet + tray faucet directly at this session's
+  /// endpoints. The serve and the tests share this ONE mapping; an android app instead bridges to fixed
+  /// loopback ports (a build-once-APK constraint), built at its own launch site.
+  Map<String, String> get hostDefines => {
+    'SIM_REGTEST_ELECTRUM_URL': url,
+    'SIM_REGTEST_CONTROL_SOCKET': controlSocket,
+  };
+
   /// Stop this session's backend, reap its bitcoind/electrs by process group, and remove its dir
   /// (idempotent). Mirrors [stopRegtestBackend] but targets THIS session's socket + the PID we
   /// spawned — no shared-node discovery, so it can never stop another session's node. Reached only

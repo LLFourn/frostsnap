@@ -102,10 +102,11 @@ fsim — drive the running sim app/devices through SimHarness.
                                               one if needed) with regtest bridged over adb; drive the
                                               devices via `./fsim` (below) or the in-app tray
   fsim info                                 print the running daemon's shape (platform/count/regtest)
-  fsim eval [--timeout SECS] "<dart>"        evaluate live Dart against the running session — a stateful
-                                              console over the harness (e.g. `session.chain()`,
-                                              `await session.connect(2)`, `(await session.faucet()).blockHeight()`)
-  fsim repl                                  interactive console: live Dart per line, state persists (Ctrl-D quits)
+  fsim eval [--timeout SECS] [-a name=val] "<dart>"
+                                              evaluate live Dart against the running session — the harness
+                                              (e.g. `session.chain()`, `await session.connect(2)`); `-a` passes
+                                              a shell value in as a String (`-a addr="\$addr" "…fund(addr,…)…"`)
+  fsim repl                                  interactive console: live Dart per line, session persists (Ctrl-D quits)
   fsim test [NAMES...] [--android] [--jobs N] [--test-timeout SECS] [--nocapture|-v] [--junit PATH]
                                               run e2e driver tests (stems; ALL if none) IN PARALLEL —
                                               host: one `dart run` each; --android: each SELF-BOOTS
@@ -223,10 +224,15 @@ Future<void> _clean() async {
 }
 
 const _evalHelp =
-    r'''fsim eval [--timeout SECS] "<dart>" — evaluate live Dart against the running session: a stateful
-console over the SAME harness the e2e tests drive. The snippet is an expression; you may `await`; state
-persists across calls. (Multi-statement / imports / decls: use `fsim test <file>`.) A snippet times out after
-60s (--timeout SECS to change) so a blocking `await`/`waitFor` recovers instead of hanging forever.
+    r'''fsim eval [--timeout SECS] [-a name=value ...] "<dart>" — evaluate live Dart against the running
+session: the SAME harness the e2e tests drive. The snippet is an expression; you may `await`. The SESSION
+persists across evals (drive actions accumulate); to reuse a captured VALUE, hold it in the shell and pass it
+back with `-a name=value` (bound as a String, never as code). (Multi-statement / imports / decls: use
+`fsim test <file>`.) A snippet times out after 60s (--timeout SECS to change) so a blocking `await`/`waitFor`
+recovers instead of hanging forever.
+
+  addr=$(fsim eval "await (await session.faucet()).faucetAddress()")
+  fsim eval -a addr="$addr" "await (await session.faucet()).fund(addr, 100000)"
 
 Console scope:
   session                  the AppSession harness (the app + its virtual devices)
@@ -281,29 +287,111 @@ Future<(VmService, String, String)> _connectDaemon() async {
   return (service, isolateId, rootLibId);
 }
 
+/// Dart reserved words — none can be a variable name, so none can be an `--arg` name.
+const _dartReservedWords = {
+  'assert',
+  'break',
+  'case',
+  'catch',
+  'class',
+  'const',
+  'continue',
+  'default',
+  'do',
+  'else',
+  'enum',
+  'extends',
+  'false',
+  'final',
+  'finally',
+  'for',
+  'if',
+  'in',
+  'is',
+  'new',
+  'null',
+  'rethrow',
+  'return',
+  'super',
+  'switch',
+  'this',
+  'throw',
+  'true',
+  'try',
+  'var',
+  'void',
+  'while',
+  'with',
+  'await',
+  'yield', //
+};
+
+/// Console/eval top-level names an `--arg` must not shadow.
+const _reservedArgNames = {
+  'session', 'instances', 'vars',
+  'evalResult', 'evalError', 'evalDone', 'evalGen', 'evalCapture', //
+};
+
+/// Validate an `--arg` NAME (the value binds via the VM `scope` protocol, never spliced into source; this
+/// guards the scope key + the snippet's bare reference). Must be a LETTER-initial Dart identifier — no leading
+/// `_`, reserving the whole `_`-namespace for the fire wrapper's own `_fsimEval*` locals so a bound arg can't
+/// shadow one — and not a reserved word or a console/eval name. Returns an error string, or null if valid.
+String? _invalidArgName(String name) {
+  if (!RegExp(r'^[a-zA-Z][a-zA-Z0-9_]*$').hasMatch(name)) {
+    return "invalid --arg name '$name' — must be a letter-initial Dart identifier (no leading '_')";
+  }
+  if (_dartReservedWords.contains(name))
+    return "invalid --arg name '$name' — Dart reserved word";
+  if (_reservedArgNames.contains(name))
+    return "invalid --arg name '$name' — reserved console/eval name";
+  return null;
+}
+
 /// Evaluate ONE snippet against the daemon via the fire-and-poll async harness (so the snippet may `await`)
-/// and return `(output, isError)` — the result's `toString()`, or the error text.
+/// and return `(output, isError)` — the result's `toString()`, or the error text. [args] binds each name to a
+/// value in the snippet's scope (see below).
 Future<(String, bool)> _evalOnce(
   VmService service,
   String isolateId,
   String rootLibId,
   String snippet,
-  Duration timeout,
-) async {
+  Duration timeout, {
+  Map<String, String> args = const {},
+}) async {
+  // Bind each --arg NAME to its VALUE via the VM `scope` protocol — NOT by splicing anything into source.
+  // Materialise the value as a String OBJECT from its bytes (base64 can't inject) and pass its object-id as
+  // scope[name]; `scope` reaches the snippet even inside the fire IIFE's closures. Names are pre-validated as
+  // letter-initial identifiers and the wrapper's own locals use an `_fsimEval*` namespace, so a bound arg can
+  // neither inject nor shadow a generated local.
+  final scope = <String, String>{};
+  for (final entry in args.entries) {
+    final b64 = base64.encode(utf8.encode(entry.value));
+    final ref = await service.evaluate(
+      isolateId,
+      rootLibId,
+      "utf8.decode(base64.decode('$b64'))",
+    );
+    if (ref is InstanceRef && ref.id != null) scope[entry.key] = ref.id!;
+  }
   // Fire an unawaited async IIFE that evaluates the snippet and records the outcome into the daemon's
   // top-level fields — `evaluate` compiles synchronously, so a top-level `await` is illegal but firing an
-  // async closure is not. `final g = ++evalGen` stamps this fire: on completion it writes the fields ONLY if
-  // its generation is still current, so a stale still-running IIFE (a blocking snippet the client timed out
+  // async closure is not. `_fsimEvalGen = ++evalGen` stamps this fire: on completion it writes the fields ONLY
+  // if its generation is still current, so a stale still-running IIFE (a blocking snippet the client timed out
   // on, then retried) can't clobber a newer eval's fields. Close any faucet the snippet opened so its
   // connection stays short-lived across evals (the backend control server serves one connection at a time).
   final fire =
-      '(() async { final g = ++evalGen; evalDone = false; evalError = null; evalResult = null; '
-      'try { final r = await evalCapture(() async => $snippet); if (evalGen == g) evalResult = r; } '
-      "catch (e, s) { if (evalGen == g) evalError = '\$e\\n\$s'; } "
-      'finally { for (final i in instances) { try { await i.closeFaucet(); } catch (_) {} } if (evalGen == g) evalDone = true; } })()';
+      '(() async { final _fsimEvalGen = ++evalGen; evalDone = false; evalError = null; evalResult = null; '
+      'try { final _fsimEvalRes = await evalCapture(() async => $snippet); if (evalGen == _fsimEvalGen) evalResult = _fsimEvalRes; } '
+      "catch (_fsimEvalErr, _fsimEvalStk) { if (evalGen == _fsimEvalGen) evalError = '\$_fsimEvalErr\\n\$_fsimEvalStk'; } "
+      'finally { for (final _fsimEvalInst in instances) { try { await _fsimEvalInst.closeFaucet(); } catch (_) {} } if (evalGen == _fsimEvalGen) evalDone = true; } })()';
   final Response fired;
   try {
-    fired = await service.evaluate(isolateId, rootLibId, fire);
+    fired = await service.evaluate(
+      isolateId,
+      rootLibId,
+      fire,
+      scope: scope.isEmpty ? null : scope,
+    );
   } catch (e) {
     // A snippet compile error is THROWN as an RPCError (not returned as an ErrorRef) — surface it so
     // eval/repl report it (and the repl keeps going) instead of crashing. Pull the `Error:` lines out of
@@ -351,18 +439,35 @@ Future<(String, bool)> _evalOnce(
 }
 
 /// `fsim eval "<dart>"` — evaluate ONE live Dart snippet against the running session's console scope
-/// (`session` + the daemon root library) and print its value or error. State persists across calls (the
-/// daemon isolate is long-lived). `--help` (or no snippet) prints [_evalHelp].
+/// (`session` + the daemon root library) and print its value or error. The session persists across evals;
+/// `-a name=value` binds a shell value into the snippet scope (via the VM `scope` protocol). `--help` (or no
+/// snippet) prints [_evalHelp].
 Future<void> _eval(List<String> args) async {
   if (args.isEmpty || args.first == '--help' || args.first == '-h') {
     stdout.write(_evalHelp);
     exit(args.isEmpty ? 2 : 0);
   }
   var timeout = const Duration(seconds: 60);
+  final argVars = <String, String>{};
   final rest = <String>[];
   for (var i = 0; i < args.length; i++) {
     if (args[i] == '--timeout' && i + 1 < args.length) {
       timeout = Duration(seconds: int.parse(args[i + 1]));
+      i++;
+    } else if ((args[i] == '--arg' || args[i] == '-a') && i + 1 < args.length) {
+      final pair = args[i + 1];
+      final eq = pair.indexOf('=');
+      if (eq <= 0) {
+        stderr.writeln("fsim eval: --arg expects name=value, got '$pair'");
+        exit(2);
+      }
+      final name = pair.substring(0, eq);
+      final invalid = _invalidArgName(name);
+      if (invalid != null) {
+        stderr.writeln('fsim eval: $invalid');
+        exit(2);
+      }
+      argVars[name] = pair.substring(eq + 1);
       i++;
     } else {
       rest.add(args[i]);
@@ -371,7 +476,7 @@ Future<void> _eval(List<String> args) async {
   final snippet = rest.join(' ').trim();
   if (snippet.isEmpty) {
     stderr.writeln(
-      'usage: fsim eval [--timeout SECS] "<dart expression>"  (see `fsim eval --help`)',
+      'usage: fsim eval [--timeout SECS] [-a name=value ...] "<dart expression>"  (see `fsim eval --help`)',
     );
     exit(2);
   }
@@ -383,6 +488,7 @@ Future<void> _eval(List<String> args) async {
       rootLibId,
       snippet,
       timeout,
+      args: argVars,
     );
     if (isError) {
       stderr.writeln('ERROR: $out');
@@ -1417,7 +1523,6 @@ Future<void> _serve(List<String> args) async {
   // rejected as host-only (see _dispatch). Drive an emulator session via the in-app slide-in tray.
   late final String platform;
   late final bool isHost;
-  late final AppSession harness;
   late final ServerSocket server;
   // On an emulator the electrum (TCP) + faucet control (unix) sockets live on the host, so we bridge
   // them: adb-reverse the electrum port (the app reaches the host electrs at the same 127.0.0.1:port
@@ -1461,8 +1566,7 @@ Future<void> _serve(List<String> args) async {
       serveLog('fsim: starting session regtest under ${_stateRoot.path} …');
       rtSession = await startRegtestSession(_stateRoot);
       if (isHost) {
-        extraDefines['SIM_REGTEST_ELECTRUM_URL'] = rtSession.url;
-        extraDefines['SIM_REGTEST_CONTROL_SOCKET'] = rtSession.controlSocket;
+        extraDefines.addAll(rtSession.hostDefines);
       } else {
         try {
           serveLog('fsim: bridging regtest to $platform over adb …');
@@ -1563,7 +1667,6 @@ Future<void> _serve(List<String> args) async {
       h.regtestBackend = rtSession;
       launched.add(h);
     }
-    harness = launched.first;
     instances = launched;
 
     // Enable THIS daemon's VM service so `fsim eval`/`repl` can ship live Dart to it against the console
@@ -1668,7 +1771,7 @@ Future<void> _serve(List<String> args) async {
       if (line.trim().isEmpty) continue;
       final (reply, down) = await _dispatch(
         line,
-        harness,
+        instances.first,
         agentOwnsKeyboard,
         wantRegtest,
         count,
