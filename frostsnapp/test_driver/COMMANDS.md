@@ -45,8 +45,8 @@ not a keyword or a console name (`session`/`instances`/…).
 | call | returns | does |
 |------|---------|------|
 | `session.tap(label)` | `void` | tap a widget by its semantic label |
-| `session.enterText(label, text)` | `void` | focus a field by label, then type `text` |
-| `session.enterFocusedText(text)` | `void` | type into the already-focused field |
+| `session.enterText(label, text)` | `void` | focus a field by label, then type `text` — needs `fsim up --agent-owns-keyboard` (else the app owns the keyboard for a human) |
+| `session.enterFocusedText(text)` | `void` | type into the already-focused field — needs `fsim up --agent-owns-keyboard` |
 | `session.exists(label)` | `bool` | is a widget with this label present? |
 | `session.getText(label)` | `String` | read a widget's text by its semantic label |
 | `session.getTextByKey(key)` | `String` | read a widget's text by its widget key |

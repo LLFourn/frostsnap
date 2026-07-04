@@ -410,6 +410,15 @@ class Scenario {
   }
 }
 
+/// Thrown by the text-entry verbs when the session lacks the agent-owned keyboard. [toString] is JUST the
+/// message (no `Bad state`/`Exception` prefix) so `fsim eval` surfaces the fix directly.
+class AgentKeyboardRequired implements Exception {
+  final String message;
+  AgentKeyboardRequired(this.message);
+  @override
+  String toString() => message;
+}
+
 /// A launched sim app: the Flutter process + FlutterDriver over the (possibly adb-forwarded) VM
 /// service. Drives the app widget tree by semantic label (`app.*` + `screenshot()`) AND the virtual
 /// devices ([device] → [AppDevice]) over the SAME app channel, so it's the ONE session shape for host
@@ -438,12 +447,19 @@ class AppSession {
   String? _emulatorSerial;
   Future<void> Function()? _unbridge;
 
+  /// Whether the DRIVER owns text input (`--agent-owns-keyboard`). True routes text through the driver's mock
+  /// input so [enterText] works (but the real keyboard is blocked); false — the `fsim up` default, so a human
+  /// can type in the GUI — hands the keyboard to the app, and the text-entry verbs fail fast with a clear
+  /// message instead of a cryptic driver `Bad state`.
+  final bool agentOwnsKeyboard;
+
   AppSession(
     this._appProcess,
     this.appDir,
     this.driver,
     this._appLog,
     this.flutterDevice,
+    this.agentOwnsKeyboard,
   );
 
   SimFaucet? _faucet;
@@ -517,7 +533,7 @@ class AppSession {
       logSink: logSink,
       appDirRoot: appDirRoot,
     );
-    return AppSession(proc, dir, drv, log, flutterDevice);
+    return AppSession(proc, dir, drv, log, flutterDevice, agentOwnsKeyboard);
   }
 
   static const _macosSimAppBinary =
@@ -1307,15 +1323,29 @@ class AppSession {
     }
   }
 
+  /// The text-entry verbs need [agentOwnsKeyboard] — without it flutter_driver's `enter_text` throws a
+  /// cryptic `Bad state`. Fail fast with the fix instead.
+  void _requireAgentKeyboard() {
+    if (!agentOwnsKeyboard) {
+      throw AgentKeyboardRequired(
+        'text entry needs the agent-owned keyboard, but this session hands the keyboard to a human. '
+        'Relaunch with `fsim up --agent-owns-keyboard` (or pass --agent-owns-keyboard to serve/test).',
+      );
+    }
+  }
+
   Future<void> enterText(Pattern label, String text) => _driverCall(() async {
+    _requireAgentKeyboard();
     await driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout);
     await driver.enterText(text, timeout: _cmdTimeout);
   });
 
   /// Type [text] into the currently-focused text field (NO finder) — for an autofocused field that has
   /// no stable semantic label, e.g. the send Amount input. Requires the agent-owned keyboard (default).
-  Future<void> enterFocusedText(String text) =>
-      _driverCall(() => driver.enterText(text, timeout: _cmdTimeout));
+  Future<void> enterFocusedText(String text) => _driverCall(() async {
+    _requireAgentKeyboard();
+    await driver.enterText(text, timeout: _cmdTimeout);
+  });
 
   Future<String> getText(Pattern label) => _driverCall(
     () => driver.getText(find.bySemanticsLabel(label), timeout: _cmdTimeout),
