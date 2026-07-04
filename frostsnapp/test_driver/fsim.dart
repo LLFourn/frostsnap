@@ -1,8 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'dart:io';
 
 import 'package:flutter_driver/flutter_driver.dart';
+import 'package:vm_service/vm_service.dart';
+import 'package:vm_service/vm_service_io.dart';
 
 import 'emulator.dart';
 import 'regtest.dart';
@@ -63,7 +66,7 @@ List<String> _resolveStateRoot(List<String> args) {
   // The regtest control socket is the longest unix-socket path under the root, and startRegtestSession
   // guards THAT path at 100 chars (a conservative margin under macOS's 104-byte sun_path); match it here so
   // an over-long dir fails at resolution with a clear message rather than inside serve.
-  final longest = '${root.path}/regtest/control.sock';
+  final longest = '${root.path}/regtest.sock';
   const limit = 100;
   if (longest.length > limit) {
     stderr.writeln(
@@ -87,9 +90,11 @@ const _usage = '''
 fsim — drive the running sim app/devices through SimHarness.
   Session-scoped: state lives in <dir>/.fsim (--dir <path> sets the dir, default the invocation cwd) — so
   concurrent fsim sessions in different dirs are isolated. `clean` deletes only that <dir>/.fsim.
-  fsim serve [--devices N] [--android] [--platform <d>] [--agent-owns-keyboard] [--no-regtest]
+  fsim serve [--devices N] [--instances N] [--android] [--platform <d>] [--agent-owns-keyboard] [--no-regtest]
                                               launch app + listen (regtest ON by default;
-                                              --no-regtest = offline)
+                                              --no-regtest = offline). --instances N holds N app windows on
+                                              ONE regtest, driven via eval as `instances[K]` (`session` ==
+                                              instances[0])
   fsim up [serve flags]                     idempotently bring the sim up + return once ready
                                               (no backgrounding/polling; reuses a matching live
                                               daemon, refuses a mismatched one — `down` first)
@@ -97,6 +102,10 @@ fsim — drive the running sim app/devices through SimHarness.
                                               one if needed) with regtest bridged over adb; drive the
                                               devices via `./fsim` (below) or the in-app tray
   fsim info                                 print the running daemon's shape (platform/count/regtest)
+  fsim eval [--timeout SECS] "<dart>"        evaluate live Dart against the running session — a stateful
+                                              console over the harness (e.g. `session.chain()`,
+                                              `await session.connect(2)`, `(await session.faucet()).blockHeight()`)
+  fsim repl                                  interactive console: live Dart per line, state persists (Ctrl-D quits)
   fsim test [NAMES...] [--android] [--jobs N] [--test-timeout SECS] [--nocapture|-v] [--junit PATH]
                                               run e2e driver tests (stems; ALL if none) IN PARALLEL —
                                               host: one `dart run` each; --android: each SELF-BOOTS
@@ -107,36 +116,44 @@ fsim — drive the running sim app/devices through SimHarness.
                                               TIMEOUT so the run never stalls; raw output goes to
                                               build/sim-failures/<test>/output.log unless
                                               --nocapture/-v streams it live; --junit writes XML
-  fsim regtest up|down|status               manage THIS session's regtest (<dir>/.fsim/regtest) — the
+  fsim regtest up|down|status               manage THIS session's regtest (<dir>/.fsim/regtest.*) — the
                                               serve auto-starts it; bitcoind+electrs+faucet
   fsim regtest fund <addr> <sats> | mine [n] | balance | height | address | url   drive the faucet
   fsim clean                                reap + delete ONLY this session's <dir>/.fsim (socket, regtest,
                                               app dir, emulator) — never another session or a test run
                                               (no daemon running)
-  fsim tap <label> [--regex]                tap a control by semantic label
-  fsim tap-until <label> <expect> [--regex] [--regex-expect]
-  fsim enter <label> <text> [--regex]       focus a field + type (agent-owns-keyboard only)
-  fsim wait <label> [--regex]               wait for a label to appear
-  fsim exists <label> [--regex]             report whether a label is present
-  fsim clipboard                            print the app clipboard text (e.g. a copied address)
   fsim shot [path]                          whole-app screenshot (incl. tray)
   fsim down                                 tear down (quit app, clean up)
- device commands (over the app channel — work on host AND emulator):
-  fsim devices                              list each device (number/id/connected)
-  fsim add-device                           add a device at runtime (joins the chain tail)
-  fsim chain                                print the connected chain order
-  fsim set-chain <n>...                     re-cable to exactly these devices, in order
-  fsim connect <n>                          plug device n into the tail of the chain
-  fsim disconnect <n>                       disconnect device n + everything downstream
-  fsim move-up <n> / move-down <n>          reorder device n within the chain
-  fsim hold <x> <y> [ms] [--device N]       device hold-to-confirm at a point
-  fsim swipe <x1> <y1> <x2> <y2> [ms] [--device N]   device swipe
-  fsim touch <x> <y> <down|up> [--device N]          device raw touch
-  fsim set-connected <true|false> [--device N]       plug/unplug a device
-  fsim screen <path> [--device N]           write the device framebuffer PNG
-(--regex matches the label as a substring; default is exact. --device selects the
- virtual device, 1-based, default 1. `serve` gives the keyboard to a human unless
- --agent-owns-keyboard is passed, which the driver needs for `enter`.)''';
+
+ App + device DRIVING (tap / chain / hold / enter / connect / wallet / faucet / …) is now
+ `fsim eval "session.…"` — see `fsim eval --help` or test_driver/COMMANDS.md for the full drive API.''';
+
+/// The serve's app instances — `fsim up --instances N` holds N `AppSession`s on the session's ONE regtest;
+/// `instances[0]` is [session]. Exposed to `fsim eval`/`repl` snippets (evaluated in THIS root library).
+/// Empty until the serve's app(s) are up.
+List<AppSession> instances = [];
+
+/// The primary console session (`instances[0]`) — the common single-instance handle in eval snippets.
+AppSession get session => instances.isNotEmpty
+    ? instances.first
+    : (throw StateError(
+        'no live session — is a `fsim up`/`serve` daemon running?',
+      ));
+
+/// Fire-and-poll async harness for `fsim eval`: `evaluate` cannot top-level `await`, so a snippet's async work
+/// runs in an IIFE that records its outcome into these top-level fields; the eval client polls [evalDone] then
+/// reads [evalResult] / [evalError]. State persists across evals (the daemon isolate is long-lived).
+/// [evalGen] stamps each fire so a stale, still-running IIFE (e.g. a blocking snippet the client timed out on)
+/// can't clobber a newer eval's fields — a completion only writes them if its generation is still current.
+Object? evalResult;
+Object? evalError;
+bool evalDone = false;
+int evalGen = 0;
+
+/// Await a snippet's result while tolerating a `void`-typed one: a `dynamic` return erases `void`, so a
+/// `Future<void>` action (e.g. `session.connect(2)`) captures `null` instead of failing to compile with
+/// "expression has type 'void'". Public (like the eval fields) so the fired eval IIFE can call it by name.
+Future<Object?> evalCapture(dynamic Function() run) async => await run();
 
 Future<void> main(List<String> args) async {
   if (args.isEmpty) {
@@ -157,7 +174,7 @@ Future<void> main(List<String> args) async {
   args = _resolveStateRoot(args);
   // The interactive regtest — serve's backend AND the `fsim regtest` commands — is this session's own,
   // under the state root, not the shared node.
-  regtestDirOverride = Directory('${_stateRoot.path}/regtest');
+  regtestDirOverride = _stateRoot;
   if (args.first == 'serve') {
     await _serve(args.skip(1).toList());
   } else if (args.first == 'up') {
@@ -166,6 +183,10 @@ Future<void> main(List<String> args) async {
     await runRegtest(args.skip(1).toList());
   } else if (args.first == 'clean') {
     await _clean();
+  } else if (args.first == 'eval') {
+    await _eval(args.skip(1).toList());
+  } else if (args.first == 'repl') {
+    await _repl(args.skip(1).toList());
   } else {
     await _client(args);
   }
@@ -181,8 +202,8 @@ Future<void> _clean() async {
     exit(1);
   }
   // Reap THIS session's regtest (a graceful `down` already self-reaped it; this catches a killed session's
-  // leftover) — scoped to <dir>/.fsim/regtest, so it never touches another session's backend.
-  await reapRegtestSessionDir(Directory('${_stateRoot.path}/regtest'));
+  // leftover) — scoped to <dir>/.fsim/regtest.*, so it never touches another session's backend.
+  await reapRegtestSessionDir(_stateRoot);
   // Reap THIS session's self-booted android emulator if a hard-killed session left one (recorded serial) —
   // scoped to this session, NEVER a global sweep that could kill a concurrent test run's pool emulator.
   final emSerialFile = File('${_stateRoot.path}/emulator-serial');
@@ -199,6 +220,211 @@ Future<void> _clean() async {
   final root = _stateRoot;
   if (await root.exists()) await root.delete(recursive: true);
   stdout.writeln(jsonEncode({'ok': true, 'cleaned': root.path}));
+}
+
+const _evalHelp =
+    r'''fsim eval [--timeout SECS] "<dart>" — evaluate live Dart against the running session: a stateful
+console over the SAME harness the e2e tests drive. The snippet is an expression; you may `await`; state
+persists across calls. (Multi-statement / imports / decls: use `fsim test <file>`.) A snippet times out after
+60s (--timeout SECS to change) so a blocking `await`/`waitFor` recovers instead of hanging forever.
+
+Console scope:
+  session                  the AppSession harness (the app + its virtual devices)
+  instances[K]             the K-th app instance (`up --instances N`); session == instances[0]
+  session.device(n)        a virtual device (raw pixel input + framebuffer)
+  await session.faucet()   this session's regtest faucet (fund/mine/balances)
+
+Common:
+  session.chain()                          connected chain order -> List<int>
+  session.deviceNumbers()                  all device numbers
+  await session.connect(n) / disconnect(n) plug / unplug device n (+ downstream)
+  await session.setChain([3, 1, 2])        re-cable to exactly these devices, in order
+  session.tap(label) / enterText(label, t) / exists(label)
+  await session.device(n).holdConfirm(x, y)         device hold-to-confirm
+  (await session.faucet()).blockHeight() / .fund(addr, sats) / .balanceSat()
+
+Full reference (every session / device / faucet method): test_driver/COMMANDS.md
+''';
+
+/// `fsim eval "<dart>"` — ship a live Dart snippet to the running daemon and evaluate it against the console
+/// scope (`session` + the daemon's root library), printing its value or its error. Connects to the daemon's
+/// VM service (published at `<dir>/.fsim/vmservice.uri` by [_serve]) and runs the snippet through the
+/// fire-and-poll async harness, so the snippet MAY `await`. State persists across calls (stateful console).
+/// The snippet is a Dart EXPRESSION (its value is the result); statements/decls need the `fsim test` file path.
+/// `--help` (or no snippet) prints [_evalHelp] — a cheat-sheet pointing at test_driver/COMMANDS.md.
+/// Connect to the running daemon's VM service (published at `<dir>/.fsim/vmservice.uri` by [_serve]) and
+/// return the service + the isolate/root-library ids to evaluate against. Exits with a clear message if
+/// there is no live session.
+Future<(VmService, String, String)> _connectDaemon() async {
+  final uriFile = File('${_stateRoot.path}/vmservice.uri');
+  if (!uriFile.existsSync()) {
+    stderr.writeln(
+      'no live session — is `fsim up` running? (missing ${uriFile.path})',
+    );
+    exit(1);
+  }
+  final base = Uri.parse(uriFile.readAsStringSync().trim());
+  final wsPath = base.path.endsWith('/') ? '${base.path}ws' : '${base.path}/ws';
+  final ws = base.replace(scheme: 'ws', path: wsPath).toString();
+  final VmService service;
+  try {
+    service = await vmServiceConnectUri(ws);
+  } catch (e) {
+    stderr.writeln(
+      'cannot reach the daemon VM service ($e) — stale session? try `fsim up`',
+    );
+    exit(1);
+  }
+  final vm = await service.getVM();
+  final isolateId = vm.isolates!.first.id!;
+  final rootLibId = (await service.getIsolate(isolateId)).rootLib!.id!;
+  return (service, isolateId, rootLibId);
+}
+
+/// Evaluate ONE snippet against the daemon via the fire-and-poll async harness (so the snippet may `await`)
+/// and return `(output, isError)` — the result's `toString()`, or the error text.
+Future<(String, bool)> _evalOnce(
+  VmService service,
+  String isolateId,
+  String rootLibId,
+  String snippet,
+  Duration timeout,
+) async {
+  // Fire an unawaited async IIFE that evaluates the snippet and records the outcome into the daemon's
+  // top-level fields — `evaluate` compiles synchronously, so a top-level `await` is illegal but firing an
+  // async closure is not. `final g = ++evalGen` stamps this fire: on completion it writes the fields ONLY if
+  // its generation is still current, so a stale still-running IIFE (a blocking snippet the client timed out
+  // on, then retried) can't clobber a newer eval's fields. Close any faucet the snippet opened so its
+  // connection stays short-lived across evals (the backend control server serves one connection at a time).
+  final fire =
+      '(() async { final g = ++evalGen; evalDone = false; evalError = null; evalResult = null; '
+      'try { final r = await evalCapture(() async => $snippet); if (evalGen == g) evalResult = r; } '
+      "catch (e, s) { if (evalGen == g) evalError = '\$e\\n\$s'; } "
+      'finally { for (final i in instances) { try { await i.closeFaucet(); } catch (_) {} } if (evalGen == g) evalDone = true; } })()';
+  final Response fired;
+  try {
+    fired = await service.evaluate(isolateId, rootLibId, fire);
+  } catch (e) {
+    // A snippet compile error is THROWN as an RPCError (not returned as an ErrorRef) — surface it so
+    // eval/repl report it (and the repl keeps going) instead of crashing. Pull the `Error:` lines out of
+    // the VM's verbose details, which otherwise echo the whole fire wrapper.
+    final raw = e is RPCError ? (e.details ?? e.message) : '$e';
+    final errs = raw
+        .split('\n')
+        .where((l) => l.contains('Error:'))
+        .map((l) => l.substring(l.indexOf('Error:') + 6).trim());
+    return (errs.isEmpty ? raw.trim() : errs.join('; '), true);
+  }
+  if (fired is ErrorRef) return (fired.message ?? 'compile error', true);
+  // Poll evalDone — the isolate's event loop resolves the fired Future between our sync evals — but bound it
+  // with a deadline so a BLOCKING snippet (e.g. `await session.waitFor("X")` for an X that never appears)
+  // makes the client RECOVER with a timeout error instead of spinning forever. The fired IIFE keeps running
+  // in the daemon (harmless — gen-guarded), so a retry won't be clobbered.
+  final deadline = DateTime.now().add(timeout);
+  while (true) {
+    final done = await service.evaluate(isolateId, rootLibId, 'evalDone');
+    if (done is InstanceRef && done.valueAsString == 'true') break;
+    if (DateTime.now().isAfter(deadline)) {
+      return (
+        'eval timed out after ${timeout.inSeconds}s; the snippet is still running in the daemon '
+            '(raise --timeout, or check for a waitFor/await that never completes)',
+        true,
+      );
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+  }
+  final err = await service.evaluate(isolateId, rootLibId, 'evalError');
+  if (err is InstanceRef && err.kind != InstanceKind.kNull) {
+    return (err.valueAsString ?? '<${err.classRef?.name}>', true);
+  }
+  // Read the result's toString(), not the raw ref, so lists/maps/records print their VALUE (`[1, 2, 3]`)
+  // not `<_GrowableList>`. `toString()` is valid on the nullable field (null -> "null").
+  final res = await service.evaluate(
+    isolateId,
+    rootLibId,
+    'evalResult.toString()',
+  );
+  if (res is InstanceRef) {
+    return (res.valueAsString ?? '<${res.classRef?.name}>', false);
+  }
+  return ('', false);
+}
+
+/// `fsim eval "<dart>"` — evaluate ONE live Dart snippet against the running session's console scope
+/// (`session` + the daemon root library) and print its value or error. State persists across calls (the
+/// daemon isolate is long-lived). `--help` (or no snippet) prints [_evalHelp].
+Future<void> _eval(List<String> args) async {
+  if (args.isEmpty || args.first == '--help' || args.first == '-h') {
+    stdout.write(_evalHelp);
+    exit(args.isEmpty ? 2 : 0);
+  }
+  var timeout = const Duration(seconds: 60);
+  final rest = <String>[];
+  for (var i = 0; i < args.length; i++) {
+    if (args[i] == '--timeout' && i + 1 < args.length) {
+      timeout = Duration(seconds: int.parse(args[i + 1]));
+      i++;
+    } else {
+      rest.add(args[i]);
+    }
+  }
+  final snippet = rest.join(' ').trim();
+  if (snippet.isEmpty) {
+    stderr.writeln(
+      'usage: fsim eval [--timeout SECS] "<dart expression>"  (see `fsim eval --help`)',
+    );
+    exit(2);
+  }
+  final (service, isolateId, rootLibId) = await _connectDaemon();
+  try {
+    final (out, isError) = await _evalOnce(
+      service,
+      isolateId,
+      rootLibId,
+      snippet,
+      timeout,
+    );
+    if (isError) {
+      stderr.writeln('ERROR: $out');
+      exitCode = 1;
+    } else {
+      stdout.writeln(out);
+    }
+  } finally {
+    await service.dispose();
+  }
+  exit(exitCode);
+}
+
+/// `fsim repl` — the same console as [_eval], kept OPEN: read a line, evaluate it against the live session,
+/// print the result, repeat. State persists between lines. Ctrl-D (EOF) or `exit`/`quit` leaves.
+Future<void> _repl(List<String> args) async {
+  final (service, isolateId, rootLibId) = await _connectDaemon();
+  stdout.writeln(
+    'fsim repl — live Dart against the session (`session.…`; see `fsim eval --help`). Ctrl-D / `exit` to quit.',
+  );
+  try {
+    while (true) {
+      stdout.write('fsim> ');
+      final line = stdin.readLineSync();
+      if (line == null) break; // EOF (Ctrl-D)
+      final snippet = line.trim();
+      if (snippet.isEmpty) continue;
+      if (snippet == 'exit' || snippet == 'quit') break;
+      final (out, isError) = await _evalOnce(
+        service,
+        isolateId,
+        rootLibId,
+        snippet,
+        const Duration(seconds: 60),
+      );
+      stdout.writeln(isError ? 'ERROR: $out' : out);
+    }
+  } finally {
+    await service.dispose();
+  }
+  stdout.writeln();
+  exit(0);
 }
 
 /// Whether a `serve` daemon is listening on the control socket.
@@ -226,9 +452,11 @@ Future<void> _up(List<String> args) async {
   var count = 1;
   // Default to the host desktop OS so it matches what `serve`/_resolvePlatform would launch (else `up` on
   // Linux would read the launched linux daemon as an incompatible-platform mismatch).
+  var wantInstances = 1;
   var wantPlatform = Platform.isLinux ? 'linux' : 'macos';
   for (var i = 0; i < args.length - 1; i++) {
     if (args[i] == '--devices') count = int.parse(args[i + 1]);
+    if (args[i] == '--instances') wantInstances = int.parse(args[i + 1]);
     if (args[i] == '--platform') wantPlatform = args[i + 1];
   }
   // `--android` targets an emulator (the exact serial is resolved by the launched `serve`, so the
@@ -243,6 +471,7 @@ Future<void> _up(List<String> args) async {
     final info = await _query({'cmd': 'info'});
     final live = (
       count: info['count'] as int,
+      instances: (info['instances'] as int?) ?? 1,
       regtest: info['regtest'] as bool,
       keyboard: info['keyboard'] as bool,
       platform: info['platform'] as String? ?? 'macos',
@@ -258,6 +487,7 @@ Future<void> _up(List<String> args) async {
     final compatible =
         platformOk &&
         live.count == count &&
+        live.instances == wantInstances &&
         live.keyboard == wantKeyboard &&
         live.regtest == wantRegtest;
     if (compatible) {
@@ -271,8 +501,8 @@ Future<void> _up(List<String> args) async {
         'ok': false,
         'error':
             'a different-shape sim daemon is already running '
-            '(platform=${live.platform}, count=${live.count}, regtest=${live.regtest}, '
-            'agentOwnsKeyboard=${live.keyboard}); run `./fsim down` first',
+            '(platform=${live.platform}, count=${live.count}, instances=${live.instances}, '
+            'regtest=${live.regtest}, agentOwnsKeyboard=${live.keyboard}); run `./fsim down` first',
       }),
     );
     exit(1);
@@ -1152,12 +1382,16 @@ Future<String> _claimAndBootSessionEmulator() async {
 
 Future<void> _serve(List<String> args) async {
   var count = 1;
+  // `--instances N`: hold N app windows (each with `count` devices) on the session's ONE regtest, drivable via
+  // the eval scope as `instances[K]`. Default 1 (`session` == `instances[0]`).
+  var instanceCount = 1;
   // Default: a human owns the keyboard (real typing works, `enter` is rejected). Pass
   // --agent-owns-keyboard for the driver to own text input instead (enables `enter`,
   // blocks the physical keyboard). One mode for the session — no hybrid.
   final agentOwnsKeyboard = args.contains('--agent-owns-keyboard');
   for (var i = 0; i < args.length - 1; i++) {
     if (args[i] == '--devices') count = int.parse(args[i + 1]);
+    if (args[i] == '--instances') instanceCount = int.parse(args[i + 1]);
   }
   // Regtest is ON by default (the common case is a wallet that can receive); `--no-regtest` opts out.
   final wantRegtest = !args.contains('--no-regtest');
@@ -1191,7 +1425,7 @@ Future<void> _serve(List<String> args) async {
   // speaks either). The app then runs regtest unaware it's remote.
   final extraDefines = <String, String>{};
   ServerSocket? controlProxy;
-  // This session's OWN regtest backend (under <dir>/.fsim/regtest): started below, held for the daemon's
+  // This session's OWN regtest backend (flat in <dir>/.fsim as regtest.*): started below, held for the daemon's
   // lifetime so it self-reaps on a hard kill (the death-pipe), and stopped in shutdown() on a graceful down.
   RegtestSession? rtSession;
   // Host-only liveness socket the app holds open + exits when it drops, so a hard-killed serve doesn't
@@ -1202,6 +1436,13 @@ Future<void> _serve(List<String> args) async {
   final livenessClients = <Socket>{};
   try {
     serveLog('fsim: resolving target …');
+    // Android multi-instance under `up` is deferred: the serve pre-claims + bridges ONE session emulator, and
+    // provisionAppInstance's per-instance emulator model is host-multi only. Reject BEFORE booting anything.
+    if (instanceCount > 1 && args.contains('--android')) {
+      throw StateError(
+        '--instances N (N>1) is host-only; --android runs a single instance',
+      );
+    }
     platform = await _resolvePlatform(args);
     isHost = _hostPlatforms.contains(platform);
     serveLog('fsim: target $platform (${isHost ? 'host' : 'emulator'})');
@@ -1211,18 +1452,14 @@ Future<void> _serve(List<String> args) async {
       File('${_stateRoot.path}/emulator-serial').writeAsStringSync(platform);
     }
 
-    // Regtest: this session owns its OWN backend under <dir>/.fsim/regtest — started here, reaped on
+    // Regtest: this session owns its OWN backend flat in <dir>/.fsim (regtest.*) — started here, reaped on
     // shutdown (or self-reaped via the death-pipe on a hard kill), so `down` leaves no orphan and no shared
     // node is touched. On host the app reaches its unix control socket + electrum TCP directly; on an
     // emulator those host endpoints are unreachable, so bridge them over adb (best-effort: a bridge failure
     // degrades to an OFFLINE session rather than sinking the bring-up).
     if (wantRegtest) {
-      serveLog(
-        'fsim: starting session regtest under ${_stateRoot.path}/regtest …',
-      );
-      rtSession = await startRegtestSession(
-        Directory('${_stateRoot.path}/regtest'),
-      );
+      serveLog('fsim: starting session regtest under ${_stateRoot.path} …');
+      rtSession = await startRegtestSession(_stateRoot);
       if (isHost) {
         extraDefines['SIM_REGTEST_ELECTRUM_URL'] = rtSession.url;
         extraDefines['SIM_REGTEST_CONTROL_SOCKET'] = rtSession.controlSocket;
@@ -1287,18 +1524,59 @@ Future<void> _serve(List<String> args) async {
       extraDefines['SIM_SERVE_LIVENESS_SOCKET'] = livenessPath;
     }
 
-    serveLog('fsim: launching the app on $platform (first build is slow) …');
-    // One session shape (devices drive over the app channel everywhere); regtest is wired purely through
-    // extraDefines above (this session's own backend), so _launchApp never touches a shared node.
-    harness = await AppSession.launch(
-      deviceCount: count,
-      flutterDevice: platform,
-      agentOwnsKeyboard: agentOwnsKeyboard,
-      withRegtest: false,
-      extraDartDefines: extraDefines,
-      appDirRoot: _stateRoot,
-      logSink: logSink,
+    serveLog(
+      'fsim: launching $instanceCount app instance(s) on $platform (first build is slow) …',
     );
+    final launched = <AppSession>[];
+    if (isHost) {
+      // Host: N windows via the SHARED seam (the same Scenario.provisionAppInstance the tests use) on the
+      // session's ONE regtest — no duplicated launch loop. instances[0] is `session`; the seam attaches the
+      // regtest, so `instances[K].faucet()` reaches THIS session's backend.
+      for (var i = 0; i < instanceCount; i++) {
+        launched.add(
+          await Scenario.provisionAppInstance(
+            index: i,
+            total: instanceCount,
+            flutterDevice: platform,
+            chain: rtSession,
+            deviceCount: count,
+            extraDartDefines: extraDefines,
+            appDirRoot: _stateRoot,
+            agentOwnsKeyboard: agentOwnsKeyboard,
+            logSink: logSink,
+          ),
+        );
+      }
+    } else {
+      // Android (single instance): the serve already booted + bridged its ONE session emulator above
+      // (`platform` == its serial); launch the app on THAT serial directly and attach the regtest — so the
+      // recorded emulator-serial + regtest bridge describe the actual AppSession serve owns. (Per-instance
+      // emulators are host-multi only; guarded above.)
+      final h = await AppSession.launch(
+        deviceCount: count,
+        flutterDevice: platform,
+        agentOwnsKeyboard: agentOwnsKeyboard,
+        extraDartDefines: extraDefines,
+        appDirRoot: _stateRoot,
+        logSink: logSink,
+      );
+      h.regtestBackend = rtSession;
+      launched.add(h);
+    }
+    harness = launched.first;
+    instances = launched;
+
+    // Enable THIS daemon's VM service so `fsim eval`/`repl` can ship live Dart to it against the console
+    // scope (`session` / `instances[K]`), and publish the URI for the client. The daemon isolate is long-lived,
+    // so state persists across evals. controlWebServer starts the service at runtime — no launch flag needed.
+    final vmInfo = await developer.Service.controlWebServer(
+      enable: true,
+      silenceOutput: true,
+    );
+    final vmUri = vmInfo.serverUri;
+    if (vmUri != null) {
+      File('${_stateRoot.path}/vmservice.uri').writeAsStringSync('$vmUri');
+    }
 
     try {
       File(_socketPath).deleteSync();
@@ -1329,9 +1607,17 @@ Future<void> _serve(List<String> args) async {
       try {
         File(_socketPath).deleteSync();
       } catch (_) {}
+      try {
+        File('${_stateRoot.path}/vmservice.uri').deleteSync();
+      } catch (_) {}
       // tearDown reaps the app orderly on a graceful down; only THEN close the liveness socket, so its
-      // watcher stays a pure hard-kill backstop (never fires mid-teardown).
-      await harness.tearDown();
+      // watcher stays a pure hard-kill backstop (never fires mid-teardown). Best-effort per instance so one
+      // hiccup doesn't strand the others' windows.
+      for (final h in instances) {
+        try {
+          await h.tearDown();
+        } catch (_) {}
+      }
       for (final c in livenessClients.toList()) {
         try {
           await c.close();
@@ -1364,12 +1650,14 @@ Future<void> _serve(List<String> args) async {
   // window closing terminates it and exits `flutter run`), shut down so the control socket goes
   // away and `./fsim up` RELAUNCHES instead of reporting already:true. (The captured app output
   // already logs the app finishing; awaiting shutdown() shares the one cleanup before exit.)
-  unawaited(
-    harness.appExitCode.then((_) async {
-      await shutdown();
-      exit(0);
-    }),
-  );
+  for (final h in instances) {
+    unawaited(
+      h.appExitCode.then((_) async {
+        await shutdown();
+        exit(0);
+      }),
+    );
+  }
 
   await for (final conn in server) {
     final lines = conn
@@ -1414,47 +1702,11 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
   } catch (e) {
     return ({'ok': false, 'error': 'bad json: $e'}, false);
   }
-  Pattern pat(String key, String flag) =>
-      req[flag] == true ? RegExp(req[key] as String) : req[key] as String;
-  // Which virtual device a device-command targets (1-based, default 1).
-  final dn = (req['device'] as int?) ?? 1;
-
-  // Every command — device driving included — runs over the app channel (driver-data → the in-process
-  // simDevicePool), so it works on host AND emulator. No host-only device sockets, no SimHarness vs
-  // AppSession split, and no channel-cache to reconcile: the app-side fleet is the only source.
+  // Only the daemon-control verbs remain here — the drive surface (device driving, chain, wallet, …) moved to
+  // `fsim eval "session.…"` against this daemon's live harness.
   final cmd = req['cmd'];
   try {
     switch (cmd) {
-      case 'tap':
-        await h.tap(pat('label', 'regex'));
-        return ({'ok': true}, false);
-      case 'tapUntil':
-        await h.tapUntil(pat('label', 'regex'), pat('expect', 'regexExpect'));
-        return ({'ok': true}, false);
-      case 'enter':
-        if (!agentOwnsKeyboard) {
-          return (
-            {
-              'ok': false,
-              'error':
-                  'enter is unavailable when a human owns the keyboard; type into the '
-                  'app directly, or relaunch with `./fsim serve --agent-owns-keyboard`',
-            },
-            false,
-          );
-        }
-        await h.enterText(pat('label', 'regex'), req['text'] as String);
-        return ({'ok': true}, false);
-      case 'wait':
-        await h.waitFor(pat('label', 'regex'));
-        return ({'ok': true}, false);
-      case 'exists':
-        return (
-          {'ok': true, 'exists': await h.exists(pat('label', 'regex'))},
-          false,
-        );
-      case 'clipboard':
-        return ({'ok': true, 'text': await h.getClipboard()}, false);
       case 'info':
         // The daemon's LAUNCH shape — `./fsim up` compares `count` against the requested
         // --devices to decide whether an already-live daemon satisfies the request. It's the
@@ -1466,6 +1718,9 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
           {
             'ok': true,
             'count': launchDeviceCount,
+            // How many app instances the serve holds (`up --instances N`); part of the shape `up`
+            // idempotence checks, so a 2-instance request won't reuse a 1-instance daemon.
+            'instances': instances.length,
             'currentDevices': current,
             'regtest': withRegtest,
             'keyboard': agentOwnsKeyboard,
@@ -1475,73 +1730,6 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
           },
           false,
         );
-      case 'addDevice':
-        return ({'ok': true, 'device': await h.addDevice()}, false);
-      case 'devices':
-        final list = <Map<String, dynamic>>[];
-        for (final n in await h.deviceNumbers()) {
-          list.add({
-            'number': n,
-            'id': await h.device(n).deviceId(),
-            'connected': await h.device(n).isConnected(),
-          });
-        }
-        return ({'ok': true, 'devices': list}, false);
-      case 'chain':
-        return ({'ok': true, 'chain': await h.chain()}, false);
-      case 'setChain':
-        await h.setChain((req['order'] as List).cast<int>());
-        return ({'ok': true}, false);
-      case 'connect':
-        await h.connect(req['device'] as int);
-        return ({'ok': true}, false);
-      case 'disconnect':
-        await h.disconnect(req['device'] as int);
-        return ({'ok': true}, false);
-      case 'moveUp':
-        await h.moveUp(req['device'] as int);
-        return ({'ok': true}, false);
-      case 'moveDown':
-        await h.moveDown(req['device'] as int);
-        return ({'ok': true}, false);
-      case 'hold':
-        final ms = req['ms'] as int?;
-        await h
-            .device(dn)
-            .holdConfirm(
-              req['x'] as int,
-              req['y'] as int,
-              ms != null
-                  ? Duration(milliseconds: ms)
-                  : const Duration(milliseconds: 2600),
-            );
-        return ({'ok': true}, false);
-      case 'swipe':
-        await h
-            .device(dn)
-            .swipe(
-              req['x1'] as int,
-              req['y1'] as int,
-              req['x2'] as int,
-              req['y2'] as int,
-              Duration(milliseconds: (req['ms'] as int?) ?? 300),
-            );
-        return ({'ok': true}, false);
-      case 'touch':
-        await h
-            .device(dn)
-            .touch(
-              req['x'] as int,
-              req['y'] as int,
-              liftUp: req['liftUp'] as bool,
-            );
-        return ({'ok': true}, false);
-      case 'setConnected':
-        await h.device(dn).setConnected(req['connected'] as bool);
-        return ({'ok': true}, false);
-      case 'screen':
-        await h.device(dn).screen(req['path'] as String);
-        return ({'ok': true, 'path': req['path']}, false);
       case 'shot':
         // No path -> the session dir (cleaned up on teardown); an explicit path is kept.
         final reqPath = req['path'] as String?;
@@ -1612,99 +1800,15 @@ Future<void> _client(List<String> args) async {
   exit((jsonDecode(reply) as Map<String, dynamic>)['ok'] == true ? 0 : 1);
 }
 
-/// Translate `fsim <cmd> ...` argv into the wire command, or null if unrecognized.
+/// Translate `fsim <cmd> ...` argv into the wire command, or null if unrecognized. Only the daemon-control
+/// verbs remain — the drive surface (tap/chain/hold/enter/…) is now `fsim eval "session.…"` (see
+/// `fsim eval --help` / test_driver/COMMANDS.md).
 Map<String, dynamic>? _argsToCommand(List<String> args) {
-  // Pull the valued option `--device <n>` (the virtual-device selector) out before
-  // positional parsing, so its value isn't mistaken for a positional argument.
-  var device = 1;
-  final rest = <String>[];
-  for (var i = 0; i < args.length; i++) {
-    if (args[i] == '--device' && i + 1 < args.length) {
-      device = int.parse(args[i + 1]);
-      i++;
-    } else {
-      rest.add(args[i]);
-    }
-  }
-  bool flag(String f) => rest.contains(f);
-  final pos = rest.where((a) => !a.startsWith('--')).toList();
+  final pos = args.where((a) => !a.startsWith('--')).toList();
   if (pos.isEmpty) return null;
   switch (pos.first) {
-    case 'tap':
-      return {'cmd': 'tap', 'label': pos[1], 'regex': flag('--regex')};
-    case 'tap-until':
-      return {
-        'cmd': 'tapUntil',
-        'label': pos[1],
-        'expect': pos[2],
-        'regex': flag('--regex'),
-        'regexExpect': flag('--regex-expect'),
-      };
-    case 'enter':
-      return {
-        'cmd': 'enter',
-        'label': pos[1],
-        'text': pos[2],
-        'regex': flag('--regex'),
-      };
-    case 'wait':
-      return {'cmd': 'wait', 'label': pos[1], 'regex': flag('--regex')};
-    case 'exists':
-      return {'cmd': 'exists', 'label': pos[1], 'regex': flag('--regex')};
-    case 'clipboard':
-      return {'cmd': 'clipboard'};
     case 'info':
       return {'cmd': 'info'};
-    case 'devices':
-      return {'cmd': 'devices'};
-    case 'add-device':
-      return {'cmd': 'addDevice'};
-    case 'chain':
-      return {'cmd': 'chain'};
-    case 'set-chain':
-      return {'cmd': 'setChain', 'order': pos.skip(1).map(int.parse).toList()};
-    case 'connect':
-      return {'cmd': 'connect', 'device': int.parse(pos[1])};
-    case 'disconnect':
-      return {'cmd': 'disconnect', 'device': int.parse(pos[1])};
-    case 'move-up':
-      return {'cmd': 'moveUp', 'device': int.parse(pos[1])};
-    case 'move-down':
-      return {'cmd': 'moveDown', 'device': int.parse(pos[1])};
-    case 'hold':
-      return {
-        'cmd': 'hold',
-        'x': int.parse(pos[1]),
-        'y': int.parse(pos[2]),
-        if (pos.length > 3) 'ms': int.parse(pos[3]),
-        'device': device,
-      };
-    case 'swipe':
-      return {
-        'cmd': 'swipe',
-        'x1': int.parse(pos[1]),
-        'y1': int.parse(pos[2]),
-        'x2': int.parse(pos[3]),
-        'y2': int.parse(pos[4]),
-        if (pos.length > 5) 'ms': int.parse(pos[5]),
-        'device': device,
-      };
-    case 'touch':
-      return {
-        'cmd': 'touch',
-        'x': int.parse(pos[1]),
-        'y': int.parse(pos[2]),
-        'liftUp': pos[3] == 'up',
-        'device': device,
-      };
-    case 'set-connected':
-      return {
-        'cmd': 'setConnected',
-        'connected': pos[1] == 'true',
-        'device': device,
-      };
-    case 'screen':
-      return {'cmd': 'screen', 'path': pos[1], 'device': device};
     case 'shot':
       return {'cmd': 'shot', if (pos.length > 1) 'path': pos[1]};
     case 'down':

@@ -14,21 +14,23 @@ import 'sim_harness.dart' show simTmpRoot;
 // tray), so the protocol has one implementation.
 
 /// When set (by the interactive fsim path in `main`), the `fsim regtest` commands + [ensureRegtestBackend]
-/// operate on THIS session's regtest dir (`<session>/.fsim/regtest`) instead of the shared
-/// `${simTmpRoot()}/regtest`. The test runner leaves it null and drives its own [startRegtestSession] chains
-/// by dir directly.
+/// operate on THIS session's regtest (`<session>/.fsim/regtest.{sock,url,log}`, flat in the state root)
+/// instead of the shared temp root. The test runner leaves it null and drives its own [startRegtestSession]
+/// chains by dir directly.
 Directory? regtestDirOverride;
 
-/// The regtest backend dir: this session's (when [regtestDirOverride] is set) else the shared one.
-Directory _regtestDir() {
-  final dir = regtestDirOverride ?? Directory('${simTmpRoot().path}/regtest');
+/// The regtest backend's ROOT dir — this session's state root when [regtestDirOverride] is set, else the
+/// shared temp root. Its files live FLAT in it as `regtest.{sock,url,log}` (no `regtest/` subdir), so a
+/// session root can hold them right next to daemon files without a nested dir.
+Directory _regtestRoot() {
+  final dir = regtestDirOverride ?? simTmpRoot();
   dir.createSync(recursive: true);
   return dir;
 }
 
-String get regtestControlSocket => '${_regtestDir().path}/control.sock';
-String get regtestUrlFile => '${_regtestDir().path}/electrum_url';
-String get _regtestLogFile => '${_regtestDir().path}/backend.log';
+String get regtestControlSocket => '${_regtestRoot().path}/regtest.sock';
+String get regtestUrlFile => '${_regtestRoot().path}/regtest.url';
+String get _regtestLogFile => '${_regtestRoot().path}/regtest.log';
 
 /// The PID the backend at [controlSocket] reports from `ping`, or null if none is (yet) live. Only
 /// the process that won `bind_control_socket` serves, so its PID identifies the live backend at that
@@ -254,8 +256,11 @@ class RegtestSession {
   /// The sim_regtest PID == its process-group leader — the reap handle for [stop].
   final int pid;
 
-  /// This session's private dir (control socket, url file, backend log) — removed on [stop].
-  final Directory dir;
+  /// The regtest's OWN files (control socket, url file, backend log) — removed on [stop]. The regtest owns
+  /// ONLY these, never the session root dir (an interactive session shares that root with daemon files + app
+  /// dirs); [stop] rmdir's the root non-recursively afterward, so a test's dedicated dir doesn't linger but a
+  /// shared session root survives.
+  final List<String> _ownedFiles;
 
   /// The spawned backend process, HELD for the session's lifetime so its stdin pipe (whose write end we
   /// own) stays open. If this owner dies ANY way — including a SIGKILL that skips [stop] — the kernel
@@ -267,9 +272,10 @@ class RegtestSession {
     required this.url,
     required this.controlSocket,
     required this.pid,
-    required this.dir,
+    required List<String> ownedFiles,
     required Process backend,
-  }) : _backend = backend;
+  }) : _ownedFiles = ownedFiles,
+       _backend = backend;
 
   Future<SimFaucet> faucet() => SimFaucet.connect(controlSocket);
 
@@ -295,21 +301,36 @@ class RegtestSession {
     try {
       await _backend.stdin.close();
     } catch (_) {}
-    try {
-      if (await dir.exists()) await dir.delete(recursive: true);
-    } catch (_) {}
+    await _removeRegtestFiles(_ownedFiles);
   }
 }
 
-/// Reap a possibly-running isolated regtest session rooted at [dir].
+/// Delete the regtest's OWN files, then rmdir their (shared) parent NON-recursively — which succeeds only if
+/// it is now empty. A test's dedicated regtest dir gets cleaned; an interactive session root that still holds
+/// daemon files + app dirs is left intact.
+Future<void> _removeRegtestFiles(List<String> files) async {
+  for (final f in files) {
+    try {
+      final file = File(f);
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
+  }
+  if (files.isEmpty) return;
+  try {
+    await File(files.first).parent.delete(recursive: false);
+  } catch (_) {}
+}
+
+/// Reap a possibly-running isolated regtest session whose files live under [dir] (`regtest.{sock,url,log}`).
 ///
 /// Used by the outer test runner's timeout path, where the timed-out test process
 /// may never reach [RegtestSession.stop]. We no longer have the in-process
 /// [RegtestSession] value, so recover the backend PID from its control socket (or,
 /// during startup, the process command line), then reap the whole backend process
-/// group so bitcoind/electrs children do not leak.
+/// group so bitcoind/electrs children do not leak. Removes only the regtest's own files (then rmdir's [dir]
+/// if empty) — never a recursive delete of the session root.
 Future<void> reapRegtestSessionDir(Directory dir) async {
-  final controlSocket = '${dir.path}/control.sock';
+  final controlSocket = '${dir.path}/regtest.sock';
   final pid =
       await _ownerPidAt(controlSocket) ??
       await _pidForControlSocket(controlSocket);
@@ -327,9 +348,11 @@ Future<void> reapRegtestSessionDir(Directory dir) async {
       await _killProcessGroup(pid);
     }
   }
-  try {
-    if (await dir.exists()) await dir.delete(recursive: true);
-  } catch (_) {}
+  await _removeRegtestFiles([
+    controlSocket,
+    '${dir.path}/regtest.url',
+    '${dir.path}/regtest.log',
+  ]);
 }
 
 Future<int?> _pidForControlSocket(String controlSocket) async {
@@ -352,11 +375,13 @@ Future<int?> _pidForControlSocket(String controlSocket) async {
   return null;
 }
 
-/// Start a fresh, isolated [RegtestSession] under [dir] (created if absent). Always spawns its own
-/// backend (no attach) — the caller owns it and MUST `stop()` it. Throws on build/startup failure.
+/// Start a fresh, isolated [RegtestSession] with its files placed FLAT under [dir] (created if absent) as
+/// `regtest.{sock,url,log}` — so [dir] can be a session root shared with daemon files, not an owned subdir.
+/// Always spawns its own backend (no attach) — the caller owns it and MUST `stop()` it. Throws on
+/// build/startup failure.
 Future<RegtestSession> startRegtestSession(Directory dir) async {
   dir.createSync(recursive: true);
-  final controlSocket = '${dir.path}/control.sock';
+  final controlSocket = '${dir.path}/regtest.sock';
   // Unix-domain socket paths are capped (~104 bytes on macOS). An over-long path makes the backend's
   // bind fail in a way it misreads as a "stale socket" (then crashes on a remove that ENOENTs), so
   // fail CLEARLY here with the actual cause — keep per-session dirs short.
@@ -366,8 +391,8 @@ Future<RegtestSession> startRegtestSession(Directory dir) async {
       '$controlSocket — use a shorter session dir',
     );
   }
-  final urlFile = '${dir.path}/electrum_url';
-  final logFile = '${dir.path}/backend.log';
+  final urlFile = '${dir.path}/regtest.url';
+  final logFile = '${dir.path}/regtest.log';
   final root = _repoRoot();
   await _buildRegtest(root);
   final child = await _spawnRegtest(
@@ -383,7 +408,7 @@ Future<RegtestSession> startRegtestSession(Directory dir) async {
       url: (await File(urlFile).readAsString()).trim(),
       controlSocket: controlSocket,
       pid: pid,
-      dir: dir,
+      ownedFiles: [controlSocket, urlFile, logFile],
       backend: child,
     );
   } catch (_) {
