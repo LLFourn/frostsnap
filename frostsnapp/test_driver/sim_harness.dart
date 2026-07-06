@@ -232,6 +232,7 @@ class Scenario {
   static Future<AppSession> provisionAppInstance({
     required int index,
     required int total,
+    required int slot,
     required String flutterDevice,
     required RegtestSession? chain,
     int deviceCount = 1,
@@ -240,10 +241,9 @@ class Scenario {
     bool agentOwnsKeyboard = true,
     IOSink? logSink,
   }) async {
-    final base =
-        int.tryParse(Platform.environment['FROSTSNAP_SIM_WINDOW_SLOT'] ?? '') ??
-        0;
-    final deviceIndex = base * _maxInstances + index;
+    // [slot] is an EXPLICIT input, not ambient env: the test path passes its per-worker FROSTSNAP_SIM_WINDOW_SLOT
+    // and the interactive serve passes a slot it CLAIMED (a serve process can't set its own env for later reads).
+    final deviceIndex = slot * _maxInstances + index;
     final diagLabel = total > 1
         ? String.fromCharCode('a'.codeUnitAt(0) + index)
         : null;
@@ -271,14 +271,20 @@ class Scenario {
     try {
       await bootEmulator(sdk, avd: avd, port: emulatorPort(deviceIndex));
       await provisionEmulator(sdk, serial);
+      var launchDefines = extraDartDefines;
       if (chain != null) {
-        unbridge = (await bridgeRegtestToEmulator(chain, serial)).unbridge;
+        final bridge = await bridgeRegtestToEmulator(chain, serial);
+        unbridge = bridge.unbridge;
+        // The SEAM owns the android regtest defines (the fixed bridge endpoints) — so a DIRECT caller (the
+        // interactive serve) reaches the chain without threading them itself; the test path's identical
+        // `_regtest.defines` merge idempotently.
+        launchDefines = {...extraDartDefines, ...bridge.defines};
       }
       final h = await AppSession.launch(
         deviceCount: deviceCount,
         flutterDevice: serial,
         agentOwnsKeyboard: agentOwnsKeyboard,
-        extraDartDefines: extraDartDefines,
+        extraDartDefines: launchDefines,
         appDirRoot: appDirRoot,
         logSink: logSink,
       );
@@ -311,9 +317,13 @@ class Scenario {
     int deviceCount = 1,
     Map<String, String> extraDartDefines = const {},
   }) async {
+    final slot =
+        int.tryParse(Platform.environment['FROSTSNAP_SIM_WINDOW_SLOT'] ?? '') ??
+        0;
     final h = await provisionAppInstance(
       index: index,
       total: totalInstances,
+      slot: slot,
       flutterDevice: flutterDevice,
       chain: _regtest?.session,
       deviceCount: deviceCount,
@@ -447,6 +457,10 @@ class AppSession {
   String? _emulatorSerial;
   Future<void> Function()? _unbridge;
 
+  /// The android emulator serial this instance self-booted via the seam, or null on host. The interactive
+  /// serve records these so `down`/`clean` reap EXACTLY the emulators it provisioned (never a global sweep).
+  String? get emulatorSerial => _emulatorSerial;
+
   /// Whether the DRIVER owns text input (`--agent-owns-keyboard`). True routes text through the driver's mock
   /// input so [enterText] works (but the real keyboard is blocked); false — the `fsim up` default, so a human
   /// can type in the GUI — hands the keyboard to the app, and the text-entry verbs fail fast with a clear
@@ -487,11 +501,6 @@ class AppSession {
     _faucet = null;
     await f?.close();
   }
-
-  /// Attach this session's regtest backend so [faucet] works when the harness is driven DIRECTLY — the serve /
-  /// `fsim eval` console — instead of by a [Scenario] (which sets [_chain] itself). Null → no faucet (an
-  /// offline session).
-  set regtestBackend(RegtestSession? session) => _chain = session;
 
   /// Resolves when the launched app process exits — e.g. its window was closed, which (with
   /// `applicationShouldTerminateAfterLastWindowClosed`) terminates the launched app process.

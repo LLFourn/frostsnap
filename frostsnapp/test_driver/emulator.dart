@@ -190,14 +190,22 @@ Future<String> bootEmulator(
 Future<void> killEmulator(String sdk, String serial) =>
     Process.run('$sdk/platform-tools/adb', ['-s', serial, 'emu', 'kill']);
 
-/// Max app instances one test provisions — the FIXED stride mapping (worker slot, instance) → device
-/// index, so an emulator's port/AVD/serial never collides across concurrent workers OR instances. The
-/// runner reaps a slot's emulators over this range; the harness derives each instance's device index.
+/// Max app instances ONE slot provisions — the FIXED per-slot stride, so an emulator's port/AVD/serial never
+/// collides across concurrent slots OR instances. `deviceIndex = globalSlot * maxInstancesPerTest + instance`.
 const maxInstancesPerTest = 2;
 
-/// Deterministic emulator PORT for a global device index (a test's worker-slot × [maxInstancesPerTest] +
-/// its instance index). Kept clear of the interactive emulator's 5554 so a self-booted test emulator
-/// never collides with it, and 2 apart so each gets a distinct serial (`emulator-$port`, from `-port`).
+/// The GLOBAL slot space is PARTITIONED so interactive `up` sessions and concurrent test workers never share
+/// an emulator: test workers take slots `[0, maxTestWorkers)`; interactive sessions take
+/// `[maxTestWorkers, maxTestWorkers + maxInteractiveSessions)` (see [interactiveGlobalSlot]). Every emulator —
+/// test OR interactive — is named by the ONE scheme below ([emulatorPort]/[emulatorAvd] over its deviceIndex);
+/// there is no separate interactive range. The whole partition must fit the console-port ceiling
+/// ([maxConsolePort]): `emulatorPort((maxTestWorkers + maxInteractiveSessions) * maxInstancesPerTest - 1)` =
+/// 5676 ≤ 5682, so up to 16 concurrent test workers + 8 interactive sessions coexist without collision.
+const maxTestWorkers = 16;
+const maxInteractiveSessions = 8;
+
+/// Deterministic emulator PORT for a device index. Clear of the legacy interactive emulator's 5554, and 2
+/// apart so each index gets a distinct serial (`emulator-$port`, from `-port`).
 const emulatorBasePort = 5582;
 int emulatorPort(int deviceIndex) => emulatorBasePort + deviceIndex * 2;
 
@@ -205,17 +213,13 @@ int emulatorPort(int deviceIndex) => emulatorBasePort + deviceIndex * 2;
 String emulatorSerial(int deviceIndex) =>
     'emulator-${emulatorPort(deviceIndex)}';
 
-/// Deterministic AVD name for a device index — NAME-isolated from the interactive `frostsnap_sim` AVD so
-/// a test's self-booted emulator can never boot/clear the interactive wallet.
+/// Deterministic AVD name for a device index — NAME-isolated from the legacy interactive `frostsnap_sim` AVD.
 String emulatorAvd(int deviceIndex) => 'frostsnap_sim_pool_$deviceIndex';
 
-/// Interactive `up --android` SESSION emulator slots: a DEDICATED range for directory-scoped sessions, so
-/// two concurrent `up --android` in different dirs each get their own emulator. Grown DOWNWARD from the top
-/// of the emulator/adb console-port range (5554–5682), away from the test pool ([emulatorBasePort]+, growing
-/// up) and the single legacy interactive emulator (5554) — a running test suite is never disturbed. Bounded;
-/// the claim probes `adb devices` and the port bind arbitrates a race (see fsim's slot claim).
-const maxInteractiveSessions = 8;
-int interactiveSessionPort(int slot) => 5680 - slot * 2;
-String interactiveSessionSerial(int slot) =>
-    'emulator-${interactiveSessionPort(slot)}';
-String interactiveSessionAvd(int slot) => 'frostsnap_sim_session_$slot';
+/// The GLOBAL slot for interactive `up` session slot [s] (0-based), placed ABOVE the test workers' range
+/// `[0, maxTestWorkers)` so an interactive session and a concurrent test run never share an emulator.
+int interactiveGlobalSlot(int s) => maxTestWorkers + s;
+
+/// The Android emulator console-port ceiling (even ports 5554–5682). A slot claim beyond its range must error
+/// clearly rather than derive a port past this.
+const maxConsolePort = 5682;
