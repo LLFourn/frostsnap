@@ -22,23 +22,9 @@ use frostsnap_comms::factory::{self, PaddedMessageBlock, DS_KEY_SIZE_BITS};
 use frostsnap_comms::genuine_certificate::{Certificate, DsSignature};
 use frostsnap_comms::Sha256Digest;
 use frostsnap_core::device::DevicePrf;
+pub use frostsnap_embedded::device_hal::{AttestError, AttestPoll};
+use frostsnap_embedded::device_hal::{DeviceCrypto, NormalCrypto};
 use nb::block;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttestError {
-    NoFactoryKey,
-    FactoryDataUnreadable,
-    /// The signer refused the key or its own result.
-    Rejected,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AttestPoll {
-    Normal,
-    InFlight,
-    /// The outcome of the last [`EspCrypto::start_attestation`], returned once.
-    Done(Result<Box<DsSignature>, AttestError>),
-}
 
 /// ESP-IDF's `SOC_DS_KEY_CHECK_MAX_WAIT_US` for the C3: a DS still busy checking its key after this
 /// got no valid key from the HMAC. It is the only DS wait ESP-IDF bounds.
@@ -261,6 +247,38 @@ impl EspCrypto<'_> {
             State::Finishing { outcome } => return AttestPoll::Done(outcome),
         };
         AttestPoll::InFlight
+    }
+}
+
+impl DeviceCrypto for EspCrypto<'_> {
+    fn try_normal_mode(&mut self) -> Option<impl NormalCrypto + '_> {
+        EspCrypto::try_normal_mode(self)
+    }
+
+    fn force_normal_mode(&mut self) -> impl NormalCrypto + '_ {
+        EspCrypto::force_normal_mode(self)
+    }
+
+    fn start_attestation(&mut self, digest: &Sha256Digest) -> Result<(), AttestError> {
+        EspCrypto::start_attestation(self, digest)
+    }
+
+    fn poll(&mut self) -> AttestPoll {
+        EspCrypto::poll(self)
+    }
+
+    fn certificate(&self) -> Option<Certificate> {
+        EspCrypto::certificate(self)
+    }
+}
+
+impl NormalCrypto for NormalMode<'_, '_> {
+    fn share_encryption(&mut self) -> impl DevicePrf + '_ {
+        NormalMode::share_encryption(self)
+    }
+
+    fn fixed_entropy(&mut self) -> impl DevicePrf + '_ {
+        NormalMode::fixed_entropy(self)
     }
 }
 
