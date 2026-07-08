@@ -7,9 +7,10 @@ edition = "2021"
 [features]
 default = ["stack_guard"]
 mem_debug = []
-debug_fps = []
-debug_mem = []
-debug_log = []
+# Forward to frostsnap_embedded so the moved FrostyUi overlay gates stay live.
+debug_fps = ["frostsnap_embedded/debug_fps"]
+debug_mem = ["frostsnap_embedded/debug_mem"]
+debug_log = ["frostsnap_embedded/debug_log"]
 debug = [ "debug_fps", "debug_mem", "debug_log" ]
 # turns on the esp32c3 hardware stack guard
 stack_guard = []
@@ -19,7 +20,7 @@ genuine_device = []
 [dependencies]
 frostsnap_core = { workspace = true }
 frostsnap_comms = { workspace = true }
-frostsnap_embedded = { workspace = true }
+frostsnap_embedded = { workspace = true, features = ["ui"] }
 frost_backup = { workspace = true, features = ["bincode"] }
 bitcoin.workspace = true
 esp-hal = { workspace = true, features = ["esp32c3", "rt"] }
@@ -55,5 +56,5 @@ path = "src/bin/frontier.rs"
 name = "widget_dev"
 
 [lints.rust]
-# prefill_words is deliberately a --cfg, not a feature: see src/widget_tree.rs.
+# demo_widget! expands `cfg!(prefill_words)` in this crate (bin/widget_dev.rs).
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(prefill_words)'] }
