@@ -18,15 +18,44 @@ import 'package:frostsnap/secure_key_provider.dart';
 import 'package:frostsnap/serialport.dart';
 import 'package:frostsnap/snackbar.dart';
 import 'package:frostsnap/settings.dart';
+import 'package:frostsnap/sim_device_tray.dart';
 import 'package:frostsnap/stream_ext.dart';
 import 'package:frostsnap/theme.dart';
 import 'package:frostsnap/wallet.dart';
 import 'package:frostsnap/wallet_list_controller.dart';
 import 'package:frostsnap/src/rust/api.dart';
+import 'package:frostsnap/src/rust/api/bitcoin.dart';
 import 'package:frostsnap/src/rust/api/device_list.dart';
 import 'package:frostsnap/src/rust/api/init.dart';
+import 'package:frostsnap/src/rust/api/settings.dart';
 import 'package:frostsnap/src/rust/api/log.dart';
 import 'package:frostsnap/src/rust/frb_generated.dart';
+
+/// Hold a connection to the serve daemon's liveness socket and [exit] when it closes, so a hard-killed
+/// serve (which skips graceful teardown) doesn't leave this window orphaned. The serve binds this socket
+/// BEFORE launching us, so a configured socket we CANNOT reach (after a brief retry for the startup race)
+/// means the owner is already gone — exit too, rather than run orphaned.
+Future<void> _exitWhenServeDies(String socketPath) async {
+  Socket? conn;
+  for (var attempt = 0; attempt < 15 && conn == null; attempt++) {
+    try {
+      conn = await Socket.connect(
+        InternetAddress(socketPath, type: InternetAddressType.unix),
+        0,
+      );
+    } catch (_) {
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+  }
+  if (conn == null) {
+    exit(0); // owner never reachable across ~3s → it's gone; don't run orphaned
+  }
+  // The serve never writes; any completion (EOF on its death, or an error) means the owner is gone.
+  try {
+    await conn.drain<void>();
+  } catch (_) {}
+  exit(0);
+}
 
 Future<void> main() async {
   // enable this if you're trying to figure out why things are displaying in
@@ -60,7 +89,70 @@ Future<void> main() async {
   try {
     final appDir = await getApplicationSupportDirectory();
     final appDirPath = appDir.path;
-    if (Platform.isAndroid) {
+    if (kSim) {
+      // If the serve daemon passed a liveness socket, hold it open and exit when it drops — a
+      // hard-killed serve otherwise leaves this window orphaned. Host desktop only (unset on emulator,
+      // where the app can't reach a host unix socket and the emulator owns its own lifetime).
+      const compileLiveness = String.fromEnvironment(
+        'SIM_SERVE_LIVENESS_SOCKET',
+      );
+      final livenessSock =
+          Platform.environment['SIM_SERVE_LIVENESS_SOCKET'] ?? compileLiveness;
+      if (livenessSock.isNotEmpty) {
+        unawaited(_exitWhenServeDies(livenessSock));
+      }
+      // Point the sim at a disposable app dir (clean DB per run, and the device
+      // channel's socket lives here too) via SIM_APP_DIR; defaults to the app-support dir.
+      const compileSimAppDir = String.fromEnvironment('SIM_APP_DIR');
+      final simAppDir = Platform.environment['SIM_APP_DIR'] ?? compileSimAppDir;
+      const compileSimDeviceCount = int.fromEnvironment(
+        'SIM_DEVICE_COUNT',
+        defaultValue: 1,
+      );
+      final simDeviceCount =
+          int.tryParse(Platform.environment['SIM_DEVICE_COUNT'] ?? '') ??
+          compileSimDeviceCount;
+      final (coord_, appCtx_, pool_) = await api.loadSim(
+        appDir: simAppDir.isEmpty ? appDirPath : simAppDir,
+        seed: 1,
+        deviceCount: simDeviceCount,
+      );
+      coord = coord_;
+      appCtx = appCtx_;
+      simDevicePool = pool_;
+      globalHostPortHandler = null;
+      // The harness seeds its local electrs URL here (regtest only); point the regtest wallet
+      // at it via the existing setter so "receive bitcoin" syncs over the sim's own node. No
+      // effect on other networks, and absent (offline sim) when the harness didn't start one.
+      const compileSimRegtestElectrum = String.fromEnvironment(
+        'SIM_REGTEST_ELECTRUM_URL',
+      );
+      final simRegtestElectrum =
+          Platform.environment['SIM_REGTEST_ELECTRUM_URL'] ??
+          compileSimRegtestElectrum;
+      const compileSimRegtestControl = String.fromEnvironment(
+        'SIM_REGTEST_CONTROL_SOCKET',
+      );
+      final simRegtestControl =
+          Platform.environment['SIM_REGTEST_CONTROL_SOCKET'] ??
+          compileSimRegtestControl;
+      if (simRegtestElectrum.isNotEmpty) {
+        simRegtestElectrumUrl = simRegtestElectrum;
+        simRegtestControlSocket = simRegtestControl.isEmpty
+            ? null
+            : simRegtestControl;
+        final regtest = BitcoinNetwork.fromString(string: 'regtest')!;
+        await appCtx_.settings.setElectrumServers(
+          network: regtest,
+          primary: simRegtestElectrum,
+          backup: simRegtestElectrum,
+        );
+        await appCtx_.settings.setElectrumEnabled(
+          network: regtest,
+          enabled: ElectrumEnabled.primaryOnly,
+        );
+      }
+    } else if (Platform.isAndroid) {
       final (coord_, appCtx_, ffiserial) = await api.loadHostHandlesSerial(
         appDir: appDirPath,
       );
@@ -153,6 +245,9 @@ Widget buildMainWidget(AppCtx appCtx, Stream<String> logStream) {
   return FrostsnapContext(
     appCtx: appCtx,
     logStream: logStream,
+    defaultNetwork: simRegtestElectrumUrl != null
+        ? BitcoinNetwork.regtest
+        : BitcoinNetwork.bitcoin,
     child: SettingsContext(
       settings: appCtx.settings,
       child: SuperWalletContext(appCtx: appCtx, child: MyApp()),
@@ -215,6 +310,21 @@ class _MyAppState extends State<MyApp> {
             colorScheme: colorScheme,
             textTheme: textTheme,
           ),
+          // The sim console is mounted by SimTrayShell ABOVE the app's Navigator (not inside it),
+          // so the app's fullscreen dialogs/overlays — which render in the Navigator's own Overlay
+          // (the `child`) — never cover it and it stays interactable while a dialog (e.g. the
+          // keygen Security Check) is up. The shell presents it responsively: docked beside the app
+          // on a wide screen, or a slide-in panel on a narrow one (a phone).
+          builder: (context, child) {
+            final app = child ?? const SizedBox.shrink();
+            final pool = simDevicePool;
+            if (!kSim || pool == null) return app;
+            return SimTrayShell(
+              app: app,
+              pool: pool,
+              regtestControlSocket: simRegtestControlSocket,
+            );
+          },
           home: widget.startupError == null
               ? const MyHomePage()
               : StartupErrorWidget(error: widget.startupError!),
@@ -256,6 +366,8 @@ class _MyHomePageState extends State<MyHomePage> {
 
   @override
   Widget build(BuildContext context) {
+    // The sim device tray is hoisted to MaterialApp.builder (above the app's
+    // dialog/overlay layer), so the home body here is unchanged from production.
     return HomeContext(
       scaffoldKey: scaffoldKey,
       walletListController: walletListController,
