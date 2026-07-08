@@ -81,6 +81,8 @@ not a keyword or a console name (`session`/`instances`/…).
 | call | returns | does |
 |------|---------|------|
 | `session.screenshot(name, {keep})` | `String` | capture a whole-app screenshot; returns its path |
+| `session.startRecording()` | `void` | **android only** — start recording the emulator screen (native `screenrecord`); call mid-run, then drive |
+| `session.stopRecording(path)` | `String` | **android only** — stop the recording + pull its mp4 to `path`; returns `path` (caps at 180s) |
 
 ## `session.device(n)` — a virtual device (raw pixel input + framebuffer)
 

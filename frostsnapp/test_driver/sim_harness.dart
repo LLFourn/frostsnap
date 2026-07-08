@@ -1454,6 +1454,94 @@ class AppSession {
     return path;
   }
 
+  // ---- video: native emulator screen recording (android only) ----
+
+  /// The in-progress recording (the detached `adb shell screenrecord` process + its on-device file), or null.
+  ({Process proc, String deviceFile})? _recording;
+
+  /// Start recording this (android) session's emulator screen to [deviceFile] on the device — a NATIVE
+  /// `screenrecord` that runs ON the emulator, so it captures the flow AS you drive it via eval with no perf
+  /// cost to driving. Call it MID-RUN (after setup), drive, then [stopRecording] to pull the mp4. Android only
+  /// (host has no emulator screen); `screenrecord` caps a single recording at 180s.
+  Future<void> startRecording({
+    String deviceFile = '/sdcard/fsim-rec.mp4',
+  }) async {
+    final serial = _emulatorSerial;
+    if (serial == null) {
+      throw StateError(
+        'recording needs an android session (emulator screenrecord) — this is a host session',
+      );
+    }
+    if (_recording != null) {
+      throw StateError('already recording — stopRecording() first');
+    }
+    final adb = '${androidSdkRoot()}/platform-tools/adb';
+    final proc = await Process.start(adb, [
+      '-s',
+      serial,
+      'shell',
+      'screenrecord',
+      deviceFile,
+    ]);
+    proc.stdout.drain<void>();
+    proc.stderr.drain<void>();
+    _recording = (proc: proc, deviceFile: deviceFile);
+  }
+
+  /// Stop the [startRecording] recording and pull its mp4 to host [path], returning it. SIGINT is what
+  /// finalizes the mp4 (a bare kill truncates it); screenrecord then exits.
+  Future<String> stopRecording(String path) async {
+    final rec = _recording;
+    final serial = _emulatorSerial;
+    if (rec == null || serial == null) {
+      throw StateError('no recording in progress — startRecording() first');
+    }
+    final adb = '${androidSdkRoot()}/platform-tools/adb';
+    // SIGINT finalizes the mp4 (a bare kill truncates it). It may have already self-stopped at the 180s cap —
+    // then pkill matches nothing; the exit-wait + pull below are the real checks.
+    final pkill = await Process.run(adb, [
+      '-s',
+      serial,
+      'shell',
+      'pkill',
+      '-INT',
+      'screenrecord',
+    ]);
+    // The mp4 is only flushed once screenrecord actually EXITS. A timeout means it's still running (didn't
+    // finalize) — the file would be truncated, so fail rather than pull garbage.
+    final exited = await rec.proc.exitCode
+        .then((_) => true)
+        .timeout(const Duration(seconds: 10), onTimeout: () => false);
+    if (!exited) {
+      throw StateError(
+        'recording did not finalize within 10s (screenrecord still running); pkill exit '
+                '${pkill.exitCode} ${(pkill.stderr as String).trim()}'
+            .trim(),
+      );
+    }
+    // The pull is the real success check — Process.run does NOT throw on a nonzero exit, so verify it (device
+    // disconnect / missing file / unwritable host path all surface here) before reporting success.
+    final pull = await Process.run(adb, [
+      '-s',
+      serial,
+      'pull',
+      rec.deviceFile,
+      path,
+    ]);
+    if (pull.exitCode != 0) {
+      final err = (pull.stderr as String).trim();
+      throw StateError(
+        'failed to pull the recording ($serial:${rec.deviceFile} -> $path): '
+        '${err.isNotEmpty ? err : (pull.stdout as String).trim()}',
+      );
+    }
+    // Best-effort cleanup of the on-device file. Only NOW clear the state — a thrown failure above leaves
+    // _recording set so a retry can pull again.
+    await Process.run(adb, ['-s', serial, 'shell', 'rm', '-f', rec.deviceFile]);
+    _recording = null;
+    return path;
+  }
+
   // ---- failure diagnostics ----
 
   /// On a scenario failure, dump where it stopped to the runner-provided artifacts dir
