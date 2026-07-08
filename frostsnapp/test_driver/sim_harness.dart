@@ -1542,6 +1542,20 @@ class AppSession {
     return path;
   }
 
+  // ---- secure key (sim: exercise the "hardware key is gone" path) ----
+
+  /// Delete the app's secure key — on android the StrongBox/TEE `AndroidKeyStore` key. The next access
+  /// regenerates it, so the app hits its key-gone / recovery path, otherwise near-impossible to reproduce.
+  /// ANDROID-ONLY: errors on a host session (the desktop provider's key is a fixed constant).
+  Future<void> deleteSecureKey() async {
+    await _requestData('delete-secure-key');
+  }
+
+  /// Whether the app's secure key currently exists — verify a [deleteSecureKey] actually removed it.
+  /// ANDROID-ONLY: errors on a host session.
+  Future<bool> secureKeyExists() async =>
+      (await _requestData('secure-key-exists')) == 'true';
+
   // ---- failure diagnostics ----
 
   /// On a scenario failure, dump where it stopped to the runner-provided artifacts dir

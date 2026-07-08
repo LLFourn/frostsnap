@@ -11,6 +11,7 @@ import 'package:flutter_driver/driver_extension.dart';
 import 'package:frostsnap/global.dart';
 import 'package:frostsnap/id_ext.dart';
 import 'package:frostsnap/main.dart' as app;
+import 'package:frostsnap/secure_key_provider.dart';
 import 'package:frostsnap/sim_device_tray.dart';
 
 /// Driver data channel for things the harness can't get off the widget tree by semantic label.
@@ -59,6 +60,20 @@ Future<String> _driverData(String? payload) async {
       if (pool == null) throw 'sim_app: no device pool (not a sim build?)';
       final device = await pool.addDevice();
       return '${device.number()}';
+    // Delete the app's secure key so a sim flow can exercise the "hardware key is gone → regenerate/recover"
+    // path. ANDROID-ONLY: the desktop provider's key is a fixed constant (deleteKey is a no-op + hasKey is
+    // always true), so REJECT on host rather than report a hollow success the verification can't reflect.
+    case 'delete-secure-key':
+      if (!Platform.isAndroid) {
+        throw 'delete-secure-key is android-only — the desktop sim key is a fixed constant, not deletable';
+      }
+      await SecureKeyProvider.instance.deleteKey();
+      return 'ok';
+    case 'secure-key-exists':
+      if (!Platform.isAndroid) {
+        throw 'secure-key-exists is android-only — the desktop sim key is a fixed constant';
+      }
+      return (await SecureKeyProvider.instance.hasKey()) ? 'true' : 'false';
     case 'device-numbers':
       final pool = simDevicePool;
       if (pool == null) throw 'sim_app: no device pool (not a sim build?)';
