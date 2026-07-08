@@ -5,20 +5,22 @@ use core::cell::RefCell;
 use esp_storage::FlashStorage;
 use frostsnap_comms::{Downstream, Upstream};
 use frostsnap_core::device::DevicePrf;
+use frostsnap_embedded::framed_serial::FramedSerial;
 use rand_chacha::ChaCha20Rng;
 
 use crate::{
     crypto::{DsKey, EspCrypto},
+    esp_ui::{EspClock, EspFrostyUi, EspTouch},
     flash::FactoryDataHandle,
     frosty_ui::FrostyUi,
-    io::SerialInterface,
+    io::SerialIo,
     ota::OtaPartitions,
     partitions::{EspFlashPartition, Partitions},
     peripherals::DevicePeripherals,
 };
 
 /// Type alias for serial interfaces
-type Serial<'a, D> = SerialInterface<'a, D>;
+type Serial<'a, D> = FramedSerial<SerialIo<'a>, EspClock, D>;
 use esp_hal::{gpio::Input, uart::Uart, usb::usb_serial_jtag::UsbSerialJtag, Blocking};
 use rand_core::{RngCore, SeedableRng};
 
@@ -39,7 +41,7 @@ pub struct Resources<'a> {
     /// and keeping it inline makes `Box::new(Self { .. })` in the init fns
     /// materialize the whole struct on the stack, blowing their stack frames
     /// past the CI stack-check limit.
-    pub ui: Box<FrostyUi<'a>>,
+    pub ui: Box<EspFrostyUi<'a>>,
 
     // Runtime peripherals needed by esp32_run
     pub upstream_serial: Serial<'a, Upstream>,
@@ -59,14 +61,19 @@ impl<'a> Resources<'a> {
         let upstream_serial = if detect_device_upstream {
             log!("upstream set to uart");
             let uart = uart_upstream.expect("upstream UART should exist when detected");
-            SerialInterface::new_uart(uart, crate::uart_interrupt::UartNum::Uart1)
+            FramedSerial::new(
+                SerialIo::new_uart(uart, crate::uart_interrupt::UartNum::Uart1),
+                EspClock,
+            )
         } else {
             log!("upstream set to jtag");
-            SerialInterface::new_jtag(jtag)
+            FramedSerial::new(SerialIo::new_jtag(jtag), EspClock)
         };
 
-        let downstream_serial =
-            SerialInterface::new_uart(uart_downstream, crate::uart_interrupt::UartNum::Uart0);
+        let downstream_serial = FramedSerial::new(
+            SerialIo::new_uart(uart_downstream, crate::uart_interrupt::UartNum::Uart0),
+            EspClock,
+        );
 
         (upstream_serial, downstream_serial)
     }
@@ -114,7 +121,11 @@ impl<'a> Resources<'a> {
             &mut initial_rng,
         );
 
-        let ui = Box::new(FrostyUi::new(display, touch_receiver));
+        let ui = Box::new(FrostyUi::new(
+            display,
+            EspClock,
+            EspTouch::new(touch_receiver),
+        ));
 
         // Create serial interfaces
         let (upstream_serial, downstream_serial) =
@@ -180,7 +191,11 @@ impl<'a> Resources<'a> {
             &mut initial_rng,
         );
 
-        let ui = Box::new(FrostyUi::new(display, touch_receiver));
+        let ui = Box::new(FrostyUi::new(
+            display,
+            EspClock,
+            EspTouch::new(touch_receiver),
+        ));
 
         // Create serial interfaces
         let (upstream_serial, downstream_serial) =
@@ -202,7 +217,7 @@ impl<'a> Resources<'a> {
     fn read_flash_data(
         flash: FlashStorage<'static>,
     ) -> (Partitions<'a>, Option<FactoryDataHandle<'a>>) {
-        // Resources is leaked, so the partitions' flash lives as long as it does.
+        // esp32_run::run never returns, so the partitions' flash is needed until reset.
         let partitions = Partitions::load(Box::leak(Box::new(RefCell::new(flash))));
 
         // Dev devices may have no factory data

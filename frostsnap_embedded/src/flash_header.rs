@@ -1,7 +1,7 @@
+use crate::{AbSlot, FlashPartition};
 use embedded_storage::nor_flash::NorFlash;
 use frostsnap_comms::{HasMagicBytes, MagicBytes, MAGIC_BYTES_LEN};
 use frostsnap_core::schnorr_fun::fun::{KeyPair, Scalar};
-use frostsnap_embedded::{AbSlot, FlashPartition};
 
 use frostsnap_core::device::DevicePrf;
 
