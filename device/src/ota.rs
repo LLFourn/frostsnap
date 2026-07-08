@@ -1,5 +1,4 @@
 use crate::{
-    io::SerialIo,
     partitions::{EspFlashPartition, PartitionExt},
     secure_boot,
     ui::{self, UserInteraction},
@@ -14,7 +13,7 @@ use frostsnap_comms::{
     firmware_version, CommsMisc, DeviceSendBody, Sha256Digest, BAUDRATE,
     FIRMWARE_NEXT_CHUNK_READY_SIGNAL, FIRMWARE_UPGRADE_CHUNK_LEN,
 };
-use nb::block;
+use frostsnap_embedded::framed_serial::ByteIo;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpgradeVerdict {
@@ -22,24 +21,7 @@ pub enum UpgradeVerdict {
     Refuse(RefuseReason),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RefuseReason {
-    UnparseableFirmware,
-    DigestMismatch,
-    SecureBootInvalid,
-    DowngradeBlocked,
-}
-
-impl core::fmt::Display for RefuseReason {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            RefuseReason::UnparseableFirmware => "Firmware invalid",
-            RefuseReason::DigestMismatch => "Download corrupted",
-            RefuseReason::SecureBootInvalid => "Signature invalid",
-            RefuseReason::DowngradeBlocked => "Downgrade blocked",
-        })
-    }
-}
+pub use frostsnap_embedded::ui::RefuseReason;
 
 /// Decide whether to commit the downloaded upgrade sitting in `partition`,
 /// against the digest the coordinator announced. Everything examined here is
@@ -283,7 +265,10 @@ pub enum UpgradeOutcome {
 }
 
 impl FirmwareUpgradeMode<'_> {
-    pub fn poll(&mut self, ui: &mut impl crate::ui::UserInteraction) -> Option<DeviceSendBody> {
+    pub fn poll(
+        &mut self,
+        ui: &mut (impl crate::ui::UserInteraction + ?Sized),
+    ) -> Option<DeviceSendBody> {
         match self {
             FirmwareUpgradeMode::Upgrading {
                 ota,
@@ -367,11 +352,15 @@ impl FirmwareUpgradeMode<'_> {
         }
     }
 
+    /// Drive the OTA takeover over the raw byte transports. The links arrive as
+    /// `&mut dyn ByteIo` (via `SerialPort::raw()`) so this stays decoupled from
+    /// the concrete esp transport; the firmware bytes ride outside the bincode
+    /// framing.
     pub fn enter_upgrade_mode(
         &mut self,
-        upstream_io: &mut SerialIo<'_>,
-        mut downstream_io: Option<&mut SerialIo<'_>>,
-        ui: &mut impl UserInteraction,
+        upstream_io: &mut dyn ByteIo,
+        mut downstream_io: Option<&mut dyn ByteIo>,
+        ui: &mut dyn UserInteraction,
         sha: &mut Sha<'_>,
         rsa: &mut Rsa<Blocking>,
     ) -> UpgradeOutcome {
@@ -389,9 +378,9 @@ impl FirmwareUpgradeMode<'_> {
             FirmwareUpgradeMode::Passive { size, .. } => size,
         };
 
-        upstream_io.change_baud(OTA_UPDATE_BAUD);
+        upstream_io.set_baud(OTA_UPDATE_BAUD);
         if let Some(downstream_io) = &mut downstream_io {
-            downstream_io.change_baud(OTA_UPDATE_BAUD);
+            downstream_io.set_baud(OTA_UPDATE_BAUD);
         }
 
         let start = Instant::now();
@@ -417,7 +406,7 @@ impl FirmwareUpgradeMode<'_> {
                     byte_count += 1;
                     finished_writing = byte_count == upgrade_size;
                     if let Some(downstream_io) = &mut downstream_io {
-                        block!(downstream_io.write_byte_nb(byte)).unwrap();
+                        downstream_io.write_bytes(&[byte]).unwrap();
                     }
 
                     if i == SECTOR_SIZE as usize || finished_writing {
@@ -462,7 +451,9 @@ impl FirmwareUpgradeMode<'_> {
                 }
 
                 if downstream_ready && !told_upstream_im_ready {
-                    block!(upstream_io.write_byte_nb(FIRMWARE_NEXT_CHUNK_READY_SIGNAL)).unwrap();
+                    upstream_io
+                        .write_bytes(&[FIRMWARE_NEXT_CHUNK_READY_SIGNAL])
+                        .unwrap();
                     upstream_io.nb_flush();
                     told_upstream_im_ready = true;
                 }
@@ -477,9 +468,9 @@ impl FirmwareUpgradeMode<'_> {
 
         // change it back to the original baudrate but keep in mind that the devices are meant to
         // restart after the upgrade.
-        upstream_io.change_baud(BAUDRATE);
+        upstream_io.set_baud(BAUDRATE);
         if let Some(downstream_io) = &mut downstream_io {
-            downstream_io.change_baud(BAUDRATE);
+            downstream_io.set_baud(BAUDRATE);
         }
 
         if let FirmwareUpgradeMode::Upgrading {

@@ -3,7 +3,9 @@
 
 extern crate alloc;
 use esp_hal::main;
-use frostsnap_device::{peripherals::DevicePeripherals, touch_handler, DISPLAY_REFRESH_MS};
+use frostsnap_device::{esp_ui::EspTouch, peripherals::DevicePeripherals, DISPLAY_REFRESH_MS};
+use frostsnap_embedded::device_hal::TouchSource;
+use frostsnap_embedded::touch_handler;
 use frostsnap_widgets::debug::{EnabledDebug, OverlayDebug};
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -33,9 +35,10 @@ fn main() -> ! {
         // Extract the components we need from DevicePeripherals
         let DevicePeripherals {
             display,
-            mut touch_receiver,
+            touch_receiver,
             ..
         } = *device;
+        let mut touch = EspTouch::new(touch_receiver);
 
         let mut display = frostsnap_widgets::SuperDrawTarget::new(
             display,
@@ -73,13 +76,15 @@ fn main() -> ! {
                     );
 
                     // Process all pending touch events
-                    touch_handler::process_all_touch_events(
-                        &mut touch_receiver,
-                        &mut widget_with_debug,
-                        &mut last_touch,
-                        &mut current_widget_index,
-                        now_ms,
-                    );
+                    while let Some(ev) = touch.next_touch() {
+                        touch_handler::apply_touch_event(
+                            ev,
+                            &mut widget_with_debug,
+                            &mut last_touch,
+                            &mut current_widget_index,
+                            now_ms,
+                        );
+                    }
 
                     // Only redraw if enough time has passed since last redraw
                     let elapsed_ms = (now - last_redraw_time).as_millis();

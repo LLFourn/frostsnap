@@ -28,7 +28,9 @@ fn main() -> ! {
         frostsnap_device::factory::run_dev_provisioning(device);
     } else {
         // Device is already provisioned - proceed with normal boot
-        let resources = alloc::boxed::Box::leak(Resources::init_dev(device));
+        let resources = Resources::init_dev(device);
+
+        // Run main event loop
         esp32_run::run(resources);
     }
 }

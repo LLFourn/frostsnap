@@ -1,194 +1,14 @@
-use alloc::format;
-use bincode::de::read::Reader;
-use bincode::enc::write::Writer;
-use bincode::error::DecodeError;
-use bincode::error::EncodeError;
+//! esp byte transport for the serial links. The portable bincode framing now
+//! lives in `frostsnap_embedded::framed_serial::FramedSerial`; this provides the
+//! `SerialIo` transport it rides on (`ByteIo`).
+
 use core::convert::Infallible;
-use core::marker::PhantomData;
-use esp_hal::time::{Duration, Instant};
 use esp_hal::uart::{self, Uart};
 use esp_hal::usb::usb_serial_jtag::UsbSerialJtag;
 use esp_hal::Blocking;
-use frostsnap_comms::Direction;
-use frostsnap_comms::MagicBytes;
-use frostsnap_comms::ReceiveSerial;
-use frostsnap_comms::BINCODE_CONFIG;
+use frostsnap_embedded::framed_serial::{ByteIo, WriteError};
 
 use crate::uart_interrupt::{UartHandle, UartNum, UartReceiver};
-
-pub struct SerialInterface<'a, D> {
-    io: SerialIo<'a>,
-    magic_bytes_progress: usize,
-    direction: PhantomData<D>,
-}
-
-impl<'a, D> SerialInterface<'a, D> {
-    pub fn new_uart(uart: Uart<'static, Blocking>, uart_num: UartNum) -> Self {
-        // Register UART for interrupt handling
-        let (handle, consumer) = crate::uart_interrupt::register_uart(uart, uart_num);
-
-        Self {
-            io: SerialIo::Uart {
-                handle,
-                uart_num,
-                consumer,
-            },
-            magic_bytes_progress: 0,
-            direction: PhantomData,
-        }
-    }
-
-    pub fn is_jtag(&self) -> bool {
-        matches!(self.io, SerialIo::Jtag { .. })
-    }
-}
-
-impl<'a, D> SerialInterface<'a, D> {
-    pub fn new_jtag(jtag: UsbSerialJtag<'a, Blocking>) -> Self {
-        Self {
-            io: SerialIo::Jtag {
-                jtag,
-                peek_byte: None,
-            },
-            magic_bytes_progress: 0,
-            direction: PhantomData,
-        }
-    }
-}
-
-impl<'a, D> SerialInterface<'a, D>
-where
-    D: Direction,
-{
-    pub fn fill_buffer(&mut self) {
-        // Let the SerialIo implementation handle filling its queue
-        self.io.fill_queue();
-    }
-
-    pub fn find_and_remove_magic_bytes(&mut self) -> bool {
-        self.fill_buffer();
-        // Check if there's any data available
-        if !self.io.has_data() {
-            return false;
-        }
-        let magic_bytes_progress = self.magic_bytes_progress;
-        let (progress, found) = frostsnap_comms::make_progress_on_magic_bytes::<D>(
-            core::iter::from_fn(|| self.io.read_byte()),
-            magic_bytes_progress,
-        );
-        self.magic_bytes_progress = progress;
-        found.is_some()
-    }
-
-    pub fn send(
-        &mut self,
-        message: <D::Opposite as Direction>::RecvType,
-    ) -> Result<(), bincode::error::EncodeError> {
-        bincode::encode_into_writer(
-            ReceiveSerial::<D::Opposite>::Message(message),
-            &mut *self,
-            BINCODE_CONFIG,
-        )?;
-        self.io.nb_flush();
-        Ok(())
-    }
-
-    pub fn receive(&mut self) -> Option<Result<ReceiveSerial<D>, bincode::error::DecodeError>>
-    where
-        ReceiveSerial<D>: bincode::Decode<()>,
-    {
-        self.fill_buffer();
-        if self.io.has_data() {
-            Some(bincode::decode_from_reader(self, BINCODE_CONFIG))
-        } else {
-            None
-        }
-    }
-
-    pub fn write_magic_bytes(&mut self) -> Result<(), bincode::error::EncodeError> {
-        bincode::encode_into_writer(
-            ReceiveSerial::<D::Opposite>::MagicBytes(MagicBytes::default()),
-            &mut *self,
-            BINCODE_CONFIG,
-        )?;
-        self.io.nb_flush();
-        Ok(())
-    }
-    pub fn write_conch(&mut self) -> Result<(), bincode::error::EncodeError> {
-        bincode::encode_into_writer(
-            ReceiveSerial::<D::Opposite>::Conch,
-            &mut *self,
-            BINCODE_CONFIG,
-        )?;
-        self.io.nb_flush();
-
-        Ok(())
-    }
-
-    pub fn send_reset_signal(&mut self) -> Result<(), bincode::error::EncodeError> {
-        bincode::encode_into_writer(
-            ReceiveSerial::<D::Opposite>::Reset,
-            &mut *self,
-            BINCODE_CONFIG,
-        )?;
-        self.flush();
-
-        Ok(())
-    }
-
-    /// Blocking flush
-    pub fn flush(&mut self) {
-        self.io.flush()
-    }
-
-    pub fn inner_mut(&mut self) -> &mut SerialIo<'a> {
-        &mut self.io
-    }
-
-    /// Try to read a byte without blocking
-    pub fn read_byte(&mut self) -> nb::Result<u8, core::convert::Infallible> {
-        // Then try to read
-        if let Some(byte) = self.io.read_byte() {
-            Ok(byte)
-        } else {
-            Err(nb::Error::WouldBlock)
-        }
-    }
-}
-
-impl<D> Reader for SerialInterface<'_, D>
-where
-    D: Direction,
-{
-    fn read(&mut self, bytes: &mut [u8]) -> Result<(), DecodeError> {
-        for (i, target_byte) in bytes.iter_mut().enumerate() {
-            let start_time = Instant::now();
-            *target_byte = loop {
-                if let Some(next_byte) = self.io.read_byte() {
-                    break next_byte;
-                }
-
-                self.fill_buffer();
-
-                if start_time.elapsed() > Duration::from_millis(1_000) {
-                    return Err(DecodeError::UnexpectedEnd {
-                        additional: bytes.len() - i + 1,
-                    });
-                }
-            };
-        }
-        Ok(())
-    }
-}
-
-impl<D> Writer for SerialInterface<'_, D> {
-    fn write(&mut self, bytes: &[u8]) -> Result<(), EncodeError> {
-        match self.io.write_bytes(bytes) {
-            Err(e) => Err(EncodeError::OtherString(format!("{e:?}"))),
-            Ok(()) => Ok(()),
-        }
-    }
-}
 
 pub enum SerialIo<'a> {
     Uart {
@@ -202,7 +22,23 @@ pub enum SerialIo<'a> {
     },
 }
 
-impl SerialIo<'_> {
+impl<'a> SerialIo<'a> {
+    pub fn new_uart(uart: Uart<'static, Blocking>, uart_num: UartNum) -> Self {
+        let (handle, consumer) = crate::uart_interrupt::register_uart(uart, uart_num);
+        SerialIo::Uart {
+            handle,
+            uart_num,
+            consumer,
+        }
+    }
+
+    pub fn new_jtag(jtag: UsbSerialJtag<'a, Blocking>) -> Self {
+        SerialIo::Jtag {
+            jtag,
+            peek_byte: None,
+        }
+    }
+
     /// Check if data is available without consuming it
     pub fn has_data(&self) -> bool {
         match self {
@@ -224,11 +60,9 @@ impl SerialIo<'_> {
                 }
             },
             SerialIo::Jtag { jtag, peek_byte } => {
-                // First check if we have a peeked byte
                 if let Some(byte) = peek_byte.take() {
                     Some(byte)
                 } else {
-                    // Otherwise try to read directly
                     jtag.read_byte().ok()
                 }
             }
@@ -244,14 +78,13 @@ impl SerialIo<'_> {
             SerialIo::Jtag { .. } => { /* no baud rate for USB jtag */ }
         }
     }
+
     pub fn fill_queue(&mut self) {
         match self {
             SerialIo::Uart { handle, .. } => {
-                // Fill buffer with any bytes that haven't triggered an interrupt (< threshold)
                 handle.fill_buffer();
             }
             SerialIo::Jtag { jtag, peek_byte } => {
-                // For JTAG, fill the peek byte if empty
                 if peek_byte.is_none() {
                     *peek_byte = jtag.read_byte().ok();
                 }
@@ -262,14 +95,10 @@ impl SerialIo<'_> {
     pub fn write_byte_nb(&mut self, byte: u8) -> nb::Result<(), Infallible> {
         match self {
             SerialIo::Jtag { jtag, .. } => jtag.write_byte_nb(byte),
-            SerialIo::Uart { handle, .. } => {
-                // write_bytes is blocking, so we need to check if there's space first
-                // For now, use write_bytes and convert the error
-                match handle.write_bytes(&[byte]) {
-                    Ok(_) => Ok(()),
-                    Err(_) => Err(nb::Error::WouldBlock), // Assume any error is WouldBlock
-                }
-            }
+            SerialIo::Uart { handle, .. } => match handle.write_bytes(&[byte]) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(nb::Error::WouldBlock),
+            },
         }
     }
 
@@ -287,29 +116,45 @@ impl SerialIo<'_> {
 
     pub fn nb_flush(&mut self) {
         match self {
-            SerialIo::Uart { .. } => {
-                // there is no reason to call this on uart. It will just block until data is
-                // actually written.
-            }
+            SerialIo::Uart { .. } => { /* uart write already blocks until written */ }
             SerialIo::Jtag { jtag, .. } => {
-                // JTAG actually does need to get flushed sometimes. We don't need to block on it
-                // though so ignore return value.
                 let _ = jtag.flush_tx_nb();
             }
         }
     }
 
-    // Blocking flush. The only time to use this is to make sure everything has been written before
-    // moving onto something else. Usually you don't want this but it's necessary to do if you write
-    // something before resetting.
+    /// Blocking flush — ensure everything is written (e.g. before reset).
     pub fn flush(&mut self) {
         match self {
             SerialIo::Uart { handle, .. } => handle.flush_tx(),
             SerialIo::Jtag { jtag, .. } => {
-                // flushes and waits until everything has been written
                 let _ = jtag.flush_tx();
             }
         }
+    }
+}
+
+impl ByteIo for SerialIo<'_> {
+    fn read_byte(&mut self) -> Option<u8> {
+        SerialIo::read_byte(self)
+    }
+    fn has_data(&mut self) -> bool {
+        SerialIo::has_data(self)
+    }
+    fn fill(&mut self) {
+        self.fill_queue();
+    }
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
+        SerialIo::write_bytes(self, bytes).map_err(|_| WriteError)
+    }
+    fn nb_flush(&mut self) {
+        SerialIo::nb_flush(self);
+    }
+    fn flush(&mut self) {
+        SerialIo::flush(self);
+    }
+    fn set_baud(&mut self, baud: u32) {
+        self.change_baud(baud);
     }
 }
 
