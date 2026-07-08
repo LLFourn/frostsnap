@@ -91,7 +91,14 @@ Future<T?> showBottomSheetOrDialog<T>(
           useSafeArea: true,
           isDismissible: true,
           showDragHandle: false,
-          builder: (context) => column,
+          // `useSafeArea` on showModalBottomSheet wraps the sheet in `SafeArea(bottom: false)` — it
+          // insets the top/sides but leaves the bottom flush to the screen edge by design — so the
+          // content would sit behind the system navigation bar. This bottom-only SafeArea is the
+          // complement: it insets just the bottom so the last control (e.g. an action bar) clears the
+          // nav bar. Consumption-aware (idempotent, won't double the outer inset) and a no-op where
+          // there's no bottom inset (desktop), so it can't regress those layouts.
+          builder: (context) =>
+              SafeArea(top: false, left: false, right: false, child: column),
         );
 
   // FIXME: Actually this is not quite right since showDialog returns before the
@@ -390,7 +397,7 @@ class _TopBarState extends State<TopBar> {
           if (isDialog && widget.showClose)
             IconButton(
               onPressed: () => Navigator.pop(context),
-              icon: Icon(Icons.close),
+              icon: Icon(Icons.close, semanticLabel: 'Close'),
               style: IconButton.styleFrom(
                 backgroundColor: theme.colorScheme.surfaceContainerHighest,
               ),
