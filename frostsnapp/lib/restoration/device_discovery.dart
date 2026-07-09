@@ -7,7 +7,6 @@ import 'package:frostsnap/restoration/recovery_flow.dart';
 import 'package:frostsnap/restoration/state.dart';
 import 'package:frostsnap/restoration/target_device.dart';
 import 'package:frostsnap/secure_key_provider.dart';
-import 'package:frostsnap/src/rust/api.dart';
 import 'package:frostsnap/src/rust/api/recovery.dart';
 import 'package:frostsnap/theme.dart';
 import 'package:frostsnap/wallet_key_mismatch.dart';
@@ -145,26 +144,17 @@ class _DeviceDiscoveryWidgetState extends State<DeviceDiscoveryWidget> {
   Future<String?> _validateShare(RecoverShare share) async {
     switch (widget.recoveryContext) {
       case NewRestorationContext():
-        // If this share belongs to a wallet we ALREADY have, "restoring" it is
-        // really an operation on existing data: guard its decryptability and
-        // route to delete-and-recover if the key can't unlock it. Otherwise
-        // it's a genuinely new restoration, which establishes a key.
+        // This flow only checks whether a restoration can start; it does not
+        // decrypt the existing wallet. Keep its duplicate error independent of
+        // whether the app's current encryption key can unlock that wallet.
         final existingRef = share.heldShare.accessStructureRef;
-        final SymmetricKey encryptionKey;
         if (existingRef != null &&
-            coord.getFrostKey(keyId: existingRef.keyId) != null) {
-          final key = await existingWalletKey(
-            context: mounted ? context : null,
-            accessStructureRef: existingRef,
-            action: 'restore this wallet again',
-          );
-          if (key == null) {
-            return 'This wallet already exists but can’t be unlocked on this phone.';
-          }
-          encryptionKey = key;
-        } else {
-          encryptionKey = await SecureKeyProvider.getEncryptionKey();
+            coord.getAccessStructure(asRef: existingRef) != null) {
+          final wallet = coord.getFrostKey(keyId: existingRef.keyId)!;
+          return "This key share belongs to existing wallet '${wallet.keyName()}' and cannot be used to start a new restoration";
         }
+
+        final encryptionKey = await SecureKeyProvider.getEncryptionKey();
         final error = await coord.checkStartRestoringKeyFromDeviceShare(
           recoverShare: share,
           encryptionKey: encryptionKey,
