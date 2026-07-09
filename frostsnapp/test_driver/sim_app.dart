@@ -14,6 +14,118 @@ import 'package:frostsnap/main.dart' as app;
 import 'package:frostsnap/secure_key_provider.dart';
 import 'package:frostsnap/sim_device_tray.dart';
 
+void _forceFrameIfIdle() {
+  final binding = WidgetsBinding.instance;
+  if (binding.schedulerPhase == SchedulerPhase.idle) {
+    binding.handleBeginFrame(null);
+    binding.handleDrawFrame();
+  }
+}
+
+Map<String, double> _rectToJson(Rect rect) => {
+  'left': rect.left,
+  'top': rect.top,
+  'right': rect.right,
+  'bottom': rect.bottom,
+  'width': rect.width,
+  'height': rect.height,
+};
+
+Rect? _globalSemanticBounds(RenderObject renderObject) {
+  try {
+    final rect = MatrixUtils.transformRect(
+      renderObject.getTransformTo(null),
+      renderObject.semanticBounds,
+    );
+    if (rect.left.isFinite &&
+        rect.top.isFinite &&
+        rect.right.isFinite &&
+        rect.bottom.isFinite) {
+      return rect;
+    }
+  } catch (_) {}
+  return null;
+}
+
+String _semanticsSnapshotJson() {
+  _forceFrameIfIdle();
+  final root = WidgetsBinding.instance.rootElement;
+  if (root == null) {
+    throw 'sim_app: no root element attached';
+  }
+
+  final nodes = <Map<String, Object?>>[];
+  final seenLabels = <String>{};
+  var ordinal = 0;
+
+  void visit(Element element, int depth) {
+    if (element is RenderObjectElement) {
+      final renderObject = element.renderObject;
+      final semantics = renderObject.debugSemantics;
+      if (semantics != null) {
+        final data = semantics.getSemanticsData();
+        // Preserve labels byte-for-byte: FlutterDriver's bySemanticsLabel finder
+        // matches debugSemantics.label without normalizing it.
+        final label = data.label;
+        final value = data.value.trim();
+        final hint = data.hint.trim();
+        final tooltip = data.tooltip.trim();
+        final actions = [
+          for (final action in ui.SemanticsAction.values)
+            if (data.hasAction(action)) action.name,
+        ];
+        final flags = data.flagsCollection.toStrings();
+        final globalBounds = _globalSemanticBounds(renderObject);
+        if (label.isNotEmpty ||
+            value.isNotEmpty ||
+            hint.isNotEmpty ||
+            tooltip.isNotEmpty ||
+            actions.isNotEmpty ||
+            flags.isNotEmpty ||
+            data.role.name != 'none') {
+          nodes.add({
+            'id': semantics.id,
+            'ordinal': ordinal++,
+            'depth': depth,
+            if (label.isNotEmpty) 'label': label,
+            if (label.isNotEmpty) 'labelFirstSeen': seenLabels.add(label),
+            if (value.isNotEmpty) 'value': value,
+            if (hint.isNotEmpty) 'hint': hint,
+            if (tooltip.isNotEmpty) 'tooltip': tooltip,
+            if (data.identifier.isNotEmpty) 'identifier': data.identifier,
+            if (actions.isNotEmpty) 'actions': actions,
+            if (flags.isNotEmpty) 'flags': flags,
+            if (data.role.name != 'none') 'role': data.role.name,
+            if (data.textDirection != null)
+              'textDirection': data.textDirection!.name,
+            if (data.minValue != null) 'minValue': data.minValue,
+            if (data.maxValue != null) 'maxValue': data.maxValue,
+            if (data.increasedValue.isNotEmpty)
+              'increasedValue': data.increasedValue,
+            if (data.decreasedValue.isNotEmpty)
+              'decreasedValue': data.decreasedValue,
+            if (data.scrollIndex != null) 'scrollIndex': data.scrollIndex,
+            if (data.scrollChildCount != null)
+              'scrollChildCount': data.scrollChildCount,
+            if (data.scrollPosition != null)
+              'scrollPosition': data.scrollPosition,
+            if (data.scrollExtentMin != null)
+              'scrollExtentMin': data.scrollExtentMin,
+            if (data.scrollExtentMax != null)
+              'scrollExtentMax': data.scrollExtentMax,
+            'rect': _rectToJson(data.rect),
+            if (globalBounds != null) 'bounds': _rectToJson(globalBounds),
+          });
+        }
+      }
+    }
+    element.debugVisitOnstageChildren((child) => visit(child, depth + 1));
+  }
+
+  visit(root, 0);
+  return jsonEncode({'nodes': nodes});
+}
+
 /// Driver data channel for things the harness can't get off the widget tree by semantic label.
 /// `clipboard` reads the app clipboard (e.g. a wallet receive address after its Copy button);
 /// `setclip:<text>` writes it (e.g. to seed a recipient before a Paste button) — portably, via
@@ -103,11 +215,7 @@ Future<String> _driverData(String? payload) async {
       // idle desktop window has vsync paused, so a state change (e.g. a just-arrived keygen confirm)
       // rebuilds the widget tree without ever painting it — the capture would then predate the change.
       // Pump one ourselves (the scheduler is idle inside this driver handler) so the shot is CURRENT.
-      final shotBinding = WidgetsBinding.instance;
-      if (shotBinding.schedulerPhase == SchedulerPhase.idle) {
-        shotBinding.handleBeginFrame(null);
-        shotBinding.handleDrawFrame();
-      }
+      _forceFrameIfIdle();
       final appBoundary =
           simAppScreenshotKey.currentContext?.findRenderObject()
               as RenderRepaintBoundary?;
@@ -137,6 +245,11 @@ Future<String> _driverData(String? payload) async {
         'topInset': pad.top / dpr,
         'bottomInset': pad.bottom / dpr,
       });
+    case 'semantics-snapshot':
+      // The current onstage render-object semantics surface — the same labels FlutterDriver's
+      // `find.bySemanticsLabel` resolves. This is the eval/test introspection endpoint, not a raw
+      // widget-tree dump.
+      return _semanticsSnapshotJson();
     case 'delete-wallet':
       // Forget ALL wallets from the COORDINATOR — the same coord.deleteKey path the "Hold to Delete" UI's
       // onComplete calls — WITHOUT touching the virtual devices' shares, so the recovery flow can restore

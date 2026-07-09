@@ -3,9 +3,9 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 // Drift guard for the drive-API reference (fsim-eval-unified-drive Task 3): every PUBLIC instance method of
-// the `fsim eval` console-scope classes (AppSession, AppDevice, SimFaucet) must be documented in
-// test_driver/COMMANDS.md, so eval visibility can't silently fall behind the harness. Add a public method →
-// document it (or add it to `ignore` if it is genuinely not a drive command).
+// the `fsim eval` console-scope classes (AppSession, AppDevice, AppSemanticsInspector, SimFaucet) must be
+// documented in test_driver/COMMANDS.md, so eval visibility can't silently fall behind the harness. Add a
+// public method → document it (or add it to `ignore` if it is genuinely not a drive command).
 void main() {
   final commands = File('test_driver/COMMANDS.md').readAsStringSync();
 
@@ -42,7 +42,11 @@ void main() {
   }
 
   const scope = {
-    'test_driver/sim_harness.dart': ['AppSession', 'AppDevice'],
+    'test_driver/sim_harness.dart': [
+      'AppSession',
+      'AppDevice',
+      'AppSemanticsInspector',
+    ],
     'lib/sim_faucet.dart': ['SimFaucet'],
   };
 

@@ -12,8 +12,9 @@ top-level type/function declarations, use `fsim test <file>`. `fsim repl` opens 
 — one line at a time, the session persisting between lines.
 
 This file is the exhaustive reference; `fsim eval --help` prints a cheat-sheet pointing here. It mirrors the
-harness API — `AppSession` / `AppDevice` in `test_driver/sim_harness.dart`, `SimFaucet` in `lib/sim_faucet.dart`
-— and `test/console_commands_documented_test.dart` fails if a public method here goes undocumented.
+harness API — `AppSession` / `AppDevice` / `AppSemanticsInspector` in `test_driver/sim_harness.dart`,
+`SimFaucet` in `lib/sim_faucet.dart` — and `test/console_commands_documented_test.dart` fails if a public
+method here goes undocumented.
 
 ## Passing values — `-a` / `--arg`
 
@@ -57,6 +58,20 @@ not a keyword or a console name (`session`/`instances`/…).
 | `session.tapUntil(label, expect, {tries, settle})` | `void` | tap `label` until `expect` appears (8 tries) |
 | `session.dismissSheetOrDialog()` | `void` | dismiss a bottom sheet / dialog |
 | `session.expectAboveBottomInset(label)` | `void` | assert `label` renders above the bottom inset |
+| `session.semantics()` | `AppSemanticsInspector` | inspect the current targetable semantic-label surface |
+
+`session.semantics()` accessors fetch a fresh snapshot each call:
+
+| call | returns | does |
+|------|---------|------|
+| `.labels()` | `List<String>` | unique onstage labels targetable by `tap` / `waitFor` / `exists` |
+| `.grep(pattern)` | `List<String>` | targetable labels containing a string or matching a `RegExp` |
+| `.pretty()` | `String` | compact human-readable semantics snapshot |
+| `.json()` | `String` | structured JSON snapshot with labels plus best-effort metadata |
+
+The stable JSON envelope is `{"nodes":[...]}`. Every currently targetable semantic label appears exactly in
+a node's `label` field; `labelFirstSeen` identifies its first occurrence. Other node fields (such as values,
+roles, actions, flags, and bounds) are diagnostic and may vary with Flutter.
 
 ### Wallet
 | call | returns | does |
@@ -124,6 +139,8 @@ fsim eval "(await session.deviceNumbers()).length"              # device count
 fsim eval "await session.connect(2)"                            # plug device 2 into the chain
 fsim eval "await session.setChain([3, 1, 2])"                   # re-cable to this exact order
 fsim eval "session.exists('Create a multi-sig wallet')"         # -> true / false
+fsim eval "await session.semantics().grep('Generate keys')"     # targetable labels matching text
+fsim eval "await session.semantics().pretty()"                  # readable current app surface
 fsim eval "(await session.faucet()).blockHeight()"              # current height
 fsim eval "await (await session.faucet()).fund(addr, 100000)"   # fund an address, returns txid
 fsim eval "await (await session.faucet()).mine(6)"              # mine 6 blocks (confirm txs)

@@ -83,6 +83,83 @@ Future<void> growFleetTo(
   }
 }
 
+/// Eval/test introspection for the app's current semantic-label surface.
+///
+/// The guaranteed surface is the same set of onstage labels that [AppSession.tap], [AppSession.waitFor],
+/// and [AppSession.exists] target through FlutterDriver's `find.bySemanticsLabel`. Extra JSON fields are
+/// diagnostic best effort.
+class AppSemanticsInspector {
+  final AppSession _session;
+
+  AppSemanticsInspector._(this._session);
+
+  Future<List<Map<String, dynamic>>> _nodes() async {
+    final root =
+        jsonDecode(await _session._requestData('semantics-snapshot'))
+            as Map<String, dynamic>;
+    final nodes = root['nodes'] as List<dynamic>? ?? const <dynamic>[];
+    return [for (final node in nodes) Map<String, dynamic>.from(node as Map)];
+  }
+
+  /// Structured JSON for scripts/tests. Prefer [labels] or [grep] for the stable targeting contract.
+  Future<String> json() => _session._requestData('semantics-snapshot');
+
+  /// Unique targetable semantic labels, in onstage traversal order.
+  Future<List<String>> labels() async {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final node in await _nodes()) {
+      final label = node['label'] as String?;
+      if (label != null && label.isNotEmpty && seen.add(label)) {
+        out.add(label);
+      }
+    }
+    return out;
+  }
+
+  /// Unique targetable labels whose text contains [pattern] (`String`) or matches it (`RegExp`).
+  Future<List<String>> grep(Pattern pattern) async {
+    return [
+      for (final label in await labels())
+        if (_matches(pattern, label)) label,
+    ];
+  }
+
+  /// Compact human-readable snapshot for terminal use.
+  Future<String> pretty() async {
+    final b = StringBuffer();
+    for (final node in await _nodes()) {
+      final label = node['label'] as String?;
+      final value = node['value'] as String?;
+      final hint = node['hint'] as String?;
+      final role = node['role'] as String?;
+      final actions = (node['actions'] as List<dynamic>?)?.cast<String>();
+      final flags = (node['flags'] as List<dynamic>?)?.cast<String>();
+      final rawDepth = node['depth'] as int? ?? 0;
+      final depth = rawDepth < 0 ? 0 : (rawDepth > 10 ? 10 : rawDepth);
+      final parts = <String>[
+        if (label != null && label.isNotEmpty) '"${_oneLine(label)}"',
+        if (value != null && value.isNotEmpty) 'value="${_oneLine(value)}"',
+        if (hint != null && hint.isNotEmpty) 'hint="${_oneLine(hint)}"',
+        if (role != null && role != 'none') 'role=$role',
+        if (actions != null && actions.isNotEmpty)
+          'actions=${actions.join(',')}',
+        if (flags != null && flags.isNotEmpty) 'flags=${flags.join(',')}',
+      ];
+      if (parts.isEmpty) continue;
+      b.writeln('${''.padLeft(depth * 2)}- ${parts.join(' ')}');
+    }
+    return b.toString().trimRight();
+  }
+
+  bool _matches(Pattern pattern, String label) {
+    if (pattern is RegExp) return pattern.hasMatch(label);
+    return label.contains(pattern.toString());
+  }
+
+  String _oneLine(String s) => s.replaceAll(RegExp(r'\s+'), ' ').trim();
+}
+
 /// A scenario's PRIVATE regtest chain (its own backend), OWNED by the [Scenario] and reaped on
 /// teardown. App instances launched against the scenario BORROW it (they never reap it). On Android the
 /// app reaches it over a per-instance adb-reverse bridge set up + torn down by each [AppSession]; on host
@@ -1130,6 +1207,10 @@ class AppSession {
       bottomInset: (m['bottomInset'] as num).toDouble(),
     );
   }
+
+  /// Inspect the app's current onstage semantic-label surface — the same labels targeted by [tap],
+  /// [waitFor], [exists], and text-entry helpers. Accessors fetch a fresh snapshot.
+  AppSemanticsInspector semantics() => AppSemanticsInspector._(this);
 
   // ---- reusable flows (driven over the app channel, so they run on host AND emulator) ----
 

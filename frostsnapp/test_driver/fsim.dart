@@ -248,6 +248,7 @@ Common:
   await session.connect(n) / disconnect(n) plug / unplug device n (+ downstream)
   await session.setChain([3, 1, 2])        re-cable to exactly these devices, in order
   session.tap(label) / enterText(label, t) / exists(label)
+  await session.semantics().labels()       current targetable app labels
   await session.device(n).holdConfirm(x, y)         device hold-to-confirm
   (await session.faucet()).blockHeight() / .fund(addr, sats) / .balanceSat()
 
