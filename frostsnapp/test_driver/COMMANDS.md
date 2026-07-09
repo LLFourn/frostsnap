@@ -96,6 +96,7 @@ roles, actions, flags, and bounds) are diagnostic and may vary with Flutter.
 | call | returns | does |
 |------|---------|------|
 | `session.screenshot(name, {keep})` | `String` | capture a whole-app screenshot; returns its path |
+| `session.record(path, body, {deviceFile})` | body result | **android only** — record one async body, always stopping + pulling the mp4 to `path` |
 | `session.startRecording()` | `void` | **android only** — start recording the emulator screen (native `screenrecord`); call mid-run, then drive |
 | `session.stopRecording(path)` | `String` | **android only** — stop the recording + pull its mp4 to `path`; returns `path` (caps at 180s) |
 | `session.deleteSecureKey()` | `void` | **android only** (errors on host) — delete the app's StrongBox/TEE `AndroidKeyStore` key; exercises the "key gone → recover" path |
@@ -146,4 +147,5 @@ fsim eval "await (await session.faucet()).fund(addr, 100000)"   # fund an addres
 fsim eval "await (await session.faucet()).mine(6)"              # mine 6 blocks (confirm txs)
 fsim eval "await session.device(1).holdConfirm(200, 600)"       # device 1 hold-to-confirm
 fsim eval "await session.screenshot('after-keygen')"            # -> screenshot path
+fsim eval "await session.record('demo.mp4', () async { await session.tap('Open simulator'); return 'recorded'; })"
 ```

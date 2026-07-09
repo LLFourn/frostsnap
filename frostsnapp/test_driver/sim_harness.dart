@@ -1540,6 +1540,21 @@ class AppSession {
   /// The in-progress recording (the detached `adb shell screenrecord` process + its on-device file), or null.
   ({Process proc, String deviceFile})? _recording;
 
+  /// Record [body] as one Android emulator clip, finalize it to host [path], and return the body's result.
+  /// Stopping is always attempted after a successful start, including when [body] throws.
+  Future<T> record<T>(
+    String path,
+    Future<T> Function() body, {
+    String deviceFile = '/sdcard/fsim-rec.mp4',
+  }) async {
+    await startRecording(deviceFile: deviceFile);
+    try {
+      return await body();
+    } finally {
+      await stopRecording(path);
+    }
+  }
+
   /// Start recording this (android) session's emulator screen to [deviceFile] on the device — a NATIVE
   /// `screenrecord` that runs ON the emulator, so it captures the flow AS you drive it via eval with no perf
   /// cost to driving. Call it MID-RUN (after setup), drive, then [stopRecording] to pull the mp4. Android only
