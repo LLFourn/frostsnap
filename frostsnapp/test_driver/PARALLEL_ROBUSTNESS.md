@@ -48,9 +48,9 @@ All three are an out-of-process find/assert losing to a slow app under contentio
 
 ## What today's machinery covers (and doesn't)
 
-- `isTransientFlake` (`fsim.dart`) retries ONLY connection-drop output (`Failed to fulfill
-  SetFrameSync` / `Lost connection to device`) with no real-assertion signature. **None** of the three
-  signatures above match, so they are never retried — they fail outright.
+- The runner retries NOTHING by default — each test runs once and a failure is a failure. `--retries N`
+  opts into up to N blind re-runs (for CI) that re-run ANY failure. So none of the three signatures above
+  are retried by default — they fail outright.
 - Runner default `effJobs = (jobs ?? files.length).clamp(1, files.length)` — every test at once. Not the
   root cause here (headroom is huge), but it maximizes the concurrent timing jitter that triggers the
   fragility.
@@ -84,9 +84,10 @@ scenarios (multi-device keygen, the 2-app `regtest_dual_send`) so they don't all
 launches simultaneously. Guard against the trivial "serialize to `--jobs 1`" answer — the goal is
 reliable at a SENSIBLE default on a clean host, which P1 is what actually buys.
 
-**P3 — Retry classification as a safety net, last.** Only after P1, consider treating the
-startup-semantics signature as transient in `isTransientFlake` (one retry). Weigh masking risk: scope it
-narrowly to the `No root widget is attached` startup signature so it can't hide a real assertion failure.
+**P3 — Opt-in retries as a safety net, last.** Only after P1, consider running CI with a small
+`--retries` budget (e.g. 1) to ride out residual startup jitter. Weigh masking risk: a blind retry re-runs
+ANY failure, so a persistently broken test still fails, but a rare real flake near a race could be papered
+over — keep the budget minimal and treat any test that only passes on retry as a bug to fix, not accept.
 
 ## Measurements
 

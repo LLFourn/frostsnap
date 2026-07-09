@@ -107,7 +107,7 @@ fsim — drive the running sim app/devices through SimHarness.
                                               (e.g. `session.chain()`, `await session.connect(2)`); `-a` passes
                                               a shell value in as a String (`-a addr="\$addr" "…fund(addr,…)…"`)
   fsim repl                                  interactive console: live Dart per line, session persists (Ctrl-D quits)
-  fsim test [NAMES...] [--android] [--jobs N] [--test-timeout SECS] [--nocapture|-v] [--junit PATH]
+  fsim test [NAMES...] [--android] [--jobs N] [--retries N] [--test-timeout SECS] [--nocapture|-v] [--junit PATH]
                                               run e2e driver tests (stems; ALL if none) IN PARALLEL —
                                               host: one `dart run` each; --android: each SELF-BOOTS
                                               its OWN emulator + (if it uses regtest) bridges its OWN
@@ -116,7 +116,9 @@ fsim — drive the running sim app/devices through SimHarness.
                                               --test-timeout (default 900s) reaps a wedged test as
                                               TIMEOUT so the run never stalls; raw output goes to
                                               build/sim-failures/<test>/output.log unless
-                                              --nocapture/-v streams it live; --junit writes XML
+                                              --nocapture/-v streams it live; --junit writes XML.
+                                              --retries N (default 0) re-runs a FAILED test up to N more
+                                              times from a fresh launch — else a failure is a failure
   fsim regtest up|down|status               manage THIS session's regtest (<dir>/.fsim/regtest.*) — the
                                               serve auto-starts it; bitcoind+electrs+faucet
   fsim regtest fund <addr> <sats> | mine [n] | balance | height | address | url   drive the faucet
@@ -722,7 +724,7 @@ class _TestResult {
   final Duration duration;
   final String? reason;
 
-  /// Transient-flake retries taken before this (final) result; 0 = passed/failed first try.
+  /// Retries taken before this (final) result; 0 = passed/failed on the first attempt.
   int retries = 0;
 
   _TestResult({
@@ -806,7 +808,7 @@ void _printSummary(List<_TestResult> results, Duration elapsed) {
   stdout.writeln(
     'test result: $passed passed; $failed failed; $timedOut timed out; '
     '$skipped skipped; finished in ${_elapsed(elapsed)}'
-    '${retried > 0 ? ' ($retried retried a transient flake)' : ''}',
+    '${retried > 0 ? ' ($retried retried)' : ''}',
   );
 }
 
@@ -875,6 +877,8 @@ Future<void> _runTests(List<String> args) async {
   int? testTimeout; // per-test hard deadline, seconds
   var noCapture = false;
   String? junitPath;
+  var retries =
+      0; // opt-in extra attempts a FAILED test gets; default 0 = a failure is a failure
   final positional = <String>[];
   for (var i = 0; i < args.length; i++) {
     final a = args[i];
@@ -893,6 +897,14 @@ Future<void> _runTests(List<String> args) async {
     }
     if (a == '--junit') {
       junitPath = args[++i];
+      continue;
+    }
+    if (a == '--retries') {
+      retries = int.parse(args[++i]);
+      if (retries < 0) {
+        stderr.writeln('fsim test: --retries must be >= 0');
+        exit(2);
+      }
       continue;
     }
     if (a.startsWith('--')) continue;
@@ -965,7 +977,7 @@ Future<void> _runTests(List<String> args) async {
   // targets the Linux desktop app + the prebuilt binary built above. Android self-boots ('android').
   final hostDevice = Platform.isLinux ? 'linux' : null;
   await _runBounded(tests, effJobs, (test, workerSlot) async {
-    final (r, retries) = await runWithRetry<_TestResult>(
+    final (r, retriesTaken) = await runWithRetry<_TestResult>(
       (_) => _runOneTest(
         test,
         flutterDevice: android ? 'android' : hostDevice,
@@ -976,14 +988,15 @@ Future<void> _runTests(List<String> args) async {
         capture: !noCapture,
         deadline: deadline,
       ),
-      (res) => res.failed && isTransientFlake(res.output),
+      (res) => res.failed,
+      maxAttempts: 1 + retries,
     );
     // Android: reap the emulator(s) this slot self-booted — belt-and-suspenders so a timed-out/killed
     // test (whose own teardown didn't run) can't orphan one. Deterministic serials from the slot.
     if (android && sdk != null) await _reapSlotEmulators(sdk, workerSlot);
-    r.retries = retries;
+    r.retries = retriesTaken;
     _printResult(r);
-    _reportRetries(r, retries);
+    _reportRetries(r, retriesTaken);
     results.add(r);
   });
 
@@ -1004,42 +1017,13 @@ Future<void> _reapSlotEmulators(String sdk, int slot) async {
   }
 }
 
-/// One try plus up to two retries — enough to ride out a transient startup flake without masking a
-/// chronically broken test.
-const _maxTestAttempts = 3;
-
-/// Signatures of a GENUINE scenario failure — present iff the test ran and asserted/threw on its own.
-/// Such a failure must NOT be retried even when a connection-drop line is ALSO in the output (e.g. the
-/// app shutting down after the failure prints "Lost connection to device"). NB: an uncaught
-/// `StateError('x')` prints as `Bad state: x`, NOT "StateError" — matching the literal type name would
-/// miss every real scenario assertion.
-const _realFailureSignatures = [
-  'Bad state:', // StateError — the scenarios' and tapUntil's assertions
-  'Expected:', // package:test / matcher expect()
-  'TestFailure', // package:test
-  'Failed assertion', // dart assert()
-];
-
-/// True if [output] shows a TRANSIENT startup connection flake — the emulator dropping the VM service
-/// while the app janks at launch — rather than a real failure. The driver's first command after the
-/// drop fails with a SetFrameSync remote error / "Lost connection to device". A failure that ALSO
-/// carries a real-assertion signature is never transient, so a genuine failure whose app then dropped
-/// the connection is not retried.
-bool isTransientFlake(String output) {
-  final connectionDropped =
-      output.contains('Failed to fulfill SetFrameSync') ||
-      output.contains('Lost connection to device');
-  if (!connectionDropped) return false;
-  return !_realFailureSignatures.any(output.contains);
-}
-
 /// Run [attempt] (each call is one fresh attempt, given its 1-based number) and retry while
 /// [shouldRetry] holds the result, up to [maxAttempts] total. Returns the final result and the number
 /// of RETRIES taken (0 on a first-try result). Pure control flow — unit-tested with a fake [attempt].
 Future<(T, int)> runWithRetry<T>(
   Future<T> Function(int attempt) attempt,
   bool Function(T) shouldRetry, {
-  int maxAttempts = _maxTestAttempts,
+  int maxAttempts = 1,
 }) async {
   for (var n = 1; ; n++) {
     final r = await attempt(n);
@@ -1047,14 +1031,14 @@ Future<(T, int)> runWithRetry<T>(
   }
 }
 
-/// Surface retries on stderr so a flaky test is visible, never silently papered over.
+/// Surface retries on stderr so a retried test is visible, never silently papered over.
 void _reportRetries(_TestResult r, int retries) {
   if (retries == 0) return;
   final s = retries == 1 ? 'retry' : 'retries';
   stderr.writeln(
     r.passed
-        ? 'fsim: ${r.test.name} recovered after $retries transient-flake $s'
-        : 'fsim: ${r.test.name} FAILED after ${retries + 1} attempts (transient startup flake persisted)',
+        ? 'fsim: ${r.test.name} recovered after $retries $s'
+        : 'fsim: ${r.test.name} FAILED after ${retries + 1} attempts',
   );
 }
 
