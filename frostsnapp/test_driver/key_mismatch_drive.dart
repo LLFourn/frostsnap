@@ -3,27 +3,15 @@ import 'dart:io';
 import 'regtest.dart' show androidSdkRoot;
 import 'sim_harness.dart';
 
-// e2e KEY MISMATCH (android-keystore-fallback): a wallet whose data was
-// encrypted under the hardware Keystore key while the app now supplies the
-// empty fallback key — the state an old-keymaster phone lands in once the
-// empty-key fallback kicks in. Uses the debug-only `frostsnap_force_empty_key`
-// global setting to flip the key the app supplies LIVE (SecureKeyManager reads
-// it on every getOrCreateKey), so we create a wallet under the hardware key and
-// then act on it under the empty key.
+// e2e KEY MISMATCH (android-keystore-fallback): top-level restoration must
+// report the ordinary duplicate-wallet error when a device share names an
+// access structure the app already has. That result must not depend on whether
+// the app key is correct, wrong, or unavailable because this check does not
+// decrypt existing wallet data.
 //
-// This drives the RISKIEST mismatch path — starting a restoration for a wallet
-// the app still has but can no longer decrypt — and asserts it routes to the
-// TYPED delete-and-recover dialog ("Wallet needs recovery"), NOT a false
-// "share belongs elsewhere", an opaque failure, or a panic. That single flow
-// exercises the whole design's hard part:
-//   - find_share SKIPS the undecryptable complete wallet (otherwise the check
-//     would report ShareBelongsElsewhere instead of the mismatch);
-//   - the explicit access-structure check reports the mismatch as a typed
-//     error the Dart side catches;
-//   - start_restoring_key_from_recover_share returns that typed error rather
-//     than assert-panicking.
-// The sign and show-backup mismatch paths share the same typed-error → dialog
-// plumbing and were validated interactively (see the PR description).
+// Decrypt-existing operations (signing, backup inspection, and adding a share
+// to an existing wallet) still route key failures to "Wallet needs recovery";
+// their focused sibling drivers cover that behavior.
 //
 // Android-only: the mismatch needs the platform-channel Keystore path; a
 // desktop host always uses the empty key so there is nothing to mismatch.
@@ -47,6 +35,45 @@ Future<void> _setForceEmptyKey(AppSession h, bool on) async {
   stdout.writeln('key_mismatch: frostsnap_force_empty_key=${on ? 1 : 0}');
 }
 
+Future<void> _clearScreenLock(AppSession h) async {
+  final adb = '${androidSdkRoot()}/platform-tools/adb';
+  final res = await Process.run(adb, [
+    '-s',
+    h.emulatorSerial!,
+    'shell',
+    'locksettings',
+    'clear',
+    '--old',
+    '0000',
+  ]);
+  if (res.exitCode != 0) {
+    throw StateError('adb locksettings clear failed: ${res.stderr}');
+  }
+  stdout.writeln('key_mismatch: screen lock removed');
+}
+
+Future<void> _expectDuplicate(AppSession h, String keyState) async {
+  await h.tap(RegExp('Use an existing device key'));
+  await h.waitFor(
+    RegExp('Restore from device'),
+    timeout: const Duration(seconds: 15),
+  );
+  await h.waitFor(
+    RegExp("existing wallet 'Mis'.*cannot be used to start a new restoration"),
+    timeout: const Duration(seconds: 20),
+  );
+  if (await h.exists('Wallet needs recovery')) {
+    throw StateError(
+      '$keyState app key incorrectly routed a top-level duplicate to recovery',
+    );
+  }
+  stdout.writeln(
+    'key_mismatch: $keyState app key reports the ordinary duplicate error',
+  );
+  await h.tap('Cancel');
+  await h.waitFor(RegExp('Use an existing device key'));
+}
+
 Future<void> main() async {
   await SimHarness.runScenario('key-mismatch', (h) async {
     if (h.emulatorSerial == null) {
@@ -63,36 +90,28 @@ Future<void> main() async {
     await h.waitFor(RegExp('Receive'), timeout: const Duration(seconds: 120));
     stdout.writeln('key_mismatch: wallet Mis created under the hardware key');
 
-    // 2. The app now supplies the empty fallback key: every wallet-data read
-    //    is a key mismatch.
-    await _setForceEmptyKey(h, true);
-
-    // 3. Start a restoration from the device that still holds Mis's share,
-    //    while Mis still exists but can't be decrypted.
+    // 2. Open the top-level restoration flow with Mis's device connected.
     await h.device(1).setConnected(true);
     await h.tap('Open navigation menu');
     await h.tapUntil(
       RegExp('Create or restore'),
       RegExp('Use an existing device key'),
     );
-    await h.tap(RegExp('Use an existing device key'));
-    await h.waitFor(
-      RegExp('Restore from device'),
-      timeout: const Duration(seconds: 15),
-    );
 
-    // 4. It must route to the typed delete-and-recover dialog — not a panic,
-    //    not a false "share belongs elsewhere".
-    await h.waitFor(
-      'Wallet needs recovery',
-      timeout: const Duration(seconds: 20),
-    );
+    // 3. The duplicate result is identical with the correct hardware key, the
+    //    forced empty (wrong) key, and no available Keystore key at all.
+    await _expectDuplicate(h, 'correct');
+
+    await _setForceEmptyKey(h, true);
+    await _expectDuplicate(h, 'wrong');
+
+    await _setForceEmptyKey(h, false);
+    await _clearScreenLock(h);
+    await _expectDuplicate(h, 'unavailable');
+
     stdout.writeln(
-      'KEY_MISMATCH_OK: restore-into-existing routes to the typed '
-      'delete-and-recover dialog (dup check skipped the undecryptable wallet, '
-      'no panic)',
+      'KEY_MISMATCH_OK: top-level duplicate restoration reports the ordinary '
+      'error with correct, wrong, and unavailable app keys',
     );
-    await h.tap('Not now');
-    await h.waitForAbsent('Wallet needs recovery');
   }, deviceCount: 1);
 }
