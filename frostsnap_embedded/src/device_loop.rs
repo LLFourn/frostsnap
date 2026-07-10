@@ -430,7 +430,7 @@ impl<'a, H: DeviceHal, U: UserInteraction> DeviceLoop<'a, H, U> {
 
                 match self.parts.firmware.poll(self.ui) {
                     FirmwareAction::Send(body) => {
-                        self.upstream_connection.send_to_coordinator([*body]);
+                        self.upstream_connection.send_to_coordinator([body]);
                     }
                     FirmwareAction::ResetRequested => {
                         return self.request_reset();
@@ -519,7 +519,7 @@ impl<'a, H: DeviceHal, U: UserInteraction> DeviceLoop<'a, H, U> {
                     };
                     match action {
                         FirmwareAction::Send(body) => {
-                            self.upstream_connection.send_to_coordinator([*body]);
+                            self.upstream_connection.send_to_coordinator([body]);
                         }
                         FirmwareAction::ResetRequested => {
                             reset_after_inbox = true;
@@ -915,7 +915,7 @@ mod smoke {
             false
         }
         fn fill(&mut self) {}
-        fn write_bytes(&mut self, _bytes: &[u8]) -> Result<(), crate::framed_serial::WriteError> {
+        fn write_bytes(&mut self, _bytes: &[u8]) -> Result<(), ()> {
             Ok(())
         }
         fn nb_flush(&mut self) {}

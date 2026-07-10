@@ -6,7 +6,7 @@
 //! drives (sim-2). sim-1 only needs the device end (a `disconnected()` link is a
 //! device with no peer — it renders Standby and never establishes upstream).
 
-use frostsnap_embedded::framed_serial::{ByteIo, WriteError};
+use frostsnap_embedded::framed_serial::ByteIo;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -142,7 +142,7 @@ impl ByteIo for PipeByteIo {
 
     fn fill(&mut self) {}
 
-    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), ()> {
         self.tx.push(bytes);
         Ok(())
     }

@@ -10,7 +10,6 @@
 use crate::flash_header::KeyedHash;
 use crate::framed_serial::SerialPort;
 use crate::ui::UserInteraction;
-use alloc::boxed::Box;
 use embedded_graphics::geometry::Point;
 use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use frostsnap_comms::{CoordinatorSendBody, DeviceSendBody, Downstream, Sha256Digest, Upstream};
@@ -74,7 +73,7 @@ pub enum InitOutcome<L> {
 /// in a reset.
 pub enum FirmwareAction {
     None,
-    Send(Box<DeviceSendBody>),
+    Send(DeviceSendBody),
     ResetRequested,
 }
 

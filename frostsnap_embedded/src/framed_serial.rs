@@ -10,11 +10,6 @@ use bincode::error::{DecodeError, EncodeError};
 use core::marker::PhantomData;
 use frostsnap_comms::{Direction, MagicBytes, ReceiveSerial, BINCODE_CONFIG};
 
-/// A byte-transport write failed. Deliberately opaque — the underlying transports
-/// (UART / USB-JTAG / in-memory pipe) carry no useful error detail to surface here.
-#[derive(Debug)]
-pub struct WriteError;
-
 /// Byte-level transport the framing rides on. esp: UART interrupt queue / USB-JTAG;
 /// host/sim: an in-memory pipe.
 pub trait ByteIo {
@@ -24,7 +19,7 @@ pub trait ByteIo {
     fn has_data(&mut self) -> bool;
     /// Top up any internal receive buffer from the underlying device.
     fn fill(&mut self);
-    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), WriteError>;
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), ()>;
     /// Non-blocking best-effort flush (esp JTAG needs it; UART is a no-op).
     fn nb_flush(&mut self);
     /// Blocking flush — only before a reset, to ensure bytes left the wire.
@@ -213,6 +208,6 @@ impl<IO: ByteIo, C, D> Writer for FramedSerial<IO, C, D> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), EncodeError> {
         self.io
             .write_bytes(bytes)
-            .map_err(|_| EncodeError::Other("serial write failed"))
+            .map_err(|()| EncodeError::Other("serial write failed"))
     }
 }

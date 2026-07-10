@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'sim_harness.dart';
@@ -24,6 +25,33 @@ Future<void> main() async {
     await h.enterText('Device name 1', 'SimDev1');
     await h.tapUntil('Continue with 1 device', 'Continue anyway');
     await h.tapUntil('Continue anyway', 'Generate keys');
+
+    final semantics = h.semantics();
+    final labels = await semantics.labels();
+    if (!labels.contains('Generate keys')) {
+      throw StateError(
+        'semantics labels did not include "Generate keys": $labels',
+      );
+    }
+    final grep = await semantics.grep('Generate keys');
+    if (!grep.contains('Generate keys') || !await h.exists('Generate keys')) {
+      throw StateError(
+        'semantics grep did not match the targetable "Generate keys" label: $grep',
+      );
+    }
+    final pretty = await semantics.pretty();
+    if (!pretty.contains('Generate keys')) {
+      throw StateError(
+        'semantics pretty output omitted "Generate keys": $pretty',
+      );
+    }
+    final snapshot = jsonDecode(await semantics.json()) as Map<String, dynamic>;
+    if (snapshot['nodes'] is! List) {
+      throw StateError(
+        'semantics json did not contain a nodes list: $snapshot',
+      );
+    }
+
     await h.tapUntil('Generate keys', RegExp('Security Check'));
 
     var confirmed = false;

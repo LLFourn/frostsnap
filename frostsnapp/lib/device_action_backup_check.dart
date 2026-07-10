@@ -4,11 +4,11 @@ import 'package:flutter/material.dart';
 import 'package:frostsnap/device_action_fullscreen_dialog.dart';
 import 'package:frostsnap/global.dart';
 import 'package:frostsnap/id_ext.dart';
+import 'package:frostsnap/secure_key_provider.dart';
 import 'package:frostsnap/src/rust/api.dart';
 import 'package:frostsnap/src/rust/api/coordinator.dart';
 import 'package:frostsnap/src/rust/api/recovery.dart';
 import 'package:frostsnap/stream_ext.dart';
-import 'package:frostsnap/wallet_key_mismatch.dart';
 
 class DeviceActionBackupCheckController with ChangeNotifier {
   final AccessStructure accessStructure;
@@ -33,12 +33,7 @@ class DeviceActionBackupCheckController with ChangeNotifier {
         null;
     if (!connected) return null;
 
-    final encryptionKey = await existingWalletKey(
-      context: context.mounted ? context : null,
-      accessStructureRef: accessStructure.accessStructureRef(),
-      action: 'check this backup',
-    );
-    if (encryptionKey == null) return null;
+    final encryptionKey = await SecureKeyProvider.getEncryptionKey();
     final shareIndex = accessStructure.getDeviceShareIndex(deviceId: id);
     if (shareIndex == null) return null;
 
@@ -67,15 +62,16 @@ class DeviceActionBackupCheckController with ChangeNotifier {
     _dialogController = controller;
 
     try {
-      final checkStream = coord.tellDeviceToCheckBackup(
-        deviceId: id,
-        accessStructureRef: accessStructure.accessStructureRef(),
-        shareIndex: shareIndex,
-        encryptionKey: encryptionKey,
-      );
-
       final (state, isCancelled) = await select([
-        checkStream.last.then((s) => (s, true)),
+        coord
+            .tellDeviceToCheckBackup(
+              deviceId: id,
+              accessStructureRef: accessStructure.accessStructureRef(),
+              shareIndex: shareIndex,
+              encryptionKey: encryptionKey,
+            )
+            .last
+            .then((s) => (s, true)),
         controller.awaitDismissed().then((_) => (null, false)),
       ], catchError: (_) => (null, true));
 

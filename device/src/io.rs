@@ -7,7 +7,7 @@ use esp_hal::uart::{AnyUart, Uart};
 use esp_hal::Blocking;
 use esp_hal::{prelude::*, timer, uart, usb_serial_jtag::UsbSerialJtag};
 use frostsnap_embedded::device_hal::Clock;
-use frostsnap_embedded::framed_serial::{ByteIo, WriteError};
+use frostsnap_embedded::framed_serial::ByteIo;
 
 use crate::uart_interrupt::RX_FIFO_THRESHOLD;
 use crate::uart_interrupt::{UartHandle, UartNum, UartReceiver};
@@ -165,8 +165,8 @@ impl ByteIo for SerialIo<'_> {
     fn fill(&mut self) {
         self.fill_queue();
     }
-    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
-        SerialIo::write_bytes(self, bytes).map_err(|_| WriteError)
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        SerialIo::write_bytes(self, bytes).map_err(|_| ())
     }
     fn nb_flush(&mut self) {
         SerialIo::nb_flush(self);

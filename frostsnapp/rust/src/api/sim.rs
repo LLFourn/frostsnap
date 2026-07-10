@@ -189,7 +189,11 @@ pub struct DevicePool {
 }
 
 impl DevicePool {
-    pub(crate) fn new(seed: u64, router: Arc<ChainRouter>, handles: Vec<SimDevice>) -> Self {
+    pub(crate) fn new(
+        seed: u64,
+        router: Arc<ChainRouter>,
+        handles: Vec<SimDevice>,
+    ) -> Self {
         Self {
             seed,
             router,

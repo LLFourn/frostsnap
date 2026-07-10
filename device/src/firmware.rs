@@ -118,10 +118,10 @@ impl FirmwareServices for EspFirmware<'_> {
             CoordinatorSendBody::Challenge(challenge) => {
                 if let (Some(hw_rsa), Some(cert)) = (self.ds.as_mut(), self.certificate.as_ref()) {
                     let signature = hw_rsa.sign(&challenge.0, &mut self.sha256);
-                    FirmwareAction::Send(Box::new(DeviceSendBody::SignedChallenge {
+                    FirmwareAction::Send(DeviceSendBody::SignedChallenge {
                         signature: Box::new(signature),
                         certificate: Box::new(cert.clone()),
-                    }))
+                    })
                 } else {
                     FirmwareAction::None
                 }
@@ -132,7 +132,7 @@ impl FirmwareServices for EspFirmware<'_> {
 
     fn poll(&mut self, ui: &mut dyn UserInteraction) -> FirmwareAction {
         match self.upgrade.as_mut().and_then(|upgrade| upgrade.poll(ui)) {
-            Some(body) => FirmwareAction::Send(Box::new(body)),
+            Some(body) => FirmwareAction::Send(body),
             None => FirmwareAction::None,
         }
     }
