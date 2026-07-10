@@ -7,6 +7,7 @@ import 'package:flutter_driver/flutter_driver.dart';
 import 'package:vm_service/vm_service.dart';
 import 'package:vm_service/vm_service_io.dart';
 
+import 'diagnostic_rerun.dart';
 import 'emulator.dart';
 import 'regtest.dart';
 import 'sim_harness.dart';
@@ -107,7 +108,7 @@ fsim — drive the running sim app/devices through SimHarness.
                                               (e.g. `session.chain()`, `await session.connect(2)`); `-a` passes
                                               a shell value in as a String (`-a addr="\$addr" "…fund(addr,…)…"`)
   fsim repl                                  interactive console: live Dart per line, session persists (Ctrl-D quits)
-  fsim test [NAMES...] [--android] [--jobs N] [--retries N] [--test-timeout SECS] [--nocapture|-v] [--junit PATH]
+  fsim test [NAMES...] [--android] [--jobs N] [--retries N] [--record-failures] [--test-timeout SECS] [--nocapture|-v] [--junit PATH]
                                               run e2e driver tests (stems; ALL if none) IN PARALLEL —
                                               host: one `dart run` each; --android: each SELF-BOOTS
                                               its OWN emulator + (if it uses regtest) bridges its OWN
@@ -118,7 +119,12 @@ fsim — drive the running sim app/devices through SimHarness.
                                               build/sim-failures/<test>/output.log unless
                                               --nocapture/-v streams it live; --junit writes XML.
                                               --retries N (default 0) re-runs a FAILED test up to N more
-                                              times from a fresh launch — else a failure is a failure
+                                              times from a fresh launch — else a failure is a failure.
+                                              --record-failures (android-only, needs --android): after
+                                              the batch, re-run each final failure ONCE solo, recording
+                                              the emulator screen (video →
+                                              build/sim-failures/<test>/rerun-N.mp4; original artifacts
+                                              kept; verdict unchanged)
   fsim regtest up|down|status               manage THIS session's regtest (<dir>/.fsim/regtest.*) — the
                                               serve auto-starts it; bitcoind+electrs+faucet
   fsim regtest fund <addr> <sats> | mine [n] | balance | height | address | url   drive the faucet
@@ -716,6 +722,10 @@ class _TestSpec {
 
   _TestSpec(this.file, this.name)
     : artifactsDir = Directory('build/sim-failures/$name');
+
+  // The diagnostic re-run writes under <test>/rerun/ so _runOneTest's artifact-clear can never touch the
+  // ORIGINAL failure evidence (error.txt / output.log / screenshots stay byte-for-byte intact).
+  _TestSpec.at(this.file, this.name, this.artifactsDir);
 }
 
 class _TestResult {
@@ -880,6 +890,7 @@ Future<void> _runTests(List<String> args) async {
   String? junitPath;
   var retries =
       0; // opt-in extra attempts a FAILED test gets; default 0 = a failure is a failure
+  var recordFailures = false;
   final positional = <String>[];
   for (var i = 0; i < args.length; i++) {
     final a = args[i];
@@ -908,8 +919,19 @@ Future<void> _runTests(List<String> args) async {
       }
       continue;
     }
+    if (a == '--record-failures') {
+      recordFailures = true;
+      continue;
+    }
     if (a.startsWith('--')) continue;
     positional.add(a);
+  }
+  if (recordFailures) {
+    final err = recordFailuresUsageError(android: android);
+    if (err != null) {
+      stderr.writeln(err);
+      exit(2);
+    }
   }
 
   final stems = <String, String>{}; // stem -> filename
@@ -1006,7 +1028,133 @@ Future<void> _runTests(List<String> args) async {
   final elapsed = DateTime.now().difference(started);
   _printSummary(results, elapsed);
   if (junitPath != null) await _writeJunit(junitPath, results, elapsed);
+  // Diagnostic phase LAST: verdict, summary, and JUnit above are frozen — the recorded re-runs below
+  // never feed back into them.
+  await _recordFailedTests(
+    results,
+    enabled: recordFailures,
+    sdk: sdk,
+    androidAppBinary: androidAppBinary,
+    deadline: deadline,
+  );
   exit(failures.isEmpty ? 0 : 1);
+}
+
+/// `--record-failures` (android-only): re-run each final failure ONCE, solo (sequentially, after the
+/// whole batch), recording the emulator screen — `rerun-N.mp4` segments land at the test dir root and
+/// the child's own artifacts under `<test>/rerun/`, so the ORIGINAL evidence is untouched.
+/// Purely diagnostic: results are already frozen; a re-run that passes just gets `rerun-passed.txt`.
+Future<void> _recordFailedTests(
+  List<_TestResult> results, {
+  required bool enabled,
+  required String? sdk,
+  required String? androidAppBinary,
+  required Duration deadline,
+}) async {
+  final reruns = selectDiagnosticReruns(
+    results,
+    enabled,
+    (r) => !r.passed && !r.skipped,
+  );
+  if (reruns.isEmpty) return;
+  stderr.writeln(
+    'fsim: recording diagnostic re-runs for ${reruns.length} failed test(s) …',
+  );
+  // The phase is purely diagnostic: ANY failure inside it (adb hiccup, boot failure, …) is reported and
+  // swallowed by runSequentially — an escaping exception would change fsim's exit code, breaking the
+  // frozen verdict (a missing recorder binary on CI did exactly that once: uncaught ProcessException ->
+  // exit 255).
+  await runSequentially(
+    reruns,
+    (r) => _recordOneRerun(
+      r,
+      sdk: sdk,
+      androidAppBinary: androidAppBinary,
+      deadline: deadline,
+    ),
+    (r, e) => stderr.writeln(
+      'fsim: --record-failures: ${r.test.name}: diagnostic re-run failed: $e',
+    ),
+  );
+}
+
+Future<void> _recordOneRerun(
+  _TestResult r, {
+  required String? sdk,
+  required String? androidAppBinary,
+  required Duration deadline,
+}) async {
+  final test = r.test;
+  final rerunSpec = _TestSpec.at(
+    test.file,
+    test.name,
+    Directory('${test.artifactsDir.path}/rerun'),
+  );
+  // The child self-boots its emulator on the deterministic slot-0 serial; recording can only start once
+  // that serial has FULLY booted. Record instance 0's emulator (a multi-instance android test would need
+  // per-serial recorders — none exists today). Cleanup is INVARIANT via the nested finallys: the recorder
+  // is finalized/pulled and the slot's emulators reaped even when the boot-wait, child, or pull throws.
+  final adb = '$sdk/platform-tools/adb';
+  final serial = emulatorSerial(0);
+  _TestResult? rerun;
+  final videos = <String>[];
+  try {
+    final childFuture = _runOneTest(
+      rerunSpec,
+      flutterDevice: 'android',
+      sdk: sdk,
+      androidAppBinary: androidAppBinary,
+      windowSlot: 0,
+      // The child must LEAVE its emulator running: the recorder pkill/pulls the mp4 after the child
+      // exits, then the outer finally reaps the slot.
+      extraEnv: const {'SIM_KEEP_EMULATOR': '1'},
+      capture: true,
+      deadline: deadline,
+    );
+    AndroidSegmentRecorder? rec;
+    try {
+      final ready = await waitBootCompleted(
+        adb,
+        serial,
+        childFuture.then((_) {}, onError: (_) {}),
+      );
+      if (ready) {
+        rec = AndroidSegmentRecorder(adb: adb, serial: serial)..start();
+      } else {
+        stderr.writeln(
+          'fsim: --record-failures: ${test.name}: emulator $serial never finished booting — no video',
+        );
+      }
+      rerun = await childFuture;
+    } finally {
+      if (rec != null) {
+        videos.addAll(await rec.stopAndPull(test.artifactsDir.path));
+      }
+    }
+  } finally {
+    if (sdk != null) await _reapSlotEmulators(sdk, 0);
+  }
+  if (rerun.passed) {
+    await File('${test.artifactsDir.path}/rerun-passed.txt').writeAsString(
+      'The recorded diagnostic re-run PASSED — the original failure did not reproduce (flake '
+      'evidence). The verdict above is unchanged.\n',
+    );
+  }
+  // A started screenrecord is no evidence of a clip: report success ONLY for segments that actually
+  // contain video, else surface a recording failure (runSequentially reports it; the verdict is frozen).
+  final usable = await usableSegments(videos);
+  if (usable.isEmpty) {
+    throw StateError(
+      'no usable video segment was recorded — the re-run child artifacts are in ${rerunSpec.artifactsDir.path}'
+      '${rerun.passed ? ' (the re-run itself PASSED; rerun-passed.txt written)' : ''}',
+    );
+  }
+  stderr.writeln(
+    rerun.passed
+        ? 'fsim: ${test.name}: diagnostic re-run PASSED (original failure stands); '
+              'video: ${usable.join(', ')}'
+        : 'fsim: ${test.name}: diagnostic re-run recorded; video: ${usable.join(', ')}',
+  );
 }
 
 /// Kill any emulators worker [slot] could have self-booted (its device-index range), so a timed-out or
@@ -1054,6 +1202,7 @@ Future<_TestResult> _runOneTest(
   String? hostAppBinary,
   String? androidAppBinary,
   int? windowSlot,
+  Map<String, String> extraEnv = const {},
   required bool capture,
   required Duration deadline,
 }) async {
@@ -1064,6 +1213,7 @@ Future<_TestResult> _runOneTest(
     ['run', 'test_driver/${test.file}'],
     mode: ProcessStartMode.normal,
     environment: {
+      ...extraEnv,
       'SIM_TEST_NAME': test.name,
       'SIM_TEST_ARTIFACTS_DIR': test.artifactsDir.absolute.path,
       // For android, this is the generic 'android' — the TEST self-boots its own emulator(s) from the

@@ -1723,7 +1723,10 @@ class AppSession {
       await _unbridge?.call();
     } catch (_) {}
     final serial = _emulatorSerial;
-    if (serial != null) {
+    // SIM_KEEP_EMULATOR=1: the `--record-failures` runner is recording this emulator's screen and must
+    // pkill/pull the mp4 AFTER this child exits — killing it here would strand the recording on a dead
+    // device. The runner reaps the slot's emulators itself once the video is pulled.
+    if (serial != null && Platform.environment['SIM_KEEP_EMULATOR'] != '1') {
       try {
         await killEmulator(androidSdkRoot(), serial);
       } catch (_) {}
