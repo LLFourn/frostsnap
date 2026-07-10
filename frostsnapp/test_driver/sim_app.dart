@@ -98,8 +98,6 @@ String _semanticsSnapshotJson() {
             if (data.role.name != 'none') 'role': data.role.name,
             if (data.textDirection != null)
               'textDirection': data.textDirection!.name,
-            if (data.minValue != null) 'minValue': data.minValue,
-            if (data.maxValue != null) 'maxValue': data.maxValue,
             if (data.increasedValue.isNotEmpty)
               'increasedValue': data.increasedValue,
             if (data.decreasedValue.isNotEmpty)
