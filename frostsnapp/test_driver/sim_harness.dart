@@ -24,6 +24,8 @@ import 'package:frostsnap/sim_faucet.dart';
 
 import 'emulator_lifecycle.dart' show shouldKillEmulatorOnTearDown;
 import 'ime_text.dart' show encodeImeText, imeTextPreflightError;
+import 'label_diagnostics.dart'
+    show diagnoseDriverFailure, tapUntilExhaustedError;
 import 'tooltip_resolve.dart' show resolveTooltip;
 import 'emulator.dart'
     show
@@ -567,7 +569,14 @@ class AppSession {
     this._appLog,
     this.flutterDevice,
     this.agentOwnsKeyboard,
-  );
+  ) {
+    // Record the app's exit so the failure classifier can consult it WITHOUT awaiting — an OOM
+    // force-stop mid-drive must classify as "app exited", not as a label/connection problem.
+    unawaited(_appProcess.exitCode.then((c) => _appExitStatus = c));
+  }
+
+  /// Cached completion of [appExitCode]; null while the app is alive.
+  int? _appExitStatus;
 
   SimFaucet? _faucet;
 
@@ -1129,7 +1138,16 @@ class AppSession {
   /// a slow/stuck app can't make a single request hang the scenario forever. (A FULLY wedged app —
   /// VM service unable to answer at all, e.g. a frozen UI thread — is caught by the runner's per-test
   /// deadline, since no client-side timeout can fire if the isolate never schedules the reply.)
-  Future<String> _requestData(String message) => driver
+  Future<String> _requestData(String message) async {
+    try {
+      return await _rawRequestData(message);
+    } catch (original) {
+      // Non-finder call: participates in app-exit/connection/action classification only.
+      throw await _diagnosed(original, verb: 'requestData("$message")');
+    }
+  }
+
+  Future<String> _rawRequestData(String message) => driver
       .runUnsynchronized(() => driver.requestData(message))
       .timeout(_cmdTimeout);
 
@@ -1354,6 +1372,8 @@ class AppSession {
     while (true) {
       final br = await _driverCall(
         () => driver.getBottomRight(finder, timeout: _cmdTimeout),
+        finder: label,
+        verb: 'getBottomRight("$label")',
       );
       if ((br.dy - prev).abs() < 1.0 || DateTime.now().isAfter(deadline)) {
         return br;
@@ -1393,34 +1413,97 @@ class AppSession {
   /// be shorter than this.
   static const Duration _minObserve = Duration(seconds: 2);
 
-  Future<T> _driverCall<T>(Future<T> Function() call, [Duration? timeout]) =>
+  /// RAW driver transport — no failure diagnosis. Used by predicates ([_appears]/[exists], which
+  /// treat failure as `false` and must not pay a probe per negative poll) and by the classifier's
+  /// own snapshot probe (which must never diagnose itself — that would recurse).
+  Future<T> _rawDriverCall<T>(Future<T> Function() call, [Duration? timeout]) =>
       driver.runUnsynchronized(call).timeout(timeout ?? _cmdTimeout);
+
+  /// The diagnosing driver wrapper: on failure, classify (label miss / app exited / action failure /
+  /// connection drop) instead of surfacing a raw DriverError or TimeoutException. [finder] is the
+  /// FINDER-phase Pattern only — typing/IME/non-finder phases must pass none, or a genuine action
+  /// failure could be rewritten as a label miss.
+  Future<T> _driverCall<T>(
+    Future<T> Function() call, {
+    Duration? timeout,
+    Pattern? finder,
+    String verb = 'driver call',
+  }) async {
+    try {
+      return await _rawDriverCall(call, timeout);
+    } catch (original) {
+      throw await _diagnosed(original, finder: finder, verb: verb);
+    }
+  }
+
+  Future<StateError> _diagnosed(
+    Object original, {
+    Pattern? finder,
+    required String verb,
+  }) async {
+    final d = await diagnoseDriverFailure(
+      original: original,
+      verb: verb,
+      finder: finder,
+      appExitStatus: () => _appExitStatus,
+      probeLabels: _probeOnStageLabels,
+      appLogTail: _recentAppLog,
+    );
+    return StateError(d.message);
+  }
+
+  /// RAW probe transport for the classifier (see [_rawDriverCall] — no recursion).
+  Future<List<String>> _probeOnStageLabels() async {
+    final nodes =
+        jsonDecode(await _rawRequestData('semantics-snapshot'))['nodes']
+            as List;
+    return [
+      for (final n in nodes)
+        if (((n as Map)['label'] as String?)?.isNotEmpty ?? false)
+          n['label'] as String,
+    ];
+  }
+
+  String _recentAppLog([int lines = 40]) => _appLog
+      .skip(_appLog.length > lines ? _appLog.length - lines : 0)
+      .join('\n');
 
   Future<void> tap(Pattern label) => _driverCall(
     () => driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout),
+    finder: label,
+    verb: 'tap("$label")',
   );
 
   /// Tap a control by its TOOLTIP — for tooltip-only buttons (e.g. an icon pencil) that expose no
   /// targetable semantic label. [tooltip] (String or RegExp) is resolved against the on-stage
   /// tooltips to exactly one — zero/many error with a diagnostic listing — then tapped via
   /// FlutterDriver's widget finder (never by coordinates).
-  Future<void> tapTooltip(Pattern tooltip) => _driverCall(() async {
-    final nodes =
-        jsonDecode(await _requestData('semantics-snapshot'))['nodes'] as List;
-    final available = <String>[
-      for (final n in nodes)
-        if ((n['tooltip'] as String?)?.isNotEmpty ?? false)
-          n['tooltip'] as String,
-    ];
-    final exact = resolveTooltip(tooltip, available);
-    await driver.tap(find.byTooltip(exact), timeout: _cmdTimeout);
-  }, _cmdTimeout * 2);
+  Future<void> tapTooltip(Pattern tooltip) => _driverCall(
+    () async {
+      // RAW fetch: this composite already sits under ONE diagnosing wrapper — a diagnosed inner
+      // call would classify (and probe) the same failure twice.
+      final nodes =
+          jsonDecode(await _rawRequestData('semantics-snapshot'))['nodes']
+              as List;
+      final available = <String>[
+        for (final n in nodes)
+          if ((n['tooltip'] as String?)?.isNotEmpty ?? false)
+            n['tooltip'] as String,
+      ];
+      final exact = resolveTooltip(tooltip, available);
+      await driver.tap(find.byTooltip(exact), timeout: _cmdTimeout);
+      // No finder context: tooltips aren't labels (the resolver already gave zero/many diagnostics),
+      // so a failure here is an action/driver failure by construction.
+    },
+    timeout: _cmdTimeout * 2,
+    verb: 'tapTooltip("$tooltip")',
+  );
 
   /// Tap the app surface at GLOBAL LOGICAL coordinates (origin top-left of the Flutter view) — the
   /// positional escape hatch for what no finder can target. Same coordinate space as the semantics
   /// snapshot's global bounds; no adb, no display-scale math, works on host and android alike.
   Future<void> tapAppAt(double x, double y) =>
-      _driverCall(() => _requestData('tap-at:$x,$y'));
+      _driverCall(() => _rawRequestData('tap-at:$x,$y'), verb: 'tapAppAt');
 
   /// Tap [label] and wait for [expect] to appear. Distinguishes two failure modes of
   /// an unsynchronized tap:
@@ -1448,14 +1531,20 @@ class AppSession {
       }
       // Otherwise [label] is still there: the tap no-op'd, so loop and re-tap.
     }
-    throw StateError(
-      'tapped "$label" $tries times but "$expect" never appeared',
-    );
+    // Diagnose the MISSING expect Pattern (the tapped label demonstrably matched) — best-effort
+    // probe so a dead connection still surfaces the plain exhaustion error, and matched-on-stage
+    // reports the timing truth instead of an absurd "no match" that lists the match.
+    List<String>? probed;
+    try {
+      probed = await _probeOnStageLabels();
+    } catch (_) {}
+    throw StateError(tapUntilExhaustedError(label, expect, tries, probed));
   }
 
   Future<bool> _appears(Pattern label, Duration timeout) async {
     try {
-      await _driverCall(
+      // RAW: a predicate treats failure as `false` — diagnosing it would probe on every poll.
+      await _rawDriverCall(
         () => driver.waitFor(find.bySemanticsLabel(label), timeout: timeout),
         timeout + const Duration(seconds: 1),
       );
@@ -1484,31 +1573,57 @@ class AppSession {
   /// Overall budget for one IME-typed entry: the keyboard-visible gate (30s) + clear + `input text`.
   static const Duration _imeTimeout = Duration(seconds: 60);
 
-  Future<void> enterText(Pattern label, String text) => _driverCall(() async {
+  Future<void> enterText(Pattern label, String text) async {
+    // Two DISTINCT diagnostic phases: the focus tap carries the label as finder context; the
+    // typing/IME phase carries none — a typing failure must never read as a focus-label miss.
     if (_isAndroid) {
       _imePreflight(
         text,
       ); // BEFORE any UI mutation — a rejected payload touches nothing.
-      await driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout);
-      await _typeViaIme(text);
+      await _driverCall(
+        () => driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout),
+        finder: label,
+        verb: 'enterText focus tap("$label")',
+      );
+      await _driverCall(
+        () => _typeViaIme(text),
+        timeout: _imeTimeout,
+        verb: 'enterText IME typing',
+      );
       return;
     }
     _requireAgentKeyboard();
-    await driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout);
-    await driver.enterText(text, timeout: _cmdTimeout);
-  }, _imeTimeout);
+    await _driverCall(
+      () => driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout),
+      finder: label,
+      verb: 'enterText focus tap("$label")',
+    );
+    await _driverCall(
+      () => driver.enterText(text, timeout: _cmdTimeout),
+      verb: 'enterText typing',
+    );
+  }
 
   /// Type [text] into the currently-focused text field (NO finder) — for an autofocused field that has
   /// no stable semantic label, e.g. the send Amount input.
-  Future<void> enterFocusedText(String text) => _driverCall(() async {
+  Future<void> enterFocusedText(String text) async {
+    // Preconditions OUTSIDE the diagnosing wrapper: their intentional ArgumentError /
+    // AgentKeyboardRequired must reach the caller as documented, not re-wrapped as a probed failure.
     if (_isAndroid) {
       _imePreflight(text);
-      await _typeViaIme(text);
+      await _driverCall(
+        () => _typeViaIme(text),
+        timeout: _imeTimeout,
+        verb: 'enterFocusedText IME typing',
+      );
       return;
     }
     _requireAgentKeyboard();
-    await driver.enterText(text, timeout: _cmdTimeout);
-  }, _imeTimeout);
+    await _driverCall(
+      () => driver.enterText(text, timeout: _cmdTimeout),
+      verb: 'enterFocusedText typing',
+    );
+  }
 
   void _imePreflight(String text) {
     final err = imeTextPreflightError(text);
@@ -1529,7 +1644,7 @@ class AppSession {
     // a 26-key clear survived), so retry until empty — backspaces past empty are no-ops, making the
     // loop convergent. The query throws if no text field is focused, so a mis-targeted enterText
     // fails loudly instead of typing into the void.
-    var len = await focusedTextLength();
+    var len = await _rawFocusedTextLength();
     for (var attempt = 0; len > 0; attempt++) {
       if (attempt >= 3) {
         throw StateError(
@@ -1544,7 +1659,7 @@ class AppSession {
         'keyevent',
         ...List.filled(len, '67'), // KEYCODE_DEL (backspace)
       ]);
-      len = await focusedTextLength();
+      len = await _rawFocusedTextLength();
     }
     if (text.isNotEmpty) {
       await adb(['shell', 'input', 'text', encodeImeText(text)]);
@@ -1555,11 +1670,19 @@ class AppSession {
   Future<bool> keyboardVisible() async =>
       await _requestData('keyboard-visible') == 'true';
 
+  /// RAW variant for composites already under one diagnosing wrapper (enterText's IME phase).
+  Future<bool> _rawKeyboardVisible() async =>
+      await _rawRequestData('keyboard-visible') == 'true';
+
   /// Exact UNTRIMMED value length of the focused text field (the semantics snapshot trims values, so
   /// edge whitespace is invisible there). Throws if no text field is focused. The android REPLACE
   /// clear backspaces exactly this many times.
   Future<int> focusedTextLength() async =>
       int.parse(await _requestData('focused-text-length'));
+
+  /// RAW variant for composites already under one diagnosing wrapper (enterText's IME phase).
+  Future<int> _rawFocusedTextLength() async =>
+      int.parse(await _rawRequestData('focused-text-length'));
 
   Future<void> _waitKeyboardVisible() async {
     // Nudge-then-poll: right after a cold emulator boot the IME service is still initializing and
@@ -1568,10 +1691,11 @@ class AppSession {
     // so the gate self-heals as soon as the service is ready.
     final deadline = DateTime.now().add(const Duration(seconds: 30));
     while (DateTime.now().isBefore(deadline)) {
-      await _requestData('show-keyboard');
+      // RAW transports: this loop runs inside enterText's diagnosing wrapper (see _rawDriverCall).
+      await _rawRequestData('show-keyboard');
       final settle = DateTime.now().add(const Duration(seconds: 2));
       while (DateTime.now().isBefore(settle)) {
-        if (await keyboardVisible()) return;
+        if (await _rawKeyboardVisible()) return;
         await Future<void>.delayed(const Duration(milliseconds: 100));
       }
     }
@@ -1620,13 +1744,18 @@ class AppSession {
 
   Future<String> getText(Pattern label) => _driverCall(
     () => driver.getText(find.bySemanticsLabel(label), timeout: _cmdTimeout),
+    finder: label,
+    verb: 'getText("$label")',
   );
 
   /// Text of the widget with `ValueKey(key)` — for content that has no stable semantic label (e.g. an
   /// address string, whose label IS the value we're trying to read). Reads this app's own widget tree,
   /// so it's per-app and can't be raced like the process-global system clipboard.
+  // NO finder context: a ValueKey is absent from the semantics snapshot — key-as-Pattern would
+  // always manufacture a false label miss.
   Future<String> getTextByKey(String key) => _driverCall(
     () => driver.getText(find.byValueKey(key), timeout: _cmdTimeout),
+    verb: 'getTextByKey("$key")',
   );
 
   /// The app clipboard, via the sim_app driver data handler — e.g. to read a wallet receive
@@ -1643,7 +1772,9 @@ class AppSession {
     Duration timeout = const Duration(seconds: 30),
   }) => _driverCall(
     () => driver.waitFor(find.bySemanticsLabel(label), timeout: timeout),
-    timeout + const Duration(seconds: 1),
+    timeout: timeout + const Duration(seconds: 1),
+    finder: label,
+    verb: 'waitFor("$label")',
   );
 
   Future<void> waitForAbsent(
@@ -1651,7 +1782,8 @@ class AppSession {
     Duration timeout = const Duration(seconds: 30),
   }) => _driverCall(
     () => driver.waitForAbsent(find.bySemanticsLabel(label), timeout: timeout),
-    timeout + const Duration(seconds: 1),
+    timeout: timeout + const Duration(seconds: 1),
+    verb: 'waitForAbsent("$label")',
   );
 
   /// Whether a control with semantic [label] is present right now. Reads the semantics tree, so it waits
@@ -1659,7 +1791,8 @@ class AppSession {
   /// just-changed-but-unpainted state.
   Future<bool> exists(Pattern label) async {
     try {
-      await _driverCall(
+      // RAW: a predicate treats failure as `false` — diagnosing it would probe on every negative.
+      await _rawDriverCall(
         () =>
             driver.waitFor(find.bySemanticsLabel(label), timeout: _minObserve),
         _minObserve + const Duration(seconds: 1),
