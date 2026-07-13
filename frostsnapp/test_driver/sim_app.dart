@@ -14,6 +14,7 @@ import 'package:frostsnap/main.dart' as app;
 import 'package:frostsnap/secure_key_provider.dart';
 import 'package:frostsnap/sim_device_tray.dart';
 
+import 'app_tap.dart';
 import 'focused_text.dart';
 
 void _forceFrameIfIdle() {
@@ -152,6 +153,20 @@ Future<String> _driverData(String? payload) async {
     pool.setChain(
       order: csv.isEmpty ? <int>[] : csv.split(',').map(int.parse).toList(),
     );
+    return 'ok';
+  }
+  // `tap-at:<x>,<y>` — positional tap in GLOBAL LOGICAL pixels. Framework PointerEvent.position is
+  // already logical, so no devicePixelRatio scaling (multiplying would miss on every non-1x view).
+  const tapAtPrefix = 'tap-at:';
+  if (payload != null && payload.startsWith(tapAtPrefix)) {
+    final v = WidgetsBinding.instance.platformDispatcher.views.first;
+    final p = parseTapAt(payload.substring(tapAtPrefix.length));
+    if (p == null) {
+      throw 'sim_app: malformed tap-at payload "$payload" — expected tap-at:<x>,<y>';
+    }
+    final boundsErr = tapAtBoundsError(p, v.physicalSize / v.devicePixelRatio);
+    if (boundsErr != null) throw 'sim_app: $boundsErr';
+    dispatchLogicalTap(p, viewId: v.viewId);
     return 'ok';
   }
   // `device-<cmd>:<n>:…` drives a virtual device through the FRB `simDevicePool` IN-PROCESS — the

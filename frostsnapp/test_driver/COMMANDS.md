@@ -46,6 +46,8 @@ not a keyword or a console name (`session`/`instances`/…).
 | call | returns | does |
 |------|---------|------|
 | `session.tap(label)` | `void` | tap a widget by its semantic label |
+| `session.tapTooltip(t)` | `void` | tap a tooltip-only control (String or RegExp, resolved to exactly one on-stage tooltip; zero/many list the candidates) |
+| `session.tapAppAt(x, y)` | `void` | tap the app at global LOGICAL coordinates (positional escape hatch; same space as the snapshot's global bounds) |
 | `session.enterText(label, text)` | `void` | focus a field by label, then type `text`. HOST: needs `fsim up --agent-owns-keyboard` (else the app owns the keyboard for a human). ANDROID: always types through the real on-screen keyboard — the IME visibly opens, existing content is replaced, printable ASCII only (a literal `%s` is rejected) |
 | `session.enterFocusedText(text)` | `void` | type into the already-focused field — same keyboard rules as `enterText` |
 | `session.keyboardVisible()` | `bool` | is the on-screen keyboard up right now (the app's bottom viewInset > 0)? |
@@ -74,8 +76,10 @@ not a keyword or a console name (`session`/`instances`/…).
 | `.json()` | `String` | structured JSON snapshot with labels plus best-effort metadata |
 
 The stable JSON envelope is `{"nodes":[...]}`. Every currently targetable semantic label appears exactly in
-a node's `label` field; `labelFirstSeen` identifies its first occurrence. Other node fields (such as values,
-roles, actions, flags, and bounds) are diagnostic and may vary with Flutter.
+a node's `label` field; `labelFirstSeen` identifies its first occurrence. A node's `tooltip` is targetable
+via `tapTooltip`, and `bounds` is the node's GLOBAL rect in the same logical coordinates `tapAppAt(x, y)`
+takes — so `bounds` center → `tapAppAt` drives any node positionally. Other node fields (values, roles,
+actions, flags, the local `rect`) are diagnostic and may vary with Flutter.
 
 ### Wallet
 | call | returns | does |
@@ -146,6 +150,8 @@ fsim eval "await session.setChain([3, 1, 2])"                   # re-cable to th
 fsim eval "session.exists('Create a multi-sig wallet')"         # -> true / false
 fsim eval "await session.semantics().grep('Generate keys')"     # targetable labels matching text
 fsim eval "await session.semantics().pretty()"                  # readable current app surface
+fsim eval "await session.tapTooltip('Copy node address')"       # tap a tooltip-only control
+fsim eval "await session.tapAppAt(640, 42)"                     # positional tap (logical px)
 fsim eval "(await session.faucet()).blockHeight()"              # current height
 fsim eval "await (await session.faucet()).fund(addr, 100000)"   # fund an address, returns txid
 fsim eval "await (await session.faucet()).mine(6)"              # mine 6 blocks (confirm txs)

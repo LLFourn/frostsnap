@@ -23,6 +23,7 @@ import 'package:flutter_driver/flutter_driver.dart';
 import 'package:frostsnap/sim_faucet.dart';
 
 import 'ime_text.dart' show encodeImeText, imeTextPreflightError;
+import 'tooltip_resolve.dart' show resolveTooltip;
 import 'emulator.dart'
     show
         bootEmulator,
@@ -1384,6 +1385,28 @@ class AppSession {
   Future<void> tap(Pattern label) => _driverCall(
     () => driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout),
   );
+
+  /// Tap a control by its TOOLTIP — for tooltip-only buttons (e.g. an icon pencil) that expose no
+  /// targetable semantic label. [tooltip] (String or RegExp) is resolved against the on-stage
+  /// tooltips to exactly one — zero/many error with a diagnostic listing — then tapped via
+  /// FlutterDriver's widget finder (never by coordinates).
+  Future<void> tapTooltip(Pattern tooltip) => _driverCall(() async {
+    final nodes =
+        jsonDecode(await _requestData('semantics-snapshot'))['nodes'] as List;
+    final available = <String>[
+      for (final n in nodes)
+        if ((n['tooltip'] as String?)?.isNotEmpty ?? false)
+          n['tooltip'] as String,
+    ];
+    final exact = resolveTooltip(tooltip, available);
+    await driver.tap(find.byTooltip(exact), timeout: _cmdTimeout);
+  }, _cmdTimeout * 2);
+
+  /// Tap the app surface at GLOBAL LOGICAL coordinates (origin top-left of the Flutter view) — the
+  /// positional escape hatch for what no finder can target. Same coordinate space as the semantics
+  /// snapshot's global bounds; no adb, no display-scale math, works on host and android alike.
+  Future<void> tapAppAt(double x, double y) =>
+      _driverCall(() => _requestData('tap-at:$x,$y'));
 
   /// Tap [label] and wait for [expect] to appear. Distinguishes two failure modes of
   /// an unsynchronized tap:
