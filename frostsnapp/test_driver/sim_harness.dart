@@ -22,6 +22,7 @@ import 'dart:io';
 import 'package:flutter_driver/flutter_driver.dart';
 import 'package:frostsnap/sim_faucet.dart';
 
+import 'ime_text.dart' show encodeImeText, imeTextPreflightError;
 import 'emulator.dart'
     show
         bootEmulator,
@@ -608,10 +609,14 @@ class AppSession {
       'linux',
       'windows',
     }.contains(flutterDevice);
+    // ANDROID always types via the real on-screen keyboard (fsim-android-ime-text): the driver's mock
+    // text input is HOST-only, so a non-host target forces user-keyboard mode regardless of the flag —
+    // the ONE enforcement point for every launch path.
+    final effectiveAgentKeyboard = hostPlatform && agentOwnsKeyboard;
     final (proc, dir, drv, log) = await _launchApp(
       deviceCount: deviceCount,
       flutterDevice: flutterDevice,
-      agentOwnsKeyboard: agentOwnsKeyboard,
+      agentOwnsKeyboard: effectiveAgentKeyboard,
       extraDartDefines: extraDartDefines,
       shareHostAppDir: hostPlatform,
       flavor: hostPlatform ? null : 'direct',
@@ -619,7 +624,14 @@ class AppSession {
       logSink: logSink,
       appDirRoot: appDirRoot,
     );
-    return AppSession(proc, dir, drv, log, flutterDevice, agentOwnsKeyboard);
+    return AppSession(
+      proc,
+      dir,
+      drv,
+      log,
+      flutterDevice,
+      effectiveAgentKeyboard,
+    );
   }
 
   static const _macosSimAppBinary =
@@ -705,7 +717,10 @@ class AppSession {
       '--flavor',
       'direct',
       '--dart-define=SIM=true',
-      '--dart-define=SIM_AGENT_OWNS_KEYBOARD=true',
+      // ANDROID always types via the real on-screen keyboard (fsim-android-ime-text). This is baked at
+      // BUILD time (the emulator app can't read the host env): `true` here re-enables the driver's text
+      // mock, which silently swallows every TextInput.show — the IME never appears.
+      '--dart-define=SIM_AGENT_OWNS_KEYBOARD=false',
       '--dart-define=SIM_REGTEST_ELECTRUM_URL=$androidBridgeElectrumUrl',
       '--dart-define=SIM_REGTEST_CONTROL_SOCKET=$androidBridgeControlSocket',
     ]);
@@ -1413,29 +1428,158 @@ class AppSession {
     }
   }
 
-  /// The text-entry verbs need [agentOwnsKeyboard] — without it flutter_driver's `enter_text` throws a
-  /// cryptic `Bad state`. Fail fast with the fix instead.
+  /// The HOST text verbs need [agentOwnsKeyboard] — without it flutter_driver's `enter_text` throws a
+  /// cryptic `Bad state`. Fail fast with the fix instead. Android never needs it: text rides the real
+  /// on-screen keyboard there.
   void _requireAgentKeyboard() {
     if (!agentOwnsKeyboard) {
       throw AgentKeyboardRequired(
-        'text entry needs the agent-owned keyboard, but this session hands the keyboard to a human. '
-        'Relaunch with `fsim up --agent-owns-keyboard` (or pass --agent-owns-keyboard to serve/test).',
+        'text entry on a host session needs the agent-owned keyboard, but this session hands the '
+        'keyboard to a human. Relaunch with `fsim up --agent-owns-keyboard` (android sessions are '
+        'unaffected: they always type via the on-screen keyboard).',
       );
     }
   }
 
+  /// Whether this session drives an android emulator ([flutterDevice] is the adb serial there).
+  bool get _isAndroid => !Scenario._isHost(flutterDevice);
+
+  /// Overall budget for one IME-typed entry: the keyboard-visible gate (30s) + clear + `input text`.
+  static const Duration _imeTimeout = Duration(seconds: 60);
+
   Future<void> enterText(Pattern label, String text) => _driverCall(() async {
+    if (_isAndroid) {
+      _imePreflight(
+        text,
+      ); // BEFORE any UI mutation — a rejected payload touches nothing.
+      await driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout);
+      await _typeViaIme(text);
+      return;
+    }
     _requireAgentKeyboard();
     await driver.tap(find.bySemanticsLabel(label), timeout: _cmdTimeout);
     await driver.enterText(text, timeout: _cmdTimeout);
-  });
+  }, _imeTimeout);
 
   /// Type [text] into the currently-focused text field (NO finder) — for an autofocused field that has
-  /// no stable semantic label, e.g. the send Amount input. Requires the agent-owned keyboard (default).
+  /// no stable semantic label, e.g. the send Amount input.
   Future<void> enterFocusedText(String text) => _driverCall(() async {
+    if (_isAndroid) {
+      _imePreflight(text);
+      await _typeViaIme(text);
+      return;
+    }
     _requireAgentKeyboard();
     await driver.enterText(text, timeout: _cmdTimeout);
-  });
+  }, _imeTimeout);
+
+  void _imePreflight(String text) {
+    final err = imeTextPreflightError(text);
+    if (err != null) throw ArgumentError(err);
+  }
+
+  /// Type through the REAL on-screen keyboard: wait for it, restore the mock path's REPLACE semantics,
+  /// then inject [text] as OS-level key events (`input text`). The IME stays visible throughout —
+  /// that's the point (recordings show real interaction); its soft keys don't animate, since injection
+  /// is hardware-style. Replace = move-to-end + counted backspaces: a select-all chord
+  /// (`input keycombination` Ctrl+A, numeric or named) never reaches the Flutter field (verified live),
+  /// and a focus tap can land the cursor MID-value, so the end-anchor matters.
+  Future<void> _typeViaIme(String text) async {
+    await _waitKeyboardVisible();
+    // VERIFIED clear: count from the app's dedicated query (the semantics SNAPSHOT trims values —
+    // edge whitespace would be invisible and survive), backspace exactly that many, then RE-QUERY.
+    // A long `input keyevent` batch can occasionally drop an event (observed once live: one char of
+    // a 26-key clear survived), so retry until empty — backspaces past empty are no-ops, making the
+    // loop convergent. The query throws if no text field is focused, so a mis-targeted enterText
+    // fails loudly instead of typing into the void.
+    var len = await focusedTextLength();
+    for (var attempt = 0; len > 0; attempt++) {
+      if (attempt >= 3) {
+        throw StateError(
+          'the focused field failed to clear ($len chars remain after $attempt attempts)',
+        );
+      }
+      await adb(['shell', 'input', 'keyevent', '123']); // KEYCODE_MOVE_END
+      // One batched call — `input keyevent` takes many codes.
+      await adb([
+        'shell',
+        'input',
+        'keyevent',
+        ...List.filled(len, '67'), // KEYCODE_DEL (backspace)
+      ]);
+      len = await focusedTextLength();
+    }
+    if (text.isNotEmpty) {
+      await adb(['shell', 'input', 'text', encodeImeText(text)]);
+    }
+  }
+
+  /// Whether the on-screen keyboard is up RIGHT NOW, as the app itself sees it (bottom viewInset > 0).
+  Future<bool> keyboardVisible() async =>
+      await _requestData('keyboard-visible') == 'true';
+
+  /// Exact UNTRIMMED value length of the focused text field (the semantics snapshot trims values, so
+  /// edge whitespace is invisible there). Throws if no text field is focused. The android REPLACE
+  /// clear backspaces exactly this many times.
+  Future<int> focusedTextLength() async =>
+      int.parse(await _requestData('focused-text-length'));
+
+  Future<void> _waitKeyboardVisible() async {
+    // Nudge-then-poll: right after a cold emulator boot the IME service is still initializing and
+    // DROPS the show request fired by the field gaining focus — and Android never retries a dropped
+    // show. Each nudge re-requests the IME for the live input connection (app-side 'show-keyboard'),
+    // so the gate self-heals as soon as the service is ready.
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while (DateTime.now().isBefore(deadline)) {
+      await _requestData('show-keyboard');
+      final settle = DateTime.now().add(const Duration(seconds: 2));
+      while (DateTime.now().isBefore(settle)) {
+        if (await keyboardVisible()) return;
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+    }
+    throw StateError(
+      'the on-screen keyboard never appeared — is the focused control a text field?',
+    );
+  }
+
+  /// Hide the on-screen keyboard if it's up (android). Gated on [keyboardVisible] — an ungated BACK
+  /// would pop a route — and waits until the inset actually drops so a following tap lands on the
+  /// restored layout. No-op on host and when already hidden.
+  Future<void> dismissKeyboard() async {
+    if (!_isAndroid || !await keyboardVisible()) return;
+    await adb(['shell', 'input', 'keyevent', '4']); // KEYCODE_BACK
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (await keyboardVisible()) {
+      if (DateTime.now().isAfter(deadline)) {
+        throw StateError('the on-screen keyboard did not hide after BACK');
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+  }
+
+  /// Run adb against THIS session's emulator and return stdout — the escape hatch for android-only
+  /// needs (key events, dumpsys, …) so one-offs don't require harness changes. Throws on host
+  /// sessions and on a nonzero exit (with stderr).
+  Future<String> adb(List<String> args) async {
+    if (!_isAndroid) {
+      throw StateError(
+        'session.adb is android-only (this is a $flutterDevice session)',
+      );
+    }
+    final serial = _emulatorSerial ?? flutterDevice;
+    final r = await Process.run('${androidSdkRoot()}/platform-tools/adb', [
+      '-s',
+      serial,
+      ...args,
+    ]);
+    if (r.exitCode != 0) {
+      throw StateError(
+        'adb ${args.join(' ')} failed (${r.exitCode}): ${(r.stderr as String).trim()}',
+      );
+    }
+    return r.stdout as String;
+  }
 
   Future<String> getText(Pattern label) => _driverCall(
     () => driver.getText(find.bySemanticsLabel(label), timeout: _cmdTimeout),

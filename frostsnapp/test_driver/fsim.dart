@@ -88,6 +88,12 @@ String get _socketPath => '${_stateRoot.path}/control.sock';
 /// emulator) runs an app-channel-only [AppSession].
 const _hostPlatforms = {'macos', 'linux', 'windows'};
 
+/// Parse-time reject for `--agent-owns-keyboard` + `--android`: the driver's mock text input is
+/// host-only — android sessions always type through the real on-screen keyboard (fsim-android-ime-text).
+String _androidKeyboardFlagError(String cmd) =>
+    'fsim $cmd: --agent-owns-keyboard is host-only — android always types via the on-screen keyboard '
+    '(enterText/enterFocusedText work there without it)';
+
 const _usage = '''
 fsim — drive the running sim app/devices through SimHarness.
   Session-scoped: state lives in <dir>/.fsim (--dir <path> sets the dir, default the invocation cwd) — so
@@ -96,7 +102,8 @@ fsim — drive the running sim app/devices through SimHarness.
                                               launch app + listen (regtest ON by default;
                                               --no-regtest = offline). --instances N holds N app windows on
                                               ONE regtest, driven via eval as `instances[K]` (`session` ==
-                                              instances[0])
+                                              instances[0]). --agent-owns-keyboard is HOST-only (android
+                                              always types via the on-screen keyboard)
   fsim up [serve flags]                     idempotently bring the sim up + return once ready
                                               (no backgrounding/polling; reuses a matching live
                                               daemon, refuses a mismatched one — `down` first)
@@ -614,6 +621,10 @@ Future<void> _up(List<String> args) async {
   // default (on the host directly, on an emulator bridged over adb); --no-regtest opts out.
   final wantRegtest = !args.contains('--no-regtest');
   final wantKeyboard = args.contains('--agent-owns-keyboard');
+  if (wantAndroid && wantKeyboard) {
+    stderr.writeln(_androidKeyboardFlagError('up'));
+    exit(2);
+  }
 
   if (await _daemonAlive()) {
     final info = await _query({'cmd': 'info'});
@@ -917,6 +928,10 @@ Future<void> _runTests(List<String> args) async {
   // SELF-BOOTS its own emulator(s) and bridges the chain to them. No shared state to serialize around.
   // `--jobs N` caps the parallelism; default = run them all at once.
   final android = args.contains('--android');
+  if (android && args.contains('--agent-owns-keyboard')) {
+    stderr.writeln(_androidKeyboardFlagError('test'));
+    exit(2);
+  }
   int? jobs; // null = "as many as possible"
   int? testTimeout; // per-test hard deadline, seconds
   var noCapture = false;
@@ -1629,6 +1644,10 @@ Future<void> _serve(List<String> args) async {
   // --agent-owns-keyboard for the driver to own text input instead (enables `enter`,
   // blocks the physical keyboard). One mode for the session — no hybrid.
   final agentOwnsKeyboard = args.contains('--agent-owns-keyboard');
+  if (args.contains('--android') && agentOwnsKeyboard) {
+    stderr.writeln(_androidKeyboardFlagError('serve'));
+    exit(2);
+  }
   for (var i = 0; i < args.length - 1; i++) {
     if (args[i] == '--devices') count = int.parse(args[i + 1]);
     if (args[i] == '--instances') instanceCount = int.parse(args[i + 1]);

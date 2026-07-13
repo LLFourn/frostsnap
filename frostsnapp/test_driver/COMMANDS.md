@@ -46,8 +46,12 @@ not a keyword or a console name (`session`/`instances`/…).
 | call | returns | does |
 |------|---------|------|
 | `session.tap(label)` | `void` | tap a widget by its semantic label |
-| `session.enterText(label, text)` | `void` | focus a field by label, then type `text` — needs `fsim up --agent-owns-keyboard` (else the app owns the keyboard for a human) |
-| `session.enterFocusedText(text)` | `void` | type into the already-focused field — needs `fsim up --agent-owns-keyboard` |
+| `session.enterText(label, text)` | `void` | focus a field by label, then type `text`. HOST: needs `fsim up --agent-owns-keyboard` (else the app owns the keyboard for a human). ANDROID: always types through the real on-screen keyboard — the IME visibly opens, existing content is replaced, printable ASCII only (a literal `%s` is rejected) |
+| `session.enterFocusedText(text)` | `void` | type into the already-focused field — same keyboard rules as `enterText` |
+| `session.keyboardVisible()` | `bool` | is the on-screen keyboard up right now (the app's bottom viewInset > 0)? |
+| `session.focusedTextLength()` | `int` | exact untrimmed value length of the focused text field (throws if none) |
+| `session.dismissKeyboard()` | `void` | android: hide the on-screen keyboard if it's up (safe — never navigates back); host: no-op |
+| `session.adb(args)` | `String` | android-only escape hatch: run `adb -s <this emulator> <args…>`, return stdout (e.g. `session.adb(['shell','input','keyevent','4'])`) |
 | `session.exists(label)` | `bool` | is a widget with this label present? |
 | `session.getText(label)` | `String` | read a widget's text by its semantic label |
 | `session.getTextByKey(key)` | `String` | read a widget's text by its widget key |

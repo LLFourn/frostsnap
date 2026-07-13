@@ -14,6 +14,8 @@ import 'package:frostsnap/main.dart' as app;
 import 'package:frostsnap/secure_key_provider.dart';
 import 'package:frostsnap/sim_device_tray.dart';
 
+import 'focused_text.dart';
+
 void _forceFrameIfIdle() {
   final binding = WidgetsBinding.instance;
   if (binding.schedulerPhase == SchedulerPhase.idle) {
@@ -243,6 +245,30 @@ Future<String> _driverData(String? payload) async {
         'topInset': pad.top / dpr,
         'bottomInset': pad.bottom / dpr,
       });
+    case 'keyboard-visible':
+      // The IME inset as THIS app sees it — the harness's positive gate for "the on-screen keyboard
+      // is up" before typing through it (android real-IME mode), and for a safe dismissKeyboard.
+      final v = WidgetsBinding.instance.platformDispatcher.views.first;
+      return (v.viewInsets.bottom > 0).toString();
+    case 'focused-text-length':
+      // Exact UNTRIMMED length of the focused text field's value — the snapshot trims values, which
+      // under-counts edge whitespace; the android REPLACE clear backspaces exactly this many times
+      // and re-queries to VERIFY. Force a frame first so the read isn't stale mid-clear.
+      _forceFrameIfIdle();
+      final root = WidgetsBinding.instance.rootElement;
+      if (root == null) throw 'sim_app: no root element attached';
+      final len = focusedTextLength(root);
+      if (len == null) {
+        throw 'sim_app: no focused text field — nothing to clear/type into';
+      }
+      return '$len';
+    case 'show-keyboard':
+      // Re-request the IME for the current input connection. Right after a cold emulator boot the
+      // IME service is still initializing and DROPS the show fired by the field gaining focus (the
+      // app has window focus, the field is focused, but mInputShown stays false — verified live);
+      // Android never retries a dropped show, so the harness nudges this while gating.
+      await SystemChannels.textInput.invokeMethod<void>('TextInput.show');
+      return 'ok';
     case 'semantics-snapshot':
       // The current onstage render-object semantics surface — the same labels FlutterDriver's
       // `find.bySemanticsLabel` resolves. This is the eval/test introspection endpoint, not a raw
