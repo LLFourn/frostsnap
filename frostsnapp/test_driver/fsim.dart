@@ -13,6 +13,7 @@ import 'emulator_lifecycle.dart';
 import 'eval_strings.dart';
 import 'regtest.dart';
 import 'sim_harness.dart';
+import 'slot_lease.dart';
 
 // fsim: interactively drive the running sim app + devices through the SAME SimHarness
 // methods the keygen test uses — no second implementation that can drift.
@@ -117,7 +118,7 @@ fsim — drive the running sim app/devices through SimHarness.
                                               (e.g. `session.chain()`, `await session.connect(2)`); `-a` passes
                                               a shell value in as a String (`-a addr="\$addr" "…fund(addr,…)…"`)
   fsim repl                                  interactive console: live Dart per line, session persists (Ctrl-D quits)
-  fsim test [NAMES...] [--android] [--jobs N] [--retries N] [--record-failures] [--test-timeout SECS] [--nocapture|-v] [--junit PATH]
+  fsim test [NAMES...] [--android] [--jobs N] [--retries N] [--slot-wait SECS] [--record-failures] [--test-timeout SECS] [--nocapture|-v] [--junit PATH]
                                               run e2e driver tests (stems; ALL if none) IN PARALLEL —
                                               host: one `dart run` each; --android: each SELF-BOOTS
                                               its OWN emulator + (if it uses regtest) bridges its OWN
@@ -129,6 +130,10 @@ fsim — drive the running sim app/devices through SimHarness.
                                               --nocapture/-v streams it live; --junit writes XML.
                                               --retries N (default 0) re-runs a FAILED test up to N more
                                               times from a fresh launch — else a failure is a failure.
+                                              --slot-wait SECS (default 120): android slots are
+                                              MACHINE-GLOBAL (cross-worktree); when all are held by
+                                              other runs, wait this long for one to free before
+                                              exiting nonzero (never boots into a held slot).
                                               --record-failures (android-only, needs --android): after
                                               the batch, re-run each final failure ONCE solo, recording
                                               the emulator screen (video →
@@ -954,6 +959,8 @@ Future<void> _runTests(List<String> args) async {
   String? junitPath;
   var retries =
       0; // opt-in extra attempts a FAILED test gets; default 0 = a failure is a failure
+  // How long an android run waits for a free MACHINE-GLOBAL slot before failing (exit nonzero).
+  var slotWait = const Duration(seconds: 120);
   var recordFailures = false;
   final positional = <String>[];
   for (var i = 0; i < args.length; i++) {
@@ -985,6 +992,17 @@ Future<void> _runTests(List<String> args) async {
     }
     if (a == '--record-failures') {
       recordFailures = true;
+      continue;
+    }
+    if (a == '--slot-wait') {
+      // Bounds-guarded: a trailing `--slot-wait` reaches the parser as '' (clear usage error, exit
+      // 2) instead of a RangeError.
+      final (d, err) = parseSlotWait(i + 1 < args.length ? args[++i] : '');
+      if (err != null) {
+        stderr.writeln(err);
+        exit(2);
+      }
+      slotWait = d!;
       continue;
     }
     if (a.startsWith('--')) continue;
@@ -1079,28 +1097,40 @@ Future<void> _runTests(List<String> args) async {
   // Host device: null on macOS (the test defaults to 'macos' — unchanged); 'linux' on Linux so the test
   // targets the Linux desktop app + the prebuilt binary built above. Android self-boots ('android').
   final hostDevice = Platform.isLinux ? 'linux' : null;
+  // ANDROID slots are MACHINE-GLOBAL leases, not process-local worker indices — two worktrees'
+  // runs otherwise boot/reap the same deterministic serial and force-stop each other's app.
+  final leaser = android && sdk != null ? _testSlotLeaser(sdk) : null;
   await _runBounded(tests, effJobs, (test, workerSlot) async {
-    final (r, retriesTaken) = await runWithRetry<_TestResult>(
-      (_) => _runOneTest(
-        test,
-        flutterDevice: android ? 'android' : hostDevice,
-        sdk: sdk,
-        hostAppBinary: hostAppBinary,
-        androidAppBinary: androidAppBinary,
-        windowSlot: workerSlot,
-        capture: !noCapture,
-        deadline: deadline,
+    // Claimed BEFORE boot/provision, held across retries, released only AFTER the confirmed reap
+    // (reap-then-release: releasing first lets another run boot into a dying emulator). On a reap
+    // failure the throw propagates and the lease deliberately stays — the slot remains locked while
+    // this pid lives, and stale-normal reclamation recovers it afterwards.
+    final lease = await leaser?.claim(waitBudget: slotWait);
+    final slot = lease?.slot ?? workerSlot;
+    // runLeased guarantees exactly one disposition on EVERY exit (an escaping setup exception must
+    // not strand a live-owner lock + orphan for the rest of the batch): normal mode reaps the
+    // slot's emulators — belt-and-suspenders so a timed-out/killed test can't orphan one — and
+    // releases only after the reap confirms; keep mode (single-test shape, enforced above) persists
+    // the lease as the kept emulator's occupancy record instead.
+    final (r, retriesTaken) = await runLeased(
+      lease: lease,
+      keep: keepEmulator,
+      reapSlot: (s) => _reapSlotEmulators(sdk!, s),
+      body: () => runWithRetry<_TestResult>(
+        (_) => _runOneTest(
+          test,
+          flutterDevice: android ? 'android' : hostDevice,
+          sdk: sdk,
+          hostAppBinary: hostAppBinary,
+          androidAppBinary: androidAppBinary,
+          windowSlot: slot,
+          capture: !noCapture,
+          deadline: deadline,
+        ),
+        (res) => res.failed,
+        maxAttempts: 1 + retries,
       ),
-      (res) => res.failed,
-      maxAttempts: 1 + retries,
     );
-    // Android: reap the emulator(s) this slot self-booted — belt-and-suspenders so a timed-out/killed
-    // test (whose own teardown didn't run) can't orphan one. Deterministic serials from the slot.
-    // Skipped under SIM_KEEP_EMULATOR (single-test shape, enforced above): a kept emulator is not
-    // an orphan, and this reap used to kill it moments after the child honored the keep.
-    if (android && sdk != null && !keepEmulator) {
-      await _reapSlotEmulators(sdk, workerSlot);
-    }
     r.retries = retriesTaken;
     _printResult(r);
     _reportRetries(r, retriesTaken);
@@ -1120,6 +1150,8 @@ Future<void> _runTests(List<String> args) async {
     sdk: sdk,
     androidAppBinary: androidAppBinary,
     deadline: deadline,
+    leaser: leaser,
+    slotWait: slotWait,
   );
   exit(failures.isEmpty ? 0 : 1);
 }
@@ -1134,6 +1166,8 @@ Future<void> _recordFailedTests(
   required String? sdk,
   required String? androidAppBinary,
   required Duration deadline,
+  required SlotLeaser? leaser,
+  required Duration slotWait,
 }) async {
   final reruns = selectDiagnosticReruns(
     results,
@@ -1155,6 +1189,8 @@ Future<void> _recordFailedTests(
       sdk: sdk,
       androidAppBinary: androidAppBinary,
       deadline: deadline,
+      leaser: leaser,
+      slotWait: slotWait,
     ),
     (r, e) => stderr.writeln(
       'fsim: --record-failures: ${r.test.name}: diagnostic re-run failed: $e',
@@ -1167,6 +1203,8 @@ Future<void> _recordOneRerun(
   required String? sdk,
   required String? androidAppBinary,
   required Duration deadline,
+  required SlotLeaser? leaser,
+  required Duration slotWait,
 }) async {
   final test = r.test;
   final rerunSpec = _TestSpec.at(
@@ -1174,51 +1212,65 @@ Future<void> _recordOneRerun(
     test.name,
     Directory('${test.artifactsDir.path}/rerun'),
   );
-  // The child self-boots its emulator on the deterministic slot-0 serial; recording can only start once
-  // that serial has FULLY booted. Record instance 0's emulator (a multi-instance android test would need
-  // per-serial recorders — none exists today). Cleanup is INVARIANT via the nested finallys: the recorder
-  // is finalized/pulled and the slot's emulators reaped even when the boot-wait, child, or pull throws.
+  // The rerun claims a MACHINE-GLOBAL lease like any worker (it used to hard-code slot 0 — a
+  // collision with another worktree even when normal workers were safe). Its child sets
+  // SIM_KEEP_EMULATOR only so the recorder can pull the mp4 after the child exits (TRANSIENT keep):
+  // this owner still reaps and RELEASES below — lease disposition follows the runner's top-level
+  // policy, never the child env. Record instance 0's emulator (a multi-instance android test would
+  // need per-serial recorders — none exists today). Cleanup is INVARIANT via runLeased: reap, then
+  // release only on a confirmed reap — on every body exit, exceptional included.
+  final lease = await leaser?.claim(waitBudget: slotWait);
+  final slot = lease?.slot ?? 0;
   final adb = '$sdk/platform-tools/adb';
-  final serial = emulatorSerial(0);
+  final serial = emulatorSerial(slot * maxInstancesPerTest);
   _TestResult? rerun;
   final videos = <String>[];
-  try {
-    final childFuture = _runOneTest(
-      rerunSpec,
-      flutterDevice: 'android',
-      sdk: sdk,
-      androidAppBinary: androidAppBinary,
-      windowSlot: 0,
-      // The child must LEAVE its emulator running: the recorder pkill/pulls the mp4 after the child
-      // exits, then the outer finally reaps the slot.
-      extraEnv: const {'SIM_KEEP_EMULATOR': '1'},
-      capture: true,
-      deadline: deadline,
-    );
-    AndroidSegmentRecorder? rec;
-    try {
-      final ready = await waitBootCompleted(
-        adb,
-        serial,
-        childFuture.then((_) {}, onError: (_) {}),
+  await runLeased(
+    lease: lease,
+    keep:
+        false, // TRANSIENT keep: the child env only holds the emulator for the pull; reap+release here
+    reapSlot: (s) async {
+      if (sdk != null) await _reapSlotEmulators(sdk, s);
+    },
+    body: () async {
+      final childFuture = _runOneTest(
+        rerunSpec,
+        flutterDevice: 'android',
+        sdk: sdk,
+        androidAppBinary: androidAppBinary,
+        windowSlot: slot,
+        // The child must LEAVE its emulator running: the recorder pkill/pulls the mp4 after the child
+        // exits, then runLeased reaps the slot.
+        extraEnv: const {'SIM_KEEP_EMULATOR': '1'},
+        capture: true,
+        deadline: deadline,
       );
-      if (ready) {
-        rec = AndroidSegmentRecorder(adb: adb, serial: serial)..start();
-      } else {
-        stderr.writeln(
-          'fsim: --record-failures: ${test.name}: emulator $serial never finished booting — no video',
+      AndroidSegmentRecorder? rec;
+      try {
+        final ready = await waitBootCompleted(
+          adb,
+          serial,
+          childFuture.then((_) {}, onError: (_) {}),
         );
+        if (ready) {
+          rec = AndroidSegmentRecorder(adb: adb, serial: serial)..start();
+        } else {
+          stderr.writeln(
+            'fsim: --record-failures: ${test.name}: emulator $serial never finished booting — no video',
+          );
+        }
+        rerun = await childFuture;
+      } finally {
+        if (rec != null) {
+          videos.addAll(await rec.stopAndPull(test.artifactsDir.path));
+        }
       }
-      rerun = await childFuture;
-    } finally {
-      if (rec != null) {
-        videos.addAll(await rec.stopAndPull(test.artifactsDir.path));
-      }
-    }
-  } finally {
-    if (sdk != null) await _reapSlotEmulators(sdk, 0);
-  }
-  if (rerun.passed) {
+    },
+  );
+  // Non-null by construction: the body either completed `rerun = await childFuture` or threw (and
+  // runLeased rethrew before we got here).
+  final rerunResult = rerun!;
+  if (rerunResult.passed) {
     await File('${test.artifactsDir.path}/rerun-passed.txt').writeAsString(
       'The recorded diagnostic re-run PASSED — the original failure did not reproduce (flake '
       'evidence). The verdict above is unchanged.\n',
@@ -1230,11 +1282,11 @@ Future<void> _recordOneRerun(
   if (usable.isEmpty) {
     throw StateError(
       'no usable video segment was recorded — the re-run child artifacts are in ${rerunSpec.artifactsDir.path}'
-      '${rerun.passed ? ' (the re-run itself PASSED; rerun-passed.txt written)' : ''}',
+      '${rerunResult.passed ? ' (the re-run itself PASSED; rerun-passed.txt written)' : ''}',
     );
   }
   stderr.writeln(
-    rerun.passed
+    rerunResult.passed
         ? 'fsim: ${test.name}: diagnostic re-run PASSED (original failure stands); '
               'video: ${usable.join(', ')}'
         : 'fsim: ${test.name}: diagnostic re-run recorded; video: ${usable.join(', ')}',
@@ -1567,6 +1619,18 @@ Future<List<int>> _processTree(int rootPid) async {
   visit(rootPid);
   return rootAlive || ordered.length > 1 ? ordered : <int>[];
 }
+
+/// The machine-global lease allocator for android test slots: the SAME lock root the interactive
+/// serve uses, PID liveness by SIGCONT probe, occupancy from the process table, orphans reaped by
+/// the blocking identity-tracked kill.
+SlotLeaser _testSlotLeaser(String sdk) => SlotLeaser(
+  root: simTmpRoot(),
+  slotCount: maxTestWorkers,
+  pidAlive: (p) => Process.killPid(p, ProcessSignal.sigcont),
+  processTable: liveEmulators,
+  reapOrphan: (serial) => killEmulator(sdk, serial),
+  onProgress: stderr.writeln,
+);
 
 /// Run [task] over [items] with at most [jobs] running concurrently (a bounded worker pool). Workers
 /// pull from a shared queue; the Dart event loop is single-threaded, so `failed.add` from concurrent
