@@ -203,6 +203,12 @@ Future<String> bootEmulator(
     '-no-boot-anim',
     '-gpu',
     'auto',
+    // 8G guest RAM (overrides the AVD's default hw.ramSize=2G, so existing pool AVDs are covered
+    // without recreation): at 2G Android's lowmemorykiller force-stops com.frostsnap ~50s after
+    // launch (four super-wallets + Google services + the sim fleet), surfacing as "Lost connection"
+    // ghosts. qemu commits guest RAM lazily, so concurrent runs don't reserve it all up front.
+    '-memory',
+    '8192',
   ], mode: ProcessStartMode.detached);
   await waitForBoot(sdk, serial);
   return serial;
