@@ -22,6 +22,7 @@ import 'dart:io';
 import 'package:flutter_driver/flutter_driver.dart';
 import 'package:frostsnap/sim_faucet.dart';
 
+import 'emulator_lifecycle.dart' show shouldKillEmulatorOnTearDown;
 import 'ime_text.dart' show encodeImeText, imeTextPreflightError;
 import 'tooltip_resolve.dart' show resolveTooltip;
 import 'emulator.dart'
@@ -318,6 +319,10 @@ class Scenario {
     Map<String, String> extraDartDefines = const {},
     Directory? appDirRoot,
     bool agentOwnsKeyboard = true,
+    // EXPLICIT session policy, not ambient env: only the TEST path (provisionInstance, whose runner
+    // validated the single-test shape) derives this from SIM_KEEP_EMULATOR. The interactive serve
+    // never sets it, so `SIM_KEEP_EMULATOR=1 fsim up` cannot silently skip the down-time kill.
+    bool keepEmulator = false,
     IOSink? logSink,
   }) async {
     // [slot] is an EXPLICIT input, not ambient env: the test path passes its per-worker FROSTSNAP_SIM_WINDOW_SLOT
@@ -370,6 +375,7 @@ class Scenario {
       h._chain = chain;
       h._diagLabel = diagLabel;
       h._emulatorSerial = serial;
+      h._keepEmulator = keepEmulator;
       h._unbridge = unbridge;
       return h;
     } catch (_) {
@@ -407,6 +413,9 @@ class Scenario {
       chain: _regtest?.session,
       deviceCount: deviceCount,
       extraDartDefines: {...extraDartDefines, ...?_regtest?.defines},
+      // The TEST path is the only reader of SIM_KEEP_EMULATOR (the runner validated the single-test
+      // shape and forwards the env); the interactive serve never sets keepEmulator.
+      keepEmulator: Platform.environment['SIM_KEEP_EMULATOR'] == '1',
     );
     // Register BEFORE growFleetTo so a stuck grow still reaps this instance (+ its emulator) in _tearDown.
     _sessions.add(h);
@@ -534,6 +543,11 @@ class AppSession {
   /// emulator's serial + the teardown of its per-serial regtest bridge — reaped in [tearDown]. Both null
   /// on host (a window instance) and on android tests without a chain (no bridge).
   String? _emulatorSerial;
+
+  /// EXPLICIT keep-on-teardown policy, set ONLY by the provisioning seam (the runner-validated test
+  /// path). Never read from the ambient environment here: an env read would let
+  /// `SIM_KEEP_EMULATOR=1 fsim up` make a later `down` silently skip the kill and report success.
+  bool _keepEmulator = false;
   Future<void> Function()? _unbridge;
 
   /// The android emulator serial this instance self-booted via the seam, or null on host. The interactive
@@ -1890,15 +1904,29 @@ class AppSession {
       await _unbridge?.call();
     } catch (_) {}
     final serial = _emulatorSerial;
-    // SIM_KEEP_EMULATOR=1: the `--record-failures` runner is recording this emulator's screen and must
-    // pkill/pull the mp4 AFTER this child exits — killing it here would strand the recording on a dead
-    // device. The runner reaps the slot's emulators itself once the video is pulled.
-    if (serial != null && Platform.environment['SIM_KEEP_EMULATOR'] != '1') {
+    // [_keepEmulator] (explicit seam policy — never ambient env): the `--record-failures` runner is
+    // recording this emulator's screen and must pkill/pull the mp4 AFTER this child exits — killing
+    // it here would strand the recording on a dead device. The runner reaps the slot's emulators
+    // itself once the video is pulled.
+    Object? killErr;
+    if (serial != null &&
+        shouldKillEmulatorOnTearDown(
+          serial: serial,
+          keepEmulator: _keepEmulator,
+        )) {
+      // PROPAGATE a kill failure (killEmulator now blocks until the process is confirmed gone):
+      // swallowing it here is how `down` used to report success over a surviving emulator.
       try {
         await killEmulator(androidSdkRoot(), serial);
-      } catch (_) {}
+      } catch (e) {
+        killErr = e;
+      }
+    }
+    if (err != null && killErr != null) {
+      throw StateError('$err; additionally the emulator kill failed: $killErr');
     }
     if (err != null) throw err;
+    if (killErr != null) throw killErr;
   }
 }
 

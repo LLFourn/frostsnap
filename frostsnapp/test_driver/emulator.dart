@@ -6,6 +6,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'emulator_lifecycle.dart';
+
 bool hostArchIsArm() {
   try {
     return (Process.runSync('uname', ['-m']).stdout as String).trim() ==
@@ -64,11 +66,31 @@ Future<void> ensureSdkPackages(String sdk) async {
   ], 'y\n' * 50);
 }
 
-/// Ensure AVD [avd] exists (creating it if missing), installing the SDK packages first if needed.
-/// Idempotent. Used for the interactive AVD and for each pool/app-host AVD.
+/// Ensure AVD [avd] exists ON THE CURRENT SYSTEM IMAGE, installing the SDK packages first if
+/// needed. Idempotent. Existence alone is the wrong invariant: when [sysImage] moves (android-30 →
+/// android-34), an existing AVD silently stays on the old OS — image-match is checked and a stale
+/// AVD is recreated (fsim-android-ime-text's first validation ran on the wrong image because of
+/// exactly this drift).
 Future<String> ensureAvd(String sdk, String avd) async {
-  final avdIni = '${Platform.environment['HOME']}/.android/avd/$avd.ini';
-  if (File(avdIni).existsSync()) return avd;
+  final home = Platform.environment['HOME'];
+  final avdIni = '$home/.android/avd/$avd.ini';
+  final avdDir = '$home/.android/avd/$avd.avd';
+  if (File(avdIni).existsSync()) {
+    final config = File('$avdDir/config.ini');
+    if (config.existsSync() &&
+        avdImageMatches(config.readAsStringSync(), sysImage)) {
+      return avd;
+    }
+    stderr.writeln(
+      'fsim: AVD "$avd" is on a stale system image — recreating on $sysImage',
+    );
+    try {
+      File(avdIni).deleteSync();
+    } catch (_) {}
+    try {
+      Directory(avdDir).deleteSync(recursive: true);
+    } catch (_) {}
+  }
   await ensureSdkPackages(sdk);
   final avdmanager = '$sdk/cmdline-tools/latest/bin/avdmanager';
   stderr.writeln('fsim: creating AVD "$avd" …');
@@ -186,9 +208,85 @@ Future<String> bootEmulator(
   return serial;
 }
 
-/// Kill the emulator [serial] (idempotent — a harmless no-op if it isn't running).
-Future<void> killEmulator(String sdk, String serial) =>
-    Process.run('$sdk/platform-tools/adb', ['-s', serial, 'emu', 'kill']);
+/// ALL live qemu emulator processes, from the PROCESS TABLE (adb's device cache lags a dying
+/// emulator by seconds — the process is the truth). FAIL-CLOSED: a failing `ps` throws instead of
+/// reading as "no emulators" (an empty table is what tells a caller an emulator is DEAD).
+/// [runPs] is injectable for the failure-path unit test. Callers that only want OUR emulators
+/// filter on [EmulatorProc.isFrostsnap].
+Future<List<EmulatorProc>> liveEmulators({
+  Future<ProcessResult> Function()? runPs,
+}) async {
+  final ps =
+      await (runPs ?? () => Process.run('ps', ['-axo', 'pid=,command=']))();
+  if (ps.exitCode != 0) {
+    throw StateError(
+      'ps failed (${ps.exitCode}): ${(ps.stderr as String).trim()} — cannot read the process table',
+    );
+  }
+  return parseEmulatorProcesses((ps.stdout as String).split('\n'));
+}
+
+/// Kill the emulator [serial] and BLOCK until its qemu process is actually gone (idempotent — an
+/// immediate no-op if it isn't running). `adb emu kill` is fire-and-forget, so callers that trusted
+/// it returned while qemu was still dying: `down` reported success early, and the next test on the
+/// slot attached to a half-dead instance. Poll the process table (~30s); on deadline SIGKILL the
+/// pid; still alive briefly after that → throw. A FOREIGN qemu on our serial's port is a collision,
+/// not a target: refuse to touch it and throw.
+Future<void> killEmulator(String sdk, String serial) async {
+  Future<EmulatorProc?> holder() async =>
+      portOwner(await liveEmulators(), serial);
+
+  final original = await holder();
+  if (original == null) return;
+  if (!original.isFrostsnap) {
+    throw StateError(
+      'serial $serial is held by a non-frostsnap emulator (avd "${original.avd}", pid ${original.pid}) '
+      '— refusing to kill a foreign process; free the port or use another slot',
+    );
+  }
+  // Every subsequent observation is judged by PID IDENTITY against [original]: ownership is not
+  // stable across the wait — our qemu can exit and another process can acquire the port between
+  // polls, and the fallback must never signal such a replacement.
+  Never reoccupied(EmulatorProc now) => throw StateError(
+    'serial $serial: the original emulator (pid ${original.pid}) is gone but the port was '
+    'REOCCUPIED by avd "${now.avd}" (pid ${now.pid}) mid-kill — the slot is not clean',
+  );
+  await Process.run('$sdk/platform-tools/adb', ['-s', serial, 'emu', 'kill']);
+  final graceful = DateTime.now().add(const Duration(seconds: 30));
+  while (DateTime.now().isBefore(graceful)) {
+    final now = await holder();
+    switch (classifyKillPoll(originalPid: original.pid, holder: now)) {
+      case KillPoll.gone:
+        return;
+      case KillPoll.reoccupied:
+        reoccupied(now!);
+      case KillPoll.stillOriginal:
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
+  }
+  final atDeadline = await holder();
+  final target = sigkillTarget(originalPid: original.pid, holder: atDeadline);
+  if (target == null) {
+    if (atDeadline == null) return;
+    reoccupied(atDeadline);
+  }
+  Process.killPid(target, ProcessSignal.sigkill);
+  final forced = DateTime.now().add(const Duration(seconds: 5));
+  while (DateTime.now().isBefore(forced)) {
+    final now = await holder();
+    switch (classifyKillPoll(originalPid: original.pid, holder: now)) {
+      case KillPoll.gone:
+        return;
+      case KillPoll.reoccupied:
+        reoccupied(now!);
+      case KillPoll.stillOriginal:
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
+  }
+  throw StateError(
+    'emulator $serial (pid ${original.pid}) survived `adb emu kill` + SIGKILL',
+  );
+}
 
 /// Max app instances ONE slot provisions — the FIXED per-slot stride, so an emulator's port/AVD/serial never
 /// collides across concurrent slots OR instances. `deviceIndex = globalSlot * maxInstancesPerTest + instance`.

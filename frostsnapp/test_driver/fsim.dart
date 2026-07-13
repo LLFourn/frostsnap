@@ -9,6 +9,7 @@ import 'package:vm_service/vm_service_io.dart';
 
 import 'diagnostic_rerun.dart';
 import 'emulator.dart';
+import 'emulator_lifecycle.dart';
 import 'eval_strings.dart';
 import 'regtest.dart';
 import 'sim_harness.dart';
@@ -223,14 +224,27 @@ Future<void> _clean() async {
   await reapRegtestSessionDir(_stateRoot);
   // Reap THIS session's self-booted android emulators if a hard-killed session left them (recorded serials, one
   // per line) — scoped to this session, NEVER a global sweep that could kill a concurrent test run's pool emu.
+  // FAIL-CLOSED: an unconfirmed kill keeps that serial in the recovery file and makes `clean` report
+  // non-success — deleting the record over a survivor would orphan it invisibly.
   final emSerialFile = File('${_stateRoot.path}/emulator-serials');
+  final unkilled = <String>[];
+  final killErrors = <String>[];
   if (await emSerialFile.exists()) {
     for (final serial in (await emSerialFile.readAsString()).split('\n')) {
       if (serial.trim().isEmpty) continue;
       try {
         await killEmulator(androidSdkRoot(), serial.trim());
-      } catch (_) {}
+      } catch (e) {
+        unkilled.add(serial.trim());
+        killErrors.add('${serial.trim()}: $e');
+      }
     }
+  }
+  if (unkilled.isNotEmpty) {
+    // Retain ONLY the unconfirmed serials so a later clean retries exactly them.
+    await emSerialFile.writeAsString('${unkilled.join('\n')}\n');
+    stdout.writeln(jsonEncode({'ok': false, 'errors': killErrors}));
+    exit(1);
   }
   // Delete ONLY this session's state root (`<dir>/.fsim`) — never the cwd/worktree or a shared root, so a
   // `clean` in one session can't nuke another's (the per-session regtest reaping is Task 2).
@@ -1011,6 +1025,22 @@ Future<void> _runTests(List<String> args) async {
   }
   final tests = _testSpecs(files);
 
+  // SIM_KEEP_EMULATOR is a SINGLE-TEST post-mortem tool: any shape where a later boot would land on
+  // the kept emulator's deterministic slot serial (second test on the worker, a retry attempt, the
+  // --record-failures rerun) is rejected up front.
+  final keepEmulator =
+      android && Platform.environment['SIM_KEEP_EMULATOR'] == '1';
+  final keepErr = keepEmulatorUsageError(
+    keep: keepEmulator,
+    selectedTests: tests.length,
+    retries: retries,
+    recordFailures: recordFailures,
+  );
+  if (keepErr != null) {
+    stderr.writeln(keepErr);
+    exit(2);
+  }
+
   // Default to running every test at once.
   var effJobs = (jobs ?? files.length).clamp(1, files.length);
   // Android emulator ports are a bounded budget: worker slots [0, maxTestWorkers) are reserved DISJOINT from
@@ -1066,7 +1096,11 @@ Future<void> _runTests(List<String> args) async {
     );
     // Android: reap the emulator(s) this slot self-booted — belt-and-suspenders so a timed-out/killed
     // test (whose own teardown didn't run) can't orphan one. Deterministic serials from the slot.
-    if (android && sdk != null) await _reapSlotEmulators(sdk, workerSlot);
+    // Skipped under SIM_KEEP_EMULATOR (single-test shape, enforced above): a kept emulator is not
+    // an orphan, and this reap used to kill it moments after the child honored the keep.
+    if (android && sdk != null && !keepEmulator) {
+      await _reapSlotEmulators(sdk, workerSlot);
+    }
     r.retries = retriesTaken;
     _printResult(r);
     _reportRetries(r, retriesTaken);
@@ -1211,9 +1245,13 @@ Future<void> _recordOneRerun(
 /// killed test — whose own teardown didn't run — never orphans one. Idempotent (a harmless no-op for an
 /// index that never booted); deterministic serials keep it independent of the dead test process.
 Future<void> _reapSlotEmulators(String sdk, int slot) async {
-  for (var i = 0; i < maxInstancesPerTest; i++) {
-    await killEmulator(sdk, emulatorSerial(slot * maxInstancesPerTest + i));
-  }
+  // Every serial is ATTEMPTED, then an unconfirmed reap THROWS an aggregate (reapSerials): the next
+  // test on this worker would otherwise boot into a half-dead emulator still holding its port — the
+  // run must stop loudly rather than produce garbage failure modes on a dirty slot.
+  await reapSerials([
+    for (var i = 0; i < maxInstancesPerTest; i++)
+      emulatorSerial(slot * maxInstancesPerTest + i),
+  ], (serial) => killEmulator(sdk, serial));
 }
 
 /// Run [attempt] (each call is one fresh attempt, given its 1-based number) and retry while
@@ -1852,50 +1890,68 @@ Future<void> _serve(List<String> args) async {
   // Idempotent AND awaitable: `down`, a signal, and the app-death watcher can all race in here;
   // they share ONE cleanup future, so EVERY caller awaits the same cleanup to FINISH before its
   // exit(0) runs. (A bare boolean guard would let a second caller return + exit mid-cleanup,
-  // killing the process before the first's app-dir delete / log flush completed.)
-  Future<void>? shutdownFuture;
-  Future<void> shutdown() {
+  // killing the process before the first's app-dir delete / log flush completed.) Returns the
+  // LABELED cleanup errors — every resource is still torn down; `down` derives its reply from this
+  // completed result, so "down":true structurally means the cleanup finished clean.
+  Future<List<String>>? shutdownFuture;
+  Future<List<String>> shutdown() {
     return shutdownFuture ??= () async {
       flushTimer.cancel();
-      await server.close();
-      try {
-        File(_socketPath).deleteSync();
-      } catch (_) {}
-      try {
-        File('${_stateRoot.path}/vmservice.uri').deleteSync();
-      } catch (_) {}
-      // tearDown reaps the app orderly on a graceful down; only THEN close the liveness socket, so its
-      // watcher stays a pure hard-kill backstop (never fires mid-teardown). Best-effort per instance so one
-      // hiccup doesn't strand the others' windows.
-      for (final h in instances) {
-        try {
-          await h.tearDown();
-        } catch (_) {}
-      }
-      for (final c in livenessClients.toList()) {
-        try {
-          await c.close();
-        } catch (_) {}
-      }
-      await livenessSocket?.close();
-      // Gracefully reap this session's regtest (the death-pipe is the backstop for a hard kill).
-      await rtSession?.stop();
-      // The instances (+ each one's emulator + regtest bridge) were reaped via tearDown above; just drop the
-      // hard-kill record so `clean` doesn't later try to reap already-dead serials. (`clean` recovers a
-      // HARD-killed session's emulators from this file.)
-      if (args.contains('--android')) {
+      final errors = await runCleanups([
+        (
+          'control socket',
+          () async {
+            await server.close();
+            try {
+              File(_socketPath).deleteSync();
+            } catch (_) {}
+            try {
+              File('${_stateRoot.path}/vmservice.uri').deleteSync();
+            } catch (_) {}
+          },
+        ),
+        // tearDown reaps the app orderly on a graceful down; only THEN close the liveness socket, so
+        // its watcher stays a pure hard-kill backstop (never fires mid-teardown). tearDown now
+        // PROPAGATES an emulator-kill failure — runCleanups records it and still tears down the rest.
+        for (final (i, h) in instances.indexed)
+          ('app[$i] teardown', () => h.tearDown()),
+        (
+          'liveness socket',
+          () async {
+            for (final c in livenessClients.toList()) {
+              try {
+                await c.close();
+              } catch (_) {}
+            }
+            await livenessSocket?.close();
+          },
+        ),
+        // Gracefully reap this session's regtest (the death-pipe is the backstop for a hard kill).
+        ('regtest', () async => await rtSession?.stop()),
+      ]);
+      // Drop the hard-kill serial record ONLY when every instance teardown succeeded — an emulator
+      // whose death was NOT confirmed must stay findable by a later `clean`.
+      final teardownFailed = errors.any((e) => e.startsWith('app['));
+      if (args.contains('--android') && !teardownFailed) {
         try {
           File('${_stateRoot.path}/emulator-serials').deleteSync();
         } catch (_) {}
       }
       await logSink.flush();
       await logSink.close();
+      return errors;
     }();
   }
+
+  // Cleanup is single-run (the shared future above); the remaining race is exit(0): the down
+  // handler's own teardown kills the app, which resolves the app-death watcher below — without the
+  // gate, that watcher would terminate the daemon BEFORE the down reply is written.
+  final exitGate = ShutdownExitGate();
 
   for (final sig in [ProcessSignal.sigint, ProcessSignal.sigterm]) {
     sig.watch().listen((_) async {
       await shutdown();
+      await exitGate.whenClear();
       exit(0);
     });
   }
@@ -1908,6 +1964,7 @@ Future<void> _serve(List<String> args) async {
     unawaited(
       h.appExitCode.then((_) async {
         await shutdown();
+        await exitGate.whenClear();
         exit(0);
       }),
     );
@@ -1928,13 +1985,23 @@ Future<void> _serve(List<String> args) async {
         count,
         platform,
       );
+      if (down) {
+        // The reply is DERIVED from the completed cleanup — "down":true means gone, and the exit
+        // gate keeps the app-death watcher (resolved by this very teardown) from terminating the
+        // daemon before the reply is flushed.
+        exitGate.hold();
+        final errors = await shutdown();
+        final downReply = errors.isEmpty
+            ? {'ok': true, 'down': true}
+            : {'ok': false, 'down': false, 'errors': errors};
+        conn.write('${jsonEncode(downReply)}\n');
+        await conn.flush();
+        await conn.close();
+        exitGate.release();
+        exit(errors.isEmpty ? 0 : 1);
+      }
       conn.write('${jsonEncode(reply)}\n');
       await conn.flush();
-      if (down) {
-        await conn.close();
-        await shutdown();
-        exit(0);
-      }
     }
   }
 }
@@ -1981,6 +2048,19 @@ Future<(Map<String, dynamic>, bool)> _dispatch(
             // The launch platform is part of the observable shape so `up` won't treat an Android
             // (AppSession) daemon and a desktop request as interchangeable.
             'platform': platform,
+            // ALL live pool emulators, from the PROCESS TABLE (independent of adb's laggy device
+            // cache) — a stale one from a crashed run is exactly what you want to see here.
+            'emulators': [
+              // Foreign qemu processes are not ours to report (or ever kill).
+              for (final p in await liveEmulators())
+                if (p.isFrostsnap)
+                  {
+                    'serial': p.serial,
+                    'avd': p.avd,
+                    'port': p.port,
+                    'pid': p.pid,
+                  },
+            ],
           },
           false,
         );
