@@ -60,6 +60,46 @@ Directory simTmpRoot() {
   return dir;
 }
 
+/// Run [ready]; on failure run [dispose] then rethrow the readiness failure (a disposal failure is
+/// aggregated, never silently swallowed). The provisioning seam uses it so a post-launch readiness
+/// failure cannot orphan the launched app/emulator/bridge.
+Future<T> readyOrDispose<T>({
+  required Future<T> Function() ready,
+  required Future<void> Function() dispose,
+}) async {
+  try {
+    return await ready();
+  } catch (readyErr, st) {
+    try {
+      await dispose();
+    } catch (disposeErr) {
+      throw StateError(
+        '$readyErr; additionally disposing the half-provisioned session failed: $disposeErr',
+      );
+    }
+    Error.throwWithStackTrace(readyErr, st);
+  }
+}
+
+/// The provisioning seam's readiness TRANSACTION — the composition that fixes the dropped
+/// `--devices N`: grow the fleet to [target], THEN settle [recognize], and only then return; a
+/// failure at EITHER step runs [dispose] before rethrowing ([readyOrDispose]). Fakeable so the
+/// composition itself — ordering, return-gating, atomicity — is host-testable, not only its
+/// ingredients.
+Future<void> provisionReadiness({
+  required int target,
+  required Future<int> Function() count,
+  required Future<int> Function() addOne,
+  required Future<void> Function() recognize,
+  required Future<void> Function() dispose,
+}) => readyOrDispose(
+  ready: () async {
+    await growFleetTo(target, count, addOne);
+    await recognize();
+  },
+  dispose: dispose,
+);
+
 /// Grow the sim fleet to EXACTLY [target] devices: [count] reads the current device count, [addOne]
 /// hot-plugs one and returns the new count. This is how an android test's device count is delivered at
 /// runtime — a shared APK can't bake a per-test count and the emulator app can't read the host env, so
@@ -308,9 +348,12 @@ class Scenario {
   /// seam, shared by the interactive serve (`fsim up --instances N`) and [Scenario] (tests). HOST: a
   /// window-slot app on this machine. ANDROID: this instance's OWN emulator — boot it, bridge the shared chain
   /// to it (per-serial adb-reverse), run the app on it; its emulator + bridge are reaped in
-  /// [AppSession.tearDown]. Attaches [chain] so `faucet()` works. The caller supplies the launch defines (incl.
-  /// SIM_REGTEST_*) and layers its own bookkeeping — the Scenario grows the fleet + waits for chain recognition
-  /// ([provisionInstance]); the serve just holds the instances.
+  /// [AppSession.tearDown]. Attaches [chain] so `faucet()` works. The seam owns FULL READINESS: no caller
+  /// receives an AppSession before [deviceCount] devices exist (android launches bake count 1 — the sandboxed
+  /// APK can't read the host env, so the fleet is grown over the app channel) AND the chain-recognition
+  /// handshake has settled; a post-launch readiness failure tears the session down instead of orphaning it.
+  /// Callers layer only their own bookkeeping (the Scenario registers for teardown; the serve holds the
+  /// instances).
   static Future<AppSession> provisionAppInstance({
     required int index,
     required int total,
@@ -346,7 +389,7 @@ class Scenario {
       );
       h._chain = chain;
       h._diagLabel = diagLabel;
-      return h;
+      return _readyInstance(h, deviceCount);
     }
 
     final sdk = androidSdkRoot();
@@ -354,6 +397,10 @@ class Scenario {
     final serial = emulatorSerial(deviceIndex);
     await ensureAvd(sdk, avd);
     Future<void> Function()? unbridge;
+    // The catch below only guards pre/at-launch failures (unbridge/kill are the only resources
+    // standing there). Post-launch readiness runs AFTER it: once the session exists, its own
+    // tearDown (via _readyInstance) owns cleanup.
+    final AppSession session;
     try {
       await bootEmulator(sdk, avd: avd, port: emulatorPort(deviceIndex));
       await provisionEmulator(sdk, serial);
@@ -379,7 +426,7 @@ class Scenario {
       h._emulatorSerial = serial;
       h._keepEmulator = keepEmulator;
       h._unbridge = unbridge;
-      return h;
+      session = h;
     } catch (_) {
       try {
         await unbridge?.call();
@@ -389,6 +436,25 @@ class Scenario {
       } catch (_) {}
       rethrow;
     }
+    return _readyInstance(session, deviceCount);
+  }
+
+  /// The seam's FULL-readiness step: grow the fleet to [deviceCount] over the app channel (host
+  /// launches already bake the count — growth no-ops) and settle the chain-recognition handshake so
+  /// flows never race the per-device UI. FAILURE-ATOMIC via [readyOrDispose]: a readiness failure
+  /// tears the launched session down (emulator + bridge included) before rethrowing.
+  static Future<AppSession> _readyInstance(
+    AppSession h,
+    int deviceCount,
+  ) async {
+    await provisionReadiness(
+      target: deviceCount,
+      count: () async => (await h.deviceNumbers()).length,
+      addOne: h.addDevice,
+      recognize: h._awaitChainRecognized,
+      dispose: h.tearDown,
+    );
+    return h;
   }
 
   /// The FIXED stride for the per-instance device index (shared with the runner), so an emulator's
@@ -396,8 +462,8 @@ class Scenario {
   static const _maxInstances = maxInstancesPerTest;
 
   /// Provision app instance [index] of [totalInstances] for THIS scenario: the shared [provisionAppInstance]
-  /// seam (host window / android emulator on the scenario's chain) PLUS the test bookkeeping — register for
-  /// teardown, grow the fleet to [deviceCount], and wait for the chain-recognition handshake before driving.
+  /// seam — which owns growth + chain recognition — PLUS the only test bookkeeping left: registering the
+  /// ready session for teardown.
   Future<AppSession> provisionInstance(
     int index, {
     required int totalInstances,
@@ -419,16 +485,9 @@ class Scenario {
       // shape and forwards the env); the interactive serve never sets keepEmulator.
       keepEmulator: Platform.environment['SIM_KEEP_EMULATOR'] == '1',
     );
-    // Register BEFORE growFleetTo so a stuck grow still reaps this instance (+ its emulator) in _tearDown.
+    // The seam returned a READY session (fleet grown, chain recognized) — and it tears a
+    // half-provisioned one down itself, so registration can safely follow.
     _sessions.add(h);
-    await growFleetTo(
-      deviceCount,
-      () async => (await h.deviceNumbers()).length,
-      h.addDevice,
-    );
-    // Wait until every launch-connected device has finished the announce handshake (recognized SET ==
-    // connected chain) before the scenario drives, so flows never race the per-device UI under load.
-    await h._awaitChainRecognized();
     return h;
   }
 
