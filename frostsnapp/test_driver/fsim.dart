@@ -9,6 +9,7 @@ import 'package:vm_service/vm_service_io.dart';
 
 import 'diagnostic_rerun.dart';
 import 'emulator.dart';
+import 'eval_strings.dart';
 import 'regtest.dart';
 import 'sim_harness.dart';
 
@@ -432,7 +433,11 @@ Future<(String, bool)> _evalOnce(
   }
   final err = await service.evaluate(isolateId, rootLibId, 'evalError');
   if (err is InstanceRef && err.kind != InstanceKind.kNull) {
-    return (err.valueAsString ?? '<${err.classRef?.name}>', true);
+    return (
+      await _fullStringValue(service, isolateId, err) ??
+          '<${err.classRef?.name}>',
+      true,
+    );
   }
   // Read the result's toString(), not the raw ref, so lists/maps/records print their VALUE (`[1, 2, 3]`)
   // not `<_GrowableList>`. `toString()` is valid on the nullable field (null -> "null").
@@ -442,9 +447,37 @@ Future<(String, bool)> _evalOnce(
     'evalResult.toString()',
   );
   if (res is InstanceRef) {
-    return (res.valueAsString ?? '<${res.classRef?.name}>', false);
+    return (
+      await _fullStringValue(service, isolateId, res) ??
+          '<${res.classRef?.name}>',
+      false,
+    );
   }
   return ('', false);
+}
+
+/// [ref]'s complete string value — `valueAsString` is only a ~128-char PREVIEW for long strings
+/// (`valueAsStringIsTruncated`), so page the rest via `getObject` offset/count ([assembleFullString]).
+Future<String?> _fullStringValue(
+  VmService service,
+  String isolateId,
+  InstanceRef ref,
+) {
+  final id = ref.id;
+  return assembleFullString(
+    ref.valueAsString,
+    ref.valueAsStringIsTruncated == true && id != null,
+    ref.length,
+    (offset, count) async {
+      final obj = await service.getObject(
+        isolateId,
+        id!,
+        offset: offset,
+        count: count,
+      );
+      return obj is Instance ? obj.valueAsString : null;
+    },
+  );
 }
 
 /// `fsim eval "<dart>"` — evaluate ONE live Dart snippet against the running session's console scope
