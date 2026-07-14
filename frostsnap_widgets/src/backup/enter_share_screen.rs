@@ -97,6 +97,25 @@ impl EnterShareScreen {
         matches!(self.completion, CompletionState::Success)
     }
 
+    /// Entry resolved to a checksum-invalid word set (`AllWordsEntered` with
+    /// no `ShareBackup`); the user can edit rows to fix it.
+    pub fn is_invalid(&self) -> bool {
+        matches!(self.completion, CompletionState::Invalid)
+    }
+
+    /// The model's current view state (which row/mode is active) — read-only,
+    /// for instruments that type on this screen and observers that report
+    /// entry progress.
+    pub fn view_state(&self) -> super::ViewState {
+        self.model.view_state()
+    }
+
+    /// The keyboard area in screen coordinates (below the input preview) —
+    /// the offset that maps keyboard-local geometry to screen touch points.
+    pub fn keyboard_rect(&self) -> Rectangle {
+        self.keyboard_rect
+    }
+
     pub fn get_backup(&self) -> Option<frost_backup::share_backup::ShareBackup> {
         if let MainViewState::AllWordsEntered { success } = &self.model.view_state().main_view {
             success.clone()
@@ -111,6 +130,18 @@ impl EnterShareScreen {
     /// - Index 4: Incompatible share from a different secret
     pub fn prefill_test_words(&mut self) {
         self.auto_fill_enabled = true;
+    }
+
+    /// Whether the widgets have caught up with the model: no deferred
+    /// keyboard/selector swap pending and no tap fade still playing — the
+    /// same condition [`draw`](Widget::draw) requires before applying the
+    /// deferred update. Until this is true the on-screen surface can be STALE
+    /// relative to [`view_state`](Self::view_state): drags are dropped while
+    /// an outgoing word selector is still up, taps are swallowed, and input
+    /// aimed at the new surface can land on the old one. A driver must gate
+    /// each action on it.
+    pub fn is_settled(&self) -> bool {
+        !self.pending_model_update && self.touches.is_empty()
     }
 
     pub fn handle_vertical_drag(&mut self, prev_y: Option<u32>, new_y: u32, _is_release: bool) {

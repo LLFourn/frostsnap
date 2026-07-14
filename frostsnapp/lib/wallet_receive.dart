@@ -402,6 +402,7 @@ class _ReceiverPageState extends State<ReceivePage> {
     );
     final addressText = Text(
       spacedHex(_address?.address.toString() ?? ''),
+      key: const ValueKey('receiveAddress'),
       style: theme.textTheme.labelLarge?.copyWith(
         fontFamily: monospaceTextStyle.fontFamily,
         color: theme.colorScheme.onSurfaceVariant,
