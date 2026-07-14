@@ -202,6 +202,12 @@ legacy-run +ARGS="": maybe-gen
     cd frostsnapp && BUNDLE_FIRMWARE=../../target/riscv32imc-unknown-none-elf/release/legacy.bin \
       flutter run $FLAVOR_FLAG --dart-define=BUILD_COMMIT="$BUILD_COMMIT" --dart-define=BUILD_VERSION="$BUILD_VERSION" {{ARGS}}
 
+# App-simulator tooling is NOT here — it lives in the repo-root `./fsim` CLI (sim-14), so
+# the sim doesn't accrete recipes in this shared justfile. `./fsim serve` runs the
+# interactive session, `./fsim <cmd>` drives it, `./fsim test [NAME]` runs the e2e driver
+# tests (`./fsim test` runs all). It reuses `just maybe-gen` for codegen. See test_driver/fsim.dart.
+# (`simulate`/`demo` below is the unrelated tools/widget_simulator, not this app sim.)
+
 build-appimage +ARGS="":
     #!/bin/sh
     if [ ! -d "frostsnapp/build/linux/x64/release/bundle" ]; then
@@ -289,13 +295,13 @@ lint-device +ARGS="":
     cargo clippy {{device_crates}} --target riscv32imc-unknown-none-elf  {{ARGS}} --all-features -- -Dwarnings
 
 dart-format-check-app:
-    ( cd frostsnapp; dart format --set-exit-if-changed --output=none  $(find ./lib -type f -name "*.dart" -not -path "./lib/src/rust/*" -not -name "*.freezed.dart") )
+    ( cd frostsnapp; dart format --set-exit-if-changed --output=none  $(find ./lib ./test_driver ./test -type f -name "*.dart" -not -path "./lib/src/rust/*" -not -name "*.freezed.dart") )
 
 lint-app +ARGS="": maybe-gen dart-format-check-app
     ( cd frostsnapp; flutter analyze {{ARGS}} )
 
 fix-dart: maybe-gen
-    ( cd frostsnapp && dart format $(find ./lib -type f -name "*.dart" -not -path "./lib/src/rust/*" -not -name "*.freezed.dart") && dart fix --apply && flutter analyze )
+    ( cd frostsnapp && dart format $(find ./lib ./test_driver ./test -type f -name "*.dart" -not -path "./lib/src/rust/*" -not -name "*.freezed.dart") && dart fix --apply && flutter analyze )
 
 fix: fix-dart fix-rust
 
