@@ -1,0 +1,23 @@
+[package]
+name = "sim_regtest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A sim-only Bitcoin regtest backend: spawns a real `bitcoind` + `electrs` (via the `electrsd`
+# crate, which downloads pinned binaries) and acts as a faucet for the sim wallet. Not in the
+# workspace default-members — the download build scripts shouldn't run on a plain root build.
+
+[dependencies]
+anyhow = "1"
+serde_json = { workspace = true }
+bitcoin = { workspace = true }
+# The standalone binary catches SIGINT/SIGTERM so it can drop Regtest (which reaps the
+# bitcoind/electrs children) on shutdown rather than orphaning them.
+ctrlc = { version = "3", features = ["termination"] }
+electrsd = { version = "0.38", default-features = false, features = [
+    "bitcoind_download",
+    "bitcoind_28_2",
+    "esplora_a33e97e1",
+    "legacy",
+] }

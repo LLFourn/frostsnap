@@ -67,6 +67,30 @@ where
             default_workflow: None,
         }
     }
+
+    /// Read-only view of an active backup-entry screen: `(view_state,
+    /// finished, invalid)`, or `None` when no entry screen is showing. Sim
+    /// observation — nothing here mutates the UI.
+    pub fn backup_entry_state(&self) -> Option<(frostsnap_widgets::backup::ViewState, bool, bool)> {
+        match self.widget.inner().current() {
+            WidgetTree::EnterBackup { widget, .. } => Some((
+                widget.view_state(),
+                widget.is_finished(),
+                widget.is_invalid(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// The keyboard area of an active backup-entry screen, in screen
+    /// coordinates — the offset instruments need to map keyboard-local
+    /// geometry to touch points.
+    pub fn backup_entry_keyboard_rect(&self) -> Option<embedded_graphics::primitives::Rectangle> {
+        match self.widget.inner().current() {
+            WidgetTree::EnterBackup { widget, .. } => Some(widget.keyboard_rect()),
+            _ => None,
+        }
+    }
 }
 
 impl<D, C, T> UserInteraction for FrostyUi<D, C, T>

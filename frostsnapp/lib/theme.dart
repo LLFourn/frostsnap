@@ -439,7 +439,7 @@ class _TopBarState extends State<TopBar> {
           if (isDialog && widget.showClose)
             IconButton(
               onPressed: () => Navigator.pop(context),
-              icon: Icon(Icons.close),
+              icon: Icon(Icons.close, semanticLabel: 'Close'),
               style: IconButton.styleFrom(
                 backgroundColor: theme.colorScheme.surfaceContainerHighest,
               ),

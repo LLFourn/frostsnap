@@ -14,11 +14,11 @@ abstract class SecureKeyProvider {
   /// Check if authentication is required
   Future<bool> requiresAuthentication();
 
-  /// Clear the authentication cache
-  Future<void> clearKey();
-
   /// Delete the key from storage
   Future<void> deleteKey();
+
+  /// Whether the key currently exists in storage — lets the sim verify [deleteKey] actually removed it.
+  Future<bool> hasKey();
 
   /// Open the OS settings page where the user can configure a screen lock.
   Future<void> openSecuritySettings();
@@ -157,13 +157,13 @@ class AndroidSecureKeyProvider extends SecureKeyProvider {
   }
 
   @override
-  Future<void> clearKey() async {
-    await _channel.invokeMethod('clearKey');
+  Future<void> deleteKey() async {
+    await _channel.invokeMethod('deleteKey');
   }
 
   @override
-  Future<void> deleteKey() async {
-    await _channel.invokeMethod('deleteKey');
+  Future<bool> hasKey() async {
+    return await _channel.invokeMethod<bool>('hasKey') ?? false;
   }
 
   @override
@@ -224,13 +224,14 @@ class DesktopSecureKeyProvider extends SecureKeyProvider {
   }
 
   @override
-  Future<void> clearKey() async {
+  Future<void> deleteKey() async {
     // No-op for desktop
   }
 
   @override
-  Future<void> deleteKey() async {
-    // No-op for desktop
+  Future<bool> hasKey() async {
+    // Desktop uses a fixed in-memory key that always "exists".
+    return true;
   }
 
   @override

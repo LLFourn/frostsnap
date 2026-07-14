@@ -94,6 +94,84 @@ impl super::Api {
         }
         load_internal(app_dir, usb_manager)
     }
+
+    /// Build the real `Coordinator` bound to a host virtual device instead of real
+    /// USB serial — for the simulator only (the sim Dart entrypoint, sim-5). The
+    /// returned [`DevicePool`] owns the device thread; drop it to stop the device.
+    ///
+    /// Sim firmware is self-contained ([`super::sim::sim_firmware_bin`]): the manager's
+    /// latest firmware and the device's announced digest both come from it, so the device
+    /// reads as up-to-date/compatible (no upgrade is ever offered). No genuine cert key is
+    /// wired in, so genuine-check is off (consistent with the sim guard). Production
+    /// `load()`/`main.dart` never reach this.
+    /// Debug/sim-only: bind the app to a host virtual device. Compiled
+    /// unconditionally; only the `--dart-define=SIM` entrypoint calls it, so a normal
+    /// build dead-code-eliminates the Dart branch and never reaches it. See `api::sim`.
+    pub fn load_sim(
+        &self,
+        app_dir: String,
+        seed: u64,
+        device_count: u32,
+    ) -> Result<(Coordinator, AppCtx, super::sim::DevicePool)> {
+        use super::sim::{build_device, make_frame_sink, sim_firmware_bin, DevicePool};
+        use frostsnap_virtual_device::{
+            ByteChannel, ChainRouter, HostEnd, SlotSpec, VirtualSerial,
+        };
+
+        let app_dir = PathBuf::from_str(&app_dir)?;
+        let firmware = sim_firmware_bin();
+        let digest = firmware.digest();
+        let count = device_count.max(1) as usize;
+
+        // One coordinator port; the router splices it to the head and relays the chain, so
+        // the coordinator sees exactly ONE port and learns the rest via the firmware relay.
+        let coord_host = HostEnd {
+            rx: ByteChannel::new(),
+            tx: ByteChannel::new(),
+        };
+        let virtual_serial = VirtualSerial::single("sim-device-0", coord_host.clone());
+        let port = virtual_serial.connection();
+        let usb_manager =
+            UsbSerialManager::new(Box::new(virtual_serial)).with_firmware_bin(firmware);
+        let (coordinator, app_state) = load_internal(app_dir.clone(), usb_manager)?;
+
+        // One power slot per device, each with its own frame sink. The slot owns what
+        // survives a power-cycle (flash + screen/touch + links); the router boots them,
+        // owns the chain order, and powers devices on/off as chain membership changes — so
+        // any device can connect independently and the order is reconfigurable at runtime.
+        let mut specs = Vec::with_capacity(count);
+        let mut frame_sinks = Vec::with_capacity(count);
+        for i in 0..count {
+            let (frames_sink, on_frame) = make_frame_sink();
+            specs.push(SlotSpec {
+                seed: seed.wrapping_add(i as u64),
+                digest,
+                on_frame,
+            });
+            frame_sinks.push(frames_sink);
+        }
+
+        // The router owns the device slots; initial chain = all devices in number order.
+        let router = Arc::new(ChainRouter::new(
+            coord_host,
+            port,
+            specs,
+            (0..count).collect(),
+        ));
+
+        // One Dart [`SimDevice`] handle per device (numbered 1-based), each wired to the slot's
+        // STABLE handles (so it keeps driving the device across power-cycles) plus the shared router
+        // (so connect/disconnect edits the one chain config). The harness drives these over the app
+        // channel (FRB) — no host socket. Same build path `DevicePool::add_device` uses.
+        let mut devices = Vec::with_capacity(count);
+        for (i, frames_sink) in frame_sinks.into_iter().enumerate() {
+            devices.push(build_device(&router, i, frames_sink));
+        }
+
+        let pool = DevicePool::new(seed, router, devices);
+
+        Ok((coordinator, app_state, pool))
+    }
 }
 
 #[cfg(genuine_cert_key)]

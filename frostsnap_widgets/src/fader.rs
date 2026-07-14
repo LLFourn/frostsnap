@@ -155,6 +155,12 @@ impl<W: Widget<Color = Rgb565>> Fader<W> {
         self.state = FadeState::FadedOut;
     }
 
+    /// Jump to fully visible, skipping any fade — the inverse of
+    /// [`Self::set_faded_out`].
+    pub fn set_visible(&mut self) {
+        self.state = FadeState::Idle;
+    }
+
     /// Check if the widget is showing (not faded out and not fading out)
     pub fn is_not_faded(&self) -> bool {
         matches!(self.state, FadeState::Idle)
