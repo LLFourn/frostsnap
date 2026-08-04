@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:frostsnap/global.dart';
 import 'package:frostsnap/src/rust/api.dart';
 import 'package:frostsnap/src/rust/lib.dart';
+import 'package:path_provider/path_provider.dart';
 
 /// The key protecting an already-existing wallet is unavailable — e.g. the
 /// screen lock that bound it was removed, so the Keystore key is gone. This is
@@ -134,6 +135,42 @@ abstract class SecureKeyProvider {
     );
     return result ?? false;
   }
+
+  static const _unprotectedWarningFlag = 'unprotected_storage_warning_shown';
+  static bool _unprotectedWarningInFlight = false;
+
+  /// Tell the user, once, that this phone can't hardware-protect wallet data
+  /// at rest. Called only from the Android empty-key fallback (the Keystore
+  /// couldn't create a key, so data is encrypted with the all-zero
+  /// [emptyKey]). Best-effort and fire-and-forget: it never blocks or fails
+  /// key retrieval. A marker file in the app support dir makes it one-time.
+  static Future<void> maybeWarnUnprotectedStorage() async {
+    if (_unprotectedWarningInFlight) return;
+    _unprotectedWarningInFlight = true;
+    try {
+      final dir = await getApplicationSupportDirectory();
+      final flag = File('${dir.path}/$_unprotectedWarningFlag');
+      if (await flag.exists()) return;
+
+      BuildContext? ctx = rootNavKey.currentContext;
+      for (int i = 0; i < 100 && ctx == null; i++) {
+        await Future.delayed(const Duration(milliseconds: 50));
+        ctx = rootNavKey.currentContext;
+      }
+      if (ctx == null) return; // no UI to show it in; try again next time
+
+      await showDialog<void>(
+        context: ctx,
+        builder: (_) => const _UnprotectedStorageDialog(),
+      );
+      // Only record it as shown once the user has actually seen it.
+      await flag.create(recursive: true);
+    } catch (_) {
+      // Warning the user must never break key retrieval.
+    } finally {
+      _unprotectedWarningInFlight = false;
+    }
+  }
 }
 
 class _NoLockScreenDialog extends StatelessWidget {
@@ -177,6 +214,31 @@ class _NoLockScreenDialog extends StatelessWidget {
   }
 }
 
+class _UnprotectedStorageDialog extends StatelessWidget {
+  const _UnprotectedStorageDialog();
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Limited protection on this phone'),
+      content: const Text(
+        'This phone can\'t create a hardware-backed key, so Frostsnap can\'t '
+        'strongly encrypt the wallet data it stores here (such as balances, '
+        'addresses, and transaction history).\n\n'
+        'Your bitcoin stays secured by your Frostsnap devices and is not at '
+        'risk. For stronger protection of the data on this phone, use a phone '
+        'that supports a secure lock screen.',
+      ),
+      actions: [
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Got it'),
+        ),
+      ],
+    );
+  }
+}
+
 /// Android implementation using the native SecureKeyManager plugin
 class AndroidSecureKeyProvider extends SecureKeyProvider {
   static const _channel = MethodChannel('com.frostsnap/secure_key');
@@ -203,6 +265,7 @@ class AndroidSecureKeyProvider extends SecureKeyProvider {
       // hardware-backed key at all. Fall back to the empty key so the app
       // still works. The wallet-locking migration will retire this path.
       if (e.code != _keyCreationFailedCode) rethrow;
+      unawaited(SecureKeyProvider.maybeWarnUnprotectedStorage());
       return SecureKeyProvider.emptyKey;
     }
   }
