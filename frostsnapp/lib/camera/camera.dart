@@ -5,22 +5,15 @@ import 'package:frostsnap/src/rust/api/qr.dart';
 import 'package:frostsnap/src/rust/api/camera.dart' as camera;
 import 'camera_native.dart';
 import 'camera_mobile.dart';
+import 'frame_scanner.dart';
 
-class FrameScanResult<T> {
-  final T? result;
-  final double? progress;
-  final String? error;
+export 'frame_scanner.dart' show FrameScanResult;
 
-  const FrameScanResult({this.result, this.progress, this.error});
-
-  static FrameScanResult<T> success<T>(T result) =>
-      FrameScanResult(result: result);
-
-  static FrameScanResult<T> withProgress<T>(double progress) =>
-      FrameScanResult(progress: progress);
-
-  static FrameScanResult<T> withError<T>(String error) =>
-      FrameScanResult(error: error);
+LensBuilder _platformLens() {
+  if (Platform.isLinux || Platform.isWindows) {
+    return (onFrame) => NativeCameraLens(onFrame: onFrame);
+  }
+  return (onFrame) => MobileCameraLens(onFrame: onFrame);
 }
 
 // PSBT-specific scanner with progress overlay
@@ -73,15 +66,10 @@ class _PsbtCameraReaderState extends State<PsbtCameraReader> {
 
   @override
   Widget build(BuildContext context) {
-    if (Platform.isLinux || Platform.isWindows) {
-      return NativeCameraWidget<Uint8List>(
-        title: "Scan PSBT",
-        scanFrame: _scanPsbtFrame,
-      );
-    }
-    return MobileCameraWidget<Uint8List>(
+    return FrameScanner<Uint8List>(
       title: "Scan PSBT",
       scanFrame: _scanPsbtFrame,
+      lens: _platformLens(),
     );
   }
 }
@@ -123,9 +111,10 @@ class _AddressScannerState extends State<AddressScanner> {
   @override
   Widget build(BuildContext context) {
     if (Platform.isLinux || Platform.isWindows) {
-      return NativeCameraWidget<String>(
+      return FrameScanner<String>(
         title: "Scan Address",
         scanFrame: _scanAddressFrame,
+        lens: (onFrame) => NativeCameraLens(onFrame: onFrame),
       );
     }
     return MobileQrScanner<String>(
