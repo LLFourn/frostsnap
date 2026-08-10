@@ -28,4 +28,11 @@ ui = ["dep:frostsnap_widgets", "dep:frost_backup", "dep:bitcoin", "dep:embedded-
 debug_log = ["ui"]
 debug_mem = ["ui"]
 debug_fps = ["ui"]
-prefill-words = ["ui"]
+
+[lints.rust]
+# prefill-words used to be a cargo feature here; it flips backup-entry
+# behavior, so `--all-features` test runs silently armed it and the typist
+# suite typed onto self-filling screens (CI-red 2026-08). A dev convenience
+# that CHANGES behavior must live outside the additive feature namespace:
+# enable with RUSTFLAGS='--cfg prefill_words'.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(prefill_words)'] }
