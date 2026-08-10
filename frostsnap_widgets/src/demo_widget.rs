@@ -99,7 +99,9 @@ macro_rules! demo_widget {
                 }
 
                 let mut screen = $crate::backup::EnterShareScreen::new();
-                if cfg!(feature = "prefill-words") {
+                // Bare --cfg rather than a cargo feature: this cfg is evaluated in the
+                // expanding crate, and as an additive feature `--all-features` armed it.
+                if cfg!(prefill_words) {
                     screen.prefill_test_words();
                 }
                 let done = Center::new(Text::new(

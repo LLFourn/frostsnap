@@ -729,15 +729,18 @@ class AppSession {
   /// message instead of a cryptic driver `Bad state`.
   final bool agentOwnsKeyboard;
 
+  // The liveness is optional so tests outside this library (which cannot name
+  // the private type) can construct a session; a fresh one simply reports
+  // activity from construction time.
   AppSession(
     this._appProcess,
     this.appDir,
     this.driver,
     this._appLog,
     this.flutterDevice,
-    this.agentOwnsKeyboard,
-    this._liveness,
-  ) {
+    this.agentOwnsKeyboard, [
+    _AppLiveness? liveness,
+  ]) : _liveness = liveness ?? _AppLiveness() {
     // Record the app's exit so the failure classifier can consult it WITHOUT awaiting — an OOM
     // force-stop mid-drive must classify as "app exited", not as a label/connection problem.
     unawaited(_appProcess.exitCode.then((c) => _appExitStatus = c));
