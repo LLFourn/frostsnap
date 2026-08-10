@@ -3,8 +3,9 @@ name = "widget_simulator"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-prefill-words = []
+[lints.rust]
+# Expands frostsnap_widgets::demo_widget!, whose prefill cfg is evaluated here.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(prefill_words)'] }
 
 [dependencies]
 frostsnap_widgets = { workspace = true, features = ["std"] }

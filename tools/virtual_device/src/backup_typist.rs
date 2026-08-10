@@ -107,6 +107,10 @@ pub struct EntryStep {
     /// Clamp-scroll the alphabetic keyboard first (letter taps only).
     pub scroll: Option<ScrollAnchor>,
     pub tap: Point,
+    /// What this step MEANS ("letter 'Z'", "word \"ZOO\""), for the failure
+    /// trail: an invalid checksum surfaces 24 rows after the divergent input,
+    /// so the trail is the only record of what was actually aimed at.
+    pub label: String,
 }
 
 /// Plain-data view of entry progress — everything the typist needs to decide
@@ -178,6 +182,7 @@ pub fn next_step(
             Ok(Some(EntryStep {
                 scroll: None,
                 tap: p + origin,
+                label: format!("index key '{key}' (current \"{current}\")"),
             }))
         }
         EntryMode::Word => {
@@ -205,6 +210,7 @@ pub fn next_step(
             Ok(Some(EntryStep {
                 scroll: Some(anchor),
                 tap: p + origin,
+                label: format!("letter '{letter}' of \"{word}\" ({anchor:?})"),
             }))
         }
         EntryMode::Select { current } => {
@@ -223,6 +229,7 @@ pub fn next_step(
             Ok(Some(EntryStep {
                 scroll: None,
                 tap: p + origin,
+                label: format!("word \"{word}\" from {possible_words:?} (current \"{current}\")"),
             }))
         }
         EntryMode::Done => Ok(None),
@@ -344,6 +351,28 @@ pub fn type_on_device(
     observation: &crate::SimObservation,
     target: &BackupTarget,
     timeout: std::time::Duration,
+) -> Result<(), TypistError> {
+    // The trail prints only on failure (cargo test surfaces captured output
+    // for failing tests alone), because the symptom lands 24 rows after the
+    // divergent input: an invalid checksum without the trail says nothing
+    // about WHICH row went wrong or what was aimed at it.
+    let mut trail: Vec<String> = Vec::new();
+    let result = type_on_device_traced(input, observation, target, timeout, &mut trail);
+    if let Err(e) = &result {
+        eprintln!("typist steps before failure ({e}):");
+        for line in &trail {
+            eprintln!("  {line}");
+        }
+    }
+    result
+}
+
+fn type_on_device_traced(
+    input: &crate::DeviceInput,
+    observation: &crate::SimObservation,
+    target: &BackupTarget,
+    timeout: std::time::Duration,
+    trail: &mut Vec<String>,
 ) -> Result<(), TypistError> {
     use crate::observation::EntryOutcome;
     use std::time::{Duration, Instant as WallInstant};
@@ -519,6 +548,10 @@ pub fn type_on_device(
                 step.tap, before.row, before.cursor
             )));
         }
+        trail.push(format!(
+            "row {} cursor {}: {} @ ({},{})",
+            before.row, before.cursor, step.label, step.tap.x, step.tap.y
+        ));
     }
 }
 
@@ -867,6 +900,109 @@ mod tests {
                 matches!(BackupTarget::parse(&bad), Err(TypistError::Parse(_))),
                 "should reject {bad:?}"
             );
+        }
+    }
+
+    // Types a full backup like `type_into_screen`, except every word-selector
+    // tap fires at exactly `select_offset_ms` after the selector's first draw
+    // — the knob the wall-clock device path turns implicitly with scheduling.
+    // Swallowed taps (grace) retry later like the real typist; what this
+    // hunts is a tap that REGISTERS during the appearance window but selects
+    // the wrong word, which nothing detects until the checksum 24 rows on.
+    fn type_with_selector_offset(
+        screen: &mut EnterShareScreen,
+        target: &BackupTarget,
+        d: &mut SuperDrawTarget<VecFramebuffer<Rgb565>, Rgb565>,
+        select_offset_ms: u64,
+    ) -> Result<ShareBackup, TypistError> {
+        const TICK_MS: u64 = 25;
+        let mut now = 0u64;
+        let mut draw = |screen: &mut EnterShareScreen, now: &mut u64| {
+            *now += TICK_MS;
+            let _ = screen.draw(d, Instant::from_millis(*now));
+        };
+
+        draw(screen, &mut now);
+        let mut selector_shown_at: Option<u64> = None;
+        for _ in 0..NUM_WORDS * 64 {
+            if screen.is_finished() {
+                return screen.get_backup().ok_or_else(|| {
+                    TypistError::UnexpectedState("finished without a backup".into())
+                });
+            }
+            if screen.is_invalid() {
+                return Err(TypistError::InvalidChecksum);
+            }
+            if !screen.is_settled() {
+                draw(screen, &mut now);
+                continue;
+            }
+            let view = EntryView::from_view_state(&screen.view_state());
+            let Some(step) = next_step(&view, target, screen.keyboard_rect())? else {
+                draw(screen, &mut now);
+                continue;
+            };
+            if matches!(view.mode, EntryMode::Select { .. }) {
+                // The settle draw that swapped the selector in is when its
+                // grace clock started; pace the tap to the swept offset.
+                let shown = *selector_shown_at.get_or_insert(now);
+                while now < shown + select_offset_ms {
+                    draw(screen, &mut now);
+                }
+            } else {
+                selector_shown_at = None;
+            }
+            let before = view.clone();
+            if let Some(anchor) = step.scroll {
+                let (from, to) = match anchor {
+                    ScrollAnchor::Top => (0u32, 1000u32),
+                    ScrollAnchor::Bottom => (1000u32, 0u32),
+                };
+                screen.handle_vertical_drag(None, from, false);
+                screen.handle_vertical_drag(Some(from), to, true);
+                draw(screen, &mut now);
+            }
+            screen.handle_touch(step.tap, Instant::from_millis(now), false);
+            screen.handle_touch(step.tap, Instant::from_millis(now), true);
+            for _ in 0..24 {
+                draw(screen, &mut now);
+                if EntryView::from_view_state(&screen.view_state()) != before
+                    || screen.is_finished()
+                    || screen.is_invalid()
+                {
+                    break;
+                }
+            }
+        }
+        Err(TypistError::Stuck(
+            "typing budget exhausted before the screen finished".into(),
+        ))
+    }
+
+    // Sweep selector-tap timing across the appearance grace and fade-in
+    // boundary. A tap during the window may be SWALLOWED (the retry types it
+    // later — fine); it must never register a DIFFERENT word. The device-path
+    // CI failure resolves 25 valid words to an invalid checksum, which only a
+    // silently-wrong selector pick can produce; this pins the boundary that
+    // wall-clock scheduling sweeps implicitly.
+    #[test]
+    fn selector_taps_across_the_grace_boundary_never_pick_the_wrong_word() {
+        let mut rng = ChaCha20Rng::seed_from_u64(99);
+        let secret = Scalar::random(&mut rng);
+        let (shares, _key) =
+            ShareBackup::generate_shares(secret, 2, 3, frost_backup::FINGERPRINT, &mut rng);
+        let share = &shares[0];
+        let target = BackupTarget::parse(&share.to_string()).unwrap();
+        for offset_ms in (0..=600).step_by(25) {
+            let mut screen = EnterShareScreen::new();
+            screen.set_constraints(SCREEN);
+            match type_with_selector_offset(&mut screen, &target, &mut display(), offset_ms) {
+                Ok(typed) => assert_eq!(
+                    &typed, share,
+                    "selector taps at +{offset_ms}ms typed a DIFFERENT backup"
+                ),
+                Err(e) => panic!("typing with selector taps at +{offset_ms}ms failed: {e}"),
+            }
         }
     }
 
