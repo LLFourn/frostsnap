@@ -196,7 +196,10 @@ impl WidgetTree {
     #[inline(never)]
     pub(crate) fn build_entering_backup(phase: EnterBackupPhase) -> Self {
         let mut widget = Box::new(EnterShareScreen::new());
-        if cfg!(feature = "prefill-words") {
+        // A --cfg, not a cargo feature: it changes entry-screen behaviour, so as a
+        // feature `--all-features` runs armed it and the typist suite typed onto
+        // self-filling screens. Enable with RUSTFLAGS='--cfg prefill_words'.
+        if cfg!(prefill_words) {
             widget.prefill_test_words();
         }
         Self::EnterBackup {
