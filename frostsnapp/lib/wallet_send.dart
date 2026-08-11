@@ -57,6 +57,7 @@ class _WalletSendPageState extends State<WalletSendPage> {
 
   var pageIndex = SendPageIndex.recipient;
   bool estimateRunning = false;
+  bool nonceLimitWarned = false;
 
   @override
   void initState() {
@@ -370,6 +371,16 @@ class _WalletSendPageState extends State<WalletSendPage> {
           ],
         ),
       };
+      if (e case AmountError_TargetExceedsAvailable(:final target)) {
+        // Exceeding what the nonce cap allows is not the same story as exceeding the
+        // balance — explain it the first time the user runs into it.
+        final uncapped = state.availableAmountIgnoringNonces(recipient: 0) ?? 0;
+        if (target <= uncapped && !nonceLimitWarned) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) warnNonceLimit(this.context);
+          });
+        }
+      }
     }
 
     final amountInputCard = Card.outlined(
@@ -399,10 +410,13 @@ class _WalletSendPageState extends State<WalletSendPage> {
                 TextButton.icon(
                   onPressed: (availableAmount ?? 0) == 0
                       ? null
-                      : () => state.toggleSendMax(
-                          recipient: 0,
-                          fallbackAmount: amountController.amount,
-                        ),
+                      : () {
+                          final wasSendMax = state.toggleSendMax(
+                            recipient: 0,
+                            fallbackAmount: amountController.amount,
+                          );
+                          if (!wasSendMax) warnNonceLimit(context);
+                        },
                   label: Row(
                     spacing: 4.0,
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -535,6 +549,63 @@ class _WalletSendPageState extends State<WalletSendPage> {
   Widget completedCardLabel(BuildContext context, String text) =>
       Text(text, style: Theme.of(context).textTheme.labelLarge);
 
+  /// Warns, at most once per send flow, that signing nonces (not balance) bound what can be
+  /// sent. A no-op while the devices can sign everything the wallet holds.
+  Future<void> warnNonceLimit(BuildContext context) async {
+    if (nonceLimitWarned) return;
+    final capped = state.availableAmount(recipient: 0) ?? 0;
+    final uncapped = state.availableAmountIgnoringNonces(recipient: 0) ?? 0;
+    if (capped >= uncapped) return;
+    nonceLimitWarned = true;
+
+    final maxInputs = state.maxSignableInputs() ?? 0;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => BackdropFilter(
+        filter: blurFilter,
+        child: AlertDialog(
+          title: Text(
+            maxInputs == 0
+                ? 'Devices can\'t sign right now'
+                : 'Send amount limited',
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                maxInputs == 0
+                    ? 'Your devices have no signing nonces left, so this balance '
+                          'can\'t be spent yet. Connect a device to replenish its '
+                          'nonces, or complete its pending signing sessions.'
+                    : 'Your devices\' remaining signing nonces limit this '
+                          'transaction to $maxInputs coins, which is less than your '
+                          'full balance. Connect a device to replenish nonces to '
+                          'send more.',
+              ),
+              if (maxInputs > 0)
+                Padding(
+                  padding: const EdgeInsets.only(top: 12.0),
+                  child: Row(
+                    children: [
+                      Text('Spendable now: '),
+                      SatoshiText(value: capped),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text('OK'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Future<ConfirmationTarget?> showFeeRateDialog(BuildContext context) async {
     final walletCtx = WalletContext.of(context)!;
 
@@ -563,6 +634,9 @@ class _WalletSendPageState extends State<WalletSendPage> {
         TryFinishTxError.missingFeerate => 'No feerate',
         TryFinishTxError.incompleteRecipientValues => 'No recipient amount',
         TryFinishTxError.insufficientBalance => 'Insufficient Balance',
+        TryFinishTxError.nonceLimitExceeded =>
+          'Devices\' signing nonces no longer cover this amount — '
+              'lower it or replenish nonces',
       };
       showErrorSnackbar(context, 'Invalid transaction: $why');
     }
@@ -620,6 +694,9 @@ class _WalletSendPageState extends State<WalletSendPage> {
     }
 
     nextPageOrPop(null);
+    if (context.mounted && state.maxSignableInputs() == 0) {
+      warnNonceLimit(context);
+    }
   }
 
   recipientPaste(BuildContext context) async {

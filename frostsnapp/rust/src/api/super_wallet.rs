@@ -198,12 +198,14 @@ impl SuperWallet {
         to_address: &Address,
         value: u64,
         feerate: f64,
+        max_inputs: Option<u32>,
     ) -> Result<UnsignedTx> {
         let mut super_wallet = self.inner.lock().unwrap();
         let signing_task = super_wallet.send_to(
             master_appkey,
             [(to_address.clone(), Some(value))],
             feerate as f32,
+            max_inputs.map(|n| n as usize),
         )?;
         let unsigned_tx = UnsignedTx {
             template_tx: signing_task,
@@ -217,6 +219,7 @@ impl SuperWallet {
         master_appkey: MasterAppkey,
         target_addresses: Vec<RustAutoOpaque<Address>>,
         feerate: f32,
+        max_inputs: Option<u32>,
     ) -> u64 {
         let mut wallet = self.inner.lock().unwrap();
         wallet
@@ -227,6 +230,7 @@ impl SuperWallet {
                     .map(|a| a.blocking_read().clone()),
                 feerate,
                 true,
+                max_inputs.map(|n| n as usize),
             )
             .max(0) as u64
     }

@@ -147,6 +147,7 @@ impl BuildTxInner {
         super_wallet: &SuperWallet,
         master_appkey: MasterAppkey,
         recipient: u32,
+        max_inputs: Option<u32>,
     ) -> Option<u64> {
         Some(
             super_wallet.calculate_available(
@@ -158,6 +159,7 @@ impl BuildTxInner {
                     .map(RustAutoOpaque::new)
                     .collect(),
                 self.feerate()?,
+                max_inputs,
             ),
         )
     }
@@ -256,17 +258,53 @@ impl BuildTxState {
         };
     }
 
-    /// Remaining amount that is available for recipient.
+    /// Remaining amount that is available for recipient, no larger than what the devices'
+    /// remaining signing nonces allow a single transaction to spend.
     ///
     /// Returns `None` if no feerate is specified.
     #[frb(sync)]
     pub fn available_amount(&self, recipient: u32) -> Option<u64> {
+        let max_inputs = self.max_signable_inputs();
         let inner = self.inner.read().unwrap();
         inner.available_amount(
             &self.super_wallet,
             self.frost_key.master_appkey(),
             recipient,
+            max_inputs,
         )
+    }
+
+    /// What [`Self::available_amount`] would be if signing nonces were plentiful. When this
+    /// exceeds `available_amount` the difference is spendable balance the devices cannot
+    /// currently sign for.
+    #[frb(sync)]
+    pub fn available_amount_ignoring_nonces(&self, recipient: u32) -> Option<u64> {
+        let inner = self.inner.read().unwrap();
+        inner.available_amount(
+            &self.super_wallet,
+            self.frost_key.master_appkey(),
+            recipient,
+            None,
+        )
+    }
+
+    /// How many inputs a single transaction can have and still be signable.
+    ///
+    /// `Some(0)` means no spend is possible at all: fewer than `threshold` devices have any
+    /// nonces left. `None` means there is nothing to limit by (no access structure).
+    ///
+    /// A device's capacity is its best single nonce stream — a signing session cannot span
+    /// streams — and the cap is the minimum over devices that have nonces at all, so whichever
+    /// signers the user picks later can sign the transaction built under it.
+    #[frb(sync)]
+    pub fn max_signable_inputs(&self) -> Option<u32> {
+        let access_id = self.inner.read().unwrap().access_id;
+        let access = access_id
+            .and_then(|id| self.frost_key.get_access_structure(id))
+            .or_else(|| self.frost_key.access_structures().into_iter().next())?;
+        let coord = self.coord.blocking_read();
+        let capacities = access.devices().map(|id| coord.nonces_available(id));
+        Some(signable_input_cap(capacities, access.threshold() as usize))
     }
 
     #[frb(sync)]
@@ -381,6 +419,7 @@ impl BuildTxState {
 
     #[frb(sync, type_64bit_int)]
     pub fn fee(&self) -> Option<u64> {
+        let max_inputs = self.max_signable_inputs();
         let inner = self.inner.read().unwrap();
         let mut sw = self.super_wallet.inner.lock().unwrap();
         sw.send_to(
@@ -391,6 +430,7 @@ impl BuildTxState {
                 Some((addr, amount))
             }),
             inner.feerate()?,
+            max_inputs.map(|n| n as usize),
         )
         .ok()?
         .fee()
@@ -580,11 +620,25 @@ impl BuildTxState {
         }
         drop(inner);
 
+        let max_inputs = self.max_signable_inputs();
         let mut sw_inner = self.super_wallet.inner.lock().unwrap();
         sw_inner
-            .send_to(master_appkey, recipients, feerate)
+            .send_to(
+                master_appkey,
+                recipients,
+                feerate,
+                max_inputs.map(|n| n as usize),
+            )
             .map(|template_tx| UnsignedTx { template_tx })
-            .map_err(|_| TryFinishTxError::InsufficientBalance)
+            .map_err(|e| {
+                use frostsnap_coordinator::bitcoin::coin_select::SelectCoinsError;
+                match e.downcast_ref::<SelectCoinsError>() {
+                    Some(SelectCoinsError::InputLimitExceeded { .. }) => {
+                        TryFinishTxError::NonceLimitExceeded
+                    }
+                    _ => TryFinishTxError::InsufficientBalance,
+                }
+            })
     }
 }
 
@@ -604,4 +658,54 @@ pub enum TryFinishTxError {
     MissingFeerate,
     IncompleteRecipientValues,
     InsufficientBalance,
+    /// The balance covers the amount but the devices' remaining signing nonces no longer do —
+    /// the cap can shrink between amount entry and finishing, e.g. when another signing
+    /// session starts meanwhile.
+    NonceLimitExceeded,
+}
+
+/// The per-transaction input cap from each candidate device's usable nonce `capacities` (its best
+/// single stream — a session cannot span streams) and the signing `threshold`.
+///
+/// A zero-capacity device is not a candidate signer, so it is excluded rather than dragging the
+/// cap to zero. Fewer than `threshold` candidates means no spend is possible (0). Otherwise the
+/// cap is the minimum over candidates, so any threshold-sized subset can sign a transaction built
+/// under it. Kept here at the app boundary — nonce policy stays out of the wallet and core.
+fn signable_input_cap(capacities: impl IntoIterator<Item = u32>, threshold: usize) -> u32 {
+    let candidates = capacities
+        .into_iter()
+        .filter(|&n| n > 0)
+        .collect::<Vec<_>>();
+    if candidates.len() < threshold {
+        return 0;
+    }
+    candidates.into_iter().min().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod test {
+    use super::signable_input_cap;
+
+    #[test]
+    fn no_spend_when_fewer_than_threshold_have_nonces() {
+        assert_eq!(signable_input_cap([30, 0, 0], 2), 0);
+        assert_eq!(signable_input_cap([0, 0, 0], 2), 0);
+        assert_eq!(signable_input_cap([0u32; 0], 1), 0);
+    }
+
+    #[test]
+    fn cap_is_min_over_candidates() {
+        assert_eq!(signable_input_cap([30, 12, 30], 2), 12);
+        assert_eq!(signable_input_cap([7, 9], 2), 7);
+    }
+
+    #[test]
+    fn zero_capacity_device_is_excluded_not_a_floor() {
+        assert_eq!(signable_input_cap([30, 0, 20], 2), 20);
+    }
+
+    #[test]
+    fn exactly_threshold_candidates_still_spendable() {
+        assert_eq!(signable_input_cap([9, 0, 4], 2), 4);
+    }
 }

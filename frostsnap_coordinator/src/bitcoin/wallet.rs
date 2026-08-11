@@ -418,11 +418,12 @@ impl CoordSuperWallet {
         master_appkey: MasterAppkey,
         recipients: impl IntoIterator<Item = (bitcoin::Address, Option<u64>)>,
         feerate: f32,
+        max_inputs: Option<usize>,
     ) -> Result<bitcoin_transaction::TransactionTemplate> {
         self.lazily_initialize_key(master_appkey);
         use bdk_coin_select::{
-            metrics, Candidate, ChangePolicy, CoinSelector, DrainWeights, FeeRate, Target,
-            TargetFee, TargetOutputs, TR_DUST_RELAY_MIN_VALUE, TR_KEYSPEND_TXIN_WEIGHT,
+            Candidate, ChangePolicy, DrainWeights, FeeRate, Target, TargetFee, TargetOutputs,
+            TR_DUST_RELAY_MIN_VALUE, TR_KEYSPEND_TXIN_WEIGHT,
         };
 
         let recipients = recipients.into_iter().collect::<Vec<_>>();
@@ -434,6 +435,7 @@ impl CoordSuperWallet {
                 recipients.iter().map(|(addr, _)| addr.clone()),
                 feerate,
                 true,
+                max_inputs,
             );
             for (i, (addr, amount_opt)) in recipients.iter().enumerate() {
                 let amount: u64 = match amount_opt {
@@ -521,22 +523,13 @@ impl CoordSuperWallet {
             long_term_feerate_guess,
         );
 
-        let mut cs = CoinSelector::new(&candidates);
-        let metric = metrics::LowestFee {
+        let cs = super::coin_select::select_coins(
+            &candidates,
             target,
-            long_term_feerate: long_term_feerate_guess,
             change_policy,
-        };
-
-        match cs.run_bnb(metric, 500_000) {
-            Err(_) => {
-                event!(Level::ERROR, "unable to find a selection with lowest fee");
-                cs.select_until_target_met(target)?;
-            }
-            Ok(score) => {
-                event!(Level::INFO, "coin selection succeeded with score: {score}");
-            }
-        }
+            long_term_feerate_guess,
+            max_inputs,
+        )?;
 
         let selected_utxos = cs.apply_selection(&utxos);
 
@@ -605,11 +598,11 @@ impl CoordSuperWallet {
         target_addresses: impl IntoIterator<Item = bitcoin::Address>,
         feerate: f32,
         effective_only: bool,
+        max_inputs: Option<usize>,
     ) -> i64 {
         self.lazily_initialize_key(master_appkey);
         use bdk_coin_select::{
-            Candidate, CoinSelector, Drain, FeeRate, Target, TargetFee, TargetOutputs,
-            TR_KEYSPEND_TXIN_WEIGHT,
+            Candidate, Drain, FeeRate, Target, TargetFee, TargetOutputs, TR_KEYSPEND_TXIN_WEIGHT,
         };
 
         let feerate = FeeRate::from_sat_per_vb(feerate);
@@ -642,12 +635,8 @@ impl CoordSuperWallet {
             })
             .collect::<Vec<_>>();
 
-        let mut cs = CoinSelector::new(&candidates);
-        if effective_only {
-            cs.select_all_effective(feerate);
-        } else {
-            cs.select_all();
-        }
+        let cs =
+            super::coin_select::select_available(&candidates, feerate, effective_only, max_inputs);
         cs.excess(target, Drain::NONE)
     }
 
