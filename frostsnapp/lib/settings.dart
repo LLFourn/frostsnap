@@ -10,7 +10,6 @@ import 'package:frostsnap/bullet_list.dart';
 import 'package:frostsnap/contexts.dart';
 import 'package:frostsnap/copy_feedback.dart';
 import 'package:frostsnap/device_action_fullscreen_dialog.dart';
-import 'package:frostsnap/firmware_upgrade_nudge.dart';
 import 'package:frostsnap/electrum_server_settings.dart';
 import 'package:frostsnap/global.dart';
 import 'package:frostsnap/id_ext.dart';
@@ -1203,10 +1202,6 @@ Future<void> _showEraseAllDialog(BuildContext context) async {
     }
     return;
   }
-
-  if (!context.mounted) return;
-  if (!await maybeNudgeFirmwareUpgrade(context, devicesToErase)) return;
-  if (!context.mounted) return;
 
   late final FullscreenActionDialogController controller;
 

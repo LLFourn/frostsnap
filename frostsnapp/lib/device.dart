@@ -5,7 +5,6 @@ import 'package:flutter/material.dart';
 import 'package:frostsnap/contexts.dart';
 import 'package:frostsnap/copy_feedback.dart';
 import 'package:frostsnap/device_action_fullscreen_dialog.dart';
-import 'package:frostsnap/firmware_upgrade_nudge.dart';
 import 'package:frostsnap/id_ext.dart';
 import 'package:frostsnap/src/rust/api.dart';
 import 'package:frostsnap/src/rust/api/coordinator.dart';
@@ -332,10 +331,6 @@ class _DeviceDetailsState extends State<DeviceDetails> {
         return;
       }
     }
-
-    if (!context.mounted) return;
-    if (!await maybeNudgeFirmwareUpgrade(context, [id])) return;
-    if (!context.mounted) return;
 
     _eraseConfirmed.value = false;
 
