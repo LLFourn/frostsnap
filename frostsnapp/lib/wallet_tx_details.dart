@@ -9,6 +9,7 @@ import 'package:frostsnap/animated_check.dart';
 import 'package:frostsnap/contexts.dart';
 import 'package:frostsnap/copy_feedback.dart';
 import 'package:frostsnap/device_action_fullscreen_dialog.dart';
+import 'package:frostsnap/firmware_upgrade_nudge.dart';
 import 'package:frostsnap/global.dart';
 import 'package:frostsnap/id_ext.dart';
 import 'package:frostsnap/psbt.dart';
@@ -436,28 +437,57 @@ class _TxDetailsPageState extends State<TxDetailsPage> {
 
     txStateSub = widget.txStates.listen(onTxStateData);
 
-    try {
-      final signingParams = widget.signingParams;
-      if (signingParams != null) {
-        // `devices` is invariant for both start and restore — for restore we
-        // hydrated it synchronously from the active session. Seed the dialog
-        // controller up front so we never go through the lazy / nullable
-        // pattern mid-stream.
-        actionDialogController = _buildActionDialogController(
-          signingParams.devices,
-        );
-        devicesSub = GlobalStreams.deviceListSubject.listen(onDeviceListData);
-        broadcastDone = false;
-        late final StreamSubscription<SigningState> sub;
-        sub = signingParams.startSigning().listen((state) {
-          // Ensure `onSigningSessionData` is called sequentially.
-          sub.pause();
-          onSigningSessionData(state).whenComplete(sub.resume);
-        });
-        signingSub = sub;
+    final signingParams = widget.signingParams;
+    if (signingParams != null) {
+      switch (signingParams.mode) {
+        // Restoring takes no upgrade offer — the session is already live on the
+        // devices, and rebooting one mid-session is worse than signing on stale
+        // firmware. So it stays synchronous here, mounted by construction.
+        case SigningMode.restore:
+          _startSigning(signingParams);
+        // Only the offer needs deferring: it pushes a route, which cannot
+        // happen while this widget is still building.
+        case SigningMode.start:
+          WidgetsBinding.instance.addPostFrameCallback(
+            (_) => _offerUpgradeThenSign(signingParams),
+          );
       }
+    }
+  }
+
+  Future<void> _offerUpgradeThenSign(TxSigningParams signingParams) async {
+    if (!mounted) return;
+    if (!await maybeNudgeFirmwareUpgrade(context, signingParams.devices)) {
+      if (mounted) Navigator.pop(context);
+      return;
+    }
+    if (!mounted) return;
+    _startSigning(signingParams);
+  }
+
+  void _startSigning(TxSigningParams signingParams) {
+    try {
+      // `devices` is invariant for both start and restore — for restore we
+      // hydrated it synchronously from the active session. Seed the dialog
+      // controller up front so we never go through the lazy / nullable
+      // pattern mid-stream.
+      actionDialogController = _buildActionDialogController(
+        signingParams.devices,
+      );
+      devicesSub = GlobalStreams.deviceListSubject.listen(onDeviceListData);
+      broadcastDone = false;
+      late final StreamSubscription<SigningState> sub;
+      sub = signingParams.startSigning().listen((state) {
+        // Ensure `onSigningSessionData` is called sequentially.
+        sub.pause();
+        onSigningSessionData(state).whenComplete(sub.resume);
+      });
+      signingSub = sub;
     } catch (e) {
+      // Post-framed because this also runs synchronously from `initState` on
+      // the restore path, where a snackbar and a pop cannot happen yet.
       WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
         showErrorSnackbar(context, e.toString());
         Navigator.popUntil(context, (r) => r.isFirst);
       });

@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:frostsnap/device_action_fullscreen_dialog.dart';
+import 'package:frostsnap/firmware_upgrade_nudge.dart';
 import 'package:frostsnap/global.dart';
 import 'package:frostsnap/id_ext.dart';
 import 'package:frostsnap/src/rust/api.dart';
@@ -46,6 +47,10 @@ class DeviceActionBackupController with ChangeNotifier {
       action: 'show this backup',
     );
     if (encryptionKey == null) return false;
+
+    if (!context.mounted) return false;
+    if (!await maybeNudgeFirmwareUpgrade(context, [id])) return false;
+    if (!context.mounted) return false;
 
     final controller = FullscreenActionDialogController<bool>(
       context: context,

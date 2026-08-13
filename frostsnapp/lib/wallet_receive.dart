@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:frostsnap/contexts.dart';
 import 'package:frostsnap/copy_feedback.dart';
 import 'package:frostsnap/device_action_fullscreen_dialog.dart';
+import 'package:frostsnap/firmware_upgrade_nudge.dart';
 import 'package:frostsnap/src/rust/api.dart';
 import 'package:frostsnap/src/rust/api/super_wallet.dart';
 import 'package:frostsnap/theme.dart';
@@ -208,6 +209,7 @@ class _ReceiverPageState extends State<ReceivePage> {
 
   StreamSubscription<VerifyAddressProtocolState>? _verifyStreamSub;
   FullscreenActionDialogController? _fullscreenDialogController;
+  bool _verifyStarting = false;
   bool verificationSuccess = false;
 
   ReceivePageFocus _focus = ReceivePageFocus.share;
@@ -217,29 +219,7 @@ class _ReceiverPageState extends State<ReceivePage> {
   set focus(ReceivePageFocus v) {
     if (v == _focus || _address == null) return;
     if (v == ReceivePageFocus.verify) {
-      _verifyStreamSub?.cancel();
-      final targetDevices = widget.wallet
-          .frostKey()!
-          .accessStructures()
-          .expand((as) => as.devices())
-          .toSet();
-      _fullscreenDialogController = _buildVerifyDialogController(targetDevices);
-      // The protocol runs on the coordinator's background thread the moment
-      // `verifyAddress` is called — the subscription isn't needed to keep it
-      // alive, and cancellation goes through `coord.cancelProtocol()` below.
-      // We still `.listen` so the stream is drained for logging/debug; the
-      // emitted state (`targetDevices`, `connectedDevices`) duplicates info
-      // we already derive synchronously, so we discard it.
-      _verifyStreamSub = coord
-          .verifyAddress(
-            keyId: widget.wallet.keyId(),
-            addressIndex: _address!.index,
-          )
-          .listen((_) {});
-
-      setState(() {
-        _focus = v;
-      });
+      _beginVerify();
       return;
     }
     _fullscreenDialogController?.dispose();
@@ -249,6 +229,50 @@ class _ReceiverPageState extends State<ReceivePage> {
     _verifyStreamSub = null;
     setState(() {
       _focus = v;
+    });
+  }
+
+  /// `verifyAddress` must not put a prompt on the device screen before the
+  /// firmware offer resolves, so the transition is asynchronous — which means
+  /// `_focus` is still `share` throughout and the setter's own guard cannot
+  /// stop a second request. Without the latch two passes would each run an
+  /// offer and then start overlapping verifications.
+  Future<void> _beginVerify() async {
+    if (_verifyStarting) return;
+    _verifyStarting = true;
+    try {
+      await _startVerification();
+    } finally {
+      _verifyStarting = false;
+    }
+  }
+
+  Future<void> _startVerification() async {
+    final addressIndex = _address?.index;
+    if (addressIndex == null) return;
+    final targetDevices = widget.wallet
+        .frostKey()!
+        .accessStructures()
+        .expand((as) => as.devices())
+        .toSet();
+
+    if (!await maybeNudgeFirmwareUpgrade(context, targetDevices)) return;
+    if (!mounted || _address?.index != addressIndex) return;
+
+    _verifyStreamSub?.cancel();
+    _fullscreenDialogController = _buildVerifyDialogController(targetDevices);
+    // The protocol runs on the coordinator's background thread the moment
+    // `verifyAddress` is called — the subscription isn't needed to keep it
+    // alive, and cancellation goes through `coord.cancelProtocol()` in the
+    // focus setter. We still `.listen` so the stream is drained for
+    // logging/debug; the emitted state (`targetDevices`, `connectedDevices`)
+    // duplicates info we already derive synchronously, so we discard it.
+    _verifyStreamSub = coord
+        .verifyAddress(keyId: widget.wallet.keyId(), addressIndex: addressIndex)
+        .listen((_) {});
+
+    setState(() {
+      _focus = ReceivePageFocus.verify;
     });
   }
 
