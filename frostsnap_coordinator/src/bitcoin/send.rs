@@ -4,7 +4,7 @@
 //! re-plan) as often as it likes — a fee display bound to a plan cannot move the wallet's
 //! keychain indices.
 
-use super::wallet::CoordSuperWallet;
+use super::wallet::{revealed_index, CoordSuperWallet};
 use anyhow::{anyhow, Result};
 use bdk_chain::{
     bitcoin::{self, Amount, OutPoint, TxOut},
@@ -189,7 +189,7 @@ impl CoordSuperWallet {
                 (
                     BitcoinBip32Path {
                         account_keychain: *account_keychain,
-                        index: *index,
+                        index: revealed_index(*index),
                     },
                     utxo.outpoint,
                 )
@@ -276,7 +276,7 @@ impl CoordSuperWallet {
                     master_appkey: plan.master_appkey,
                     bip32_path: BitcoinBip32Path {
                         account_keychain: BitcoinAccountKeychain::internal(),
-                        index,
+                        index: revealed_index(index),
                     },
                 },
             );
@@ -301,6 +301,7 @@ mod test {
         BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate,
     };
     use frostsnap_core::schnorr_fun::fun::Point;
+    use frostsnap_core::tweak::NormalIndex;
     use std::str::FromStr;
     use std::sync::{Arc, Mutex};
 
@@ -364,7 +365,7 @@ mod test {
                 self.master_appkey,
                 BitcoinBip32Path {
                     account_keychain: BitcoinAccountKeychain::external(),
-                    index,
+                    index: NormalIndex::new(index).expect("fixture index is a literal below 2^31"),
                 },
             );
             let tx = bitcoin::Transaction {

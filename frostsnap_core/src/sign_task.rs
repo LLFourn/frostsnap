@@ -217,7 +217,7 @@ impl std::error::Error for SignTaskError {}
 mod test {
     use super::*;
     use crate::bitcoin_transaction::{LocalSpk, TransactionTemplate};
-    use crate::tweak::BitcoinBip32Path;
+    use crate::tweak::{BitcoinBip32Path, NormalIndex};
     use bitcoin::{Amount, Network, ScriptBuf, TxOut};
     use schnorr_fun::fun::prelude::*;
 
@@ -241,7 +241,7 @@ mod test {
         tx_template.push_imaginary_owned_input(
             LocalSpk {
                 master_appkey: signing,
-                bip32_path: BitcoinBip32Path::external(0),
+                bip32_path: BitcoinBip32Path::external(NormalIndex::ZERO),
             },
             Amount::from_sat(100_000),
         );
@@ -249,7 +249,7 @@ mod test {
             Amount::from_sat(90_000),
             LocalSpk {
                 master_appkey: other,
-                bip32_path: BitcoinBip32Path::internal(0),
+                bip32_path: BitcoinBip32Path::internal(NormalIndex::ZERO),
             },
         );
 
@@ -280,7 +280,7 @@ mod test {
         tx_template.push_imaginary_owned_input(
             LocalSpk {
                 master_appkey: other,
-                bip32_path: BitcoinBip32Path::external(0),
+                bip32_path: BitcoinBip32Path::external(NormalIndex::ZERO),
             },
             Amount::from_sat(100_000),
         );
@@ -312,7 +312,7 @@ mod test {
         tx_template.push_imaginary_owned_input(
             LocalSpk {
                 master_appkey: signing,
-                bip32_path: BitcoinBip32Path::external(0),
+                bip32_path: BitcoinBip32Path::external(NormalIndex::ZERO),
             },
             Amount::from_sat(100_000),
         );
