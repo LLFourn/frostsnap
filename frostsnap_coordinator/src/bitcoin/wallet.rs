@@ -11,7 +11,7 @@ use bdk_chain::{
 };
 use frostsnap_core::{
     bitcoin_transaction::{self, LocalSpk},
-    tweak::{AppTweakKind, BitcoinAccountKeychain, BitcoinBip32Path},
+    tweak::{AppTweakKind, BitcoinAccountKeychain, BitcoinBip32Path, NormalIndex},
     MasterAppkey,
 };
 use frostsnap_core::{
@@ -205,7 +205,7 @@ impl CoordSuperWallet {
                     master_appkey,
                     BitcoinBip32Path {
                         account_keychain: keychain,
-                        index: i,
+                        index: revealed_index(i),
                     },
                 )
             })
@@ -219,18 +219,19 @@ impl CoordSuperWallet {
             master_appkey,
             BitcoinBip32Path {
                 account_keychain: keychain,
-                index,
+                index: NormalIndex::new(index)?,
             },
         ))
     }
 
     fn address_info(&self, master_appkey: MasterAppkey, path: BitcoinBip32Path) -> AddressInfo {
         let keychain = (master_appkey, path.account_keychain);
-        let used = self.tx_graph.index.is_used(keychain, path.index);
-        let revealed = self.tx_graph.index.last_revealed_index(keychain) <= Some(path.index);
+        let used = self.tx_graph.index.is_used(keychain, path.index.to_u32());
+        let revealed =
+            self.tx_graph.index.last_revealed_index(keychain) <= Some(path.index.to_u32());
         let spk = super::peek_spk(master_appkey, path);
         AddressInfo {
-            index: path.index,
+            index: path.index.to_u32(),
             address: bitcoin::Address::from_script(&spk, self.network).expect("has address form"),
             external: true,
             used,
@@ -252,7 +253,7 @@ impl CoordSuperWallet {
             master_appkey,
             BitcoinBip32Path {
                 account_keychain: keychain,
-                index,
+                index: revealed_index(index),
             },
         )
     }
@@ -312,7 +313,7 @@ impl CoordSuperWallet {
                             master_appkey,
                             BitcoinBip32Path {
                                 account_keychain: keychain,
-                                index: i,
+                                index: NormalIndex::new(i)?,
                             },
                         ))
                     } else {
@@ -551,7 +552,7 @@ impl CoordSuperWallet {
                 .expect("must exist");
             let bip32_path = BitcoinBip32Path {
                 account_keychain: *account_keychain,
-                index: *index,
+                index: revealed_index(*index),
             };
             template_tx
                 .push_owned_input(
@@ -586,7 +587,7 @@ impl CoordSuperWallet {
                     master_appkey,
                     bip32_path: BitcoinBip32Path {
                         account_keychain: BitcoinAccountKeychain::internal(),
-                        index: i,
+                        index: revealed_index(i),
                     },
                 },
             );
@@ -812,7 +813,7 @@ impl CoordSuperWallet {
                         master_appkey,
                         bip32_path: BitcoinBip32Path {
                             account_keychain,
-                            index,
+                            index: revealed_index(index),
                         },
                     },
                 ),
@@ -896,6 +897,11 @@ impl std::fmt::Display for PsbtValidationError {
 }
 impl std::error::Error for PsbtValidationError {}
 
+/// bdk stops revealing at `BIP32_MAX_INDEX`, so any index it hands back is a normal child.
+fn revealed_index(index: u32) -> NormalIndex {
+    NormalIndex::new(index).expect("bdk never reveals past BIP32_MAX_INDEX")
+}
+
 #[derive(Clone, Debug)]
 pub struct AddressInfo {
     pub index: u32,
@@ -941,7 +947,7 @@ mod test {
         let (account_keychain, external_descriptor) = &descriptors[0];
         let xonly = AppTweak::Bitcoin(BitcoinBip32Path {
             account_keychain: *account_keychain,
-            index: 42,
+            index: NormalIndex::new(42).unwrap(),
         })
         .derive_xonly_key(&master_appkey.to_xpub());
 
