@@ -27,11 +27,15 @@ class MainActivity : FlutterActivity() {
         // 1. Setup channel for MainActivity to send device attached events TO Dart
         mainActivityToDartMethodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, USB_PERMISSIONS_CHANNEL_TO_DART)
 
-        try {
-            flutterEngine.plugins.add(CdcAcmPlugin())
-            Log.i("configureFlutterEngine", "CdcAcmPlugin successfully registered with FlutterEngine.")
-        } catch (e: Exception) {
-            Log.e("configureFlutterEngine", "Error REGISTERING CdcAcmPlugin: ${e.message}", e)
+        if (BuildConfig.FROSTSNAP_SIM) {
+            Log.i("configureFlutterEngine", "SIM build: skipping CdcAcmPlugin.")
+        } else {
+            try {
+                flutterEngine.plugins.add(CdcAcmPlugin())
+                Log.i("configureFlutterEngine", "CdcAcmPlugin successfully registered with FlutterEngine.")
+            } catch (e: Exception) {
+                Log.e("configureFlutterEngine", "Error REGISTERING CdcAcmPlugin: ${e.message}", e)
+            }
         }
         
         try {
@@ -57,6 +61,11 @@ class MainActivity : FlutterActivity() {
 
     private fun handleIntent(intent: Intent?) {
         if (intent != null && UsbManager.ACTION_USB_DEVICE_ATTACHED == intent.action) {
+            if (BuildConfig.FROSTSNAP_SIM) {
+                Log.i(TAG, "SIM build: ignoring USB attach intent.")
+                return
+            }
+
             val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
             if (device != null) {
                 Log.i(TAG, "Device attached: ${device.deviceName} (VID: ${device.vendorId} PID: ${device.productId} OS_DeviceID: ${device.deviceId})")

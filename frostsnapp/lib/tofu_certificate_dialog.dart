@@ -89,6 +89,7 @@ class TofuCertificateDialog extends StatelessWidget {
                         ),
                         const SizedBox(height: 8),
                         SelectableText(
+                          key: const ValueKey('tofu-fingerprint'),
                           _formatFingerprint(certificateInfo.fingerprint),
                           style: monospaceTextStyle.copyWith(
                             fontSize: 13,
@@ -108,6 +109,7 @@ class TofuCertificateDialog extends StatelessWidget {
                           ),
                           const SizedBox(height: 8),
                           SelectableText(
+                            key: const ValueKey('tofu-old-fingerprint'),
                             _formatFingerprint(certificateInfo.oldFingerprint!),
                             style: monospaceTextStyle.copyWith(
                               fontSize: 13,

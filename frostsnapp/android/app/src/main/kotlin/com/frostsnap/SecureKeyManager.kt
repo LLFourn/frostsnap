@@ -48,8 +48,8 @@ class SecureKeyManager : FlutterPlugin, MethodCallHandler, ActivityAware, Plugin
         when (call.method) {
             "getOrCreateKey" -> getOrCreateKey(result)
             "requiresAuthentication" -> requiresAuthentication(result)
-            "clearKey" -> clearKey(result)
             "deleteKey" -> deleteKey(result)
+            "hasKey" -> hasKey(result)
             else -> result.notImplemented()
         }
     }
@@ -272,11 +272,6 @@ class SecureKeyManager : FlutterPlugin, MethodCallHandler, ActivityAware, Plugin
         }
     }
 
-    private fun clearKey(result: Result) {
-        // No-op since we don't cache authentication
-        result.success(null)
-    }
-
     private fun deleteKey(result: Result) {
         try {
             val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
@@ -291,6 +286,18 @@ class SecureKeyManager : FlutterPlugin, MethodCallHandler, ActivityAware, Plugin
         } catch (e: Exception) {
             Log.e(TAG, "Error deleting key", e)
             result.error("DELETE_ERROR", "Failed to delete key: ${e.message}", null)
+        }
+    }
+
+    // Read-only key-existence check — used by the sim to verify deleteKey actually removed the entry.
+    private fun hasKey(result: Result) {
+        try {
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
+            keyStore.load(null)
+            result.success(keyStore.containsAlias(KEY_ALIAS))
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking key existence", e)
+            result.error("HAS_KEY_ERROR", "Failed to check key: ${e.message}", null)
         }
     }
 }

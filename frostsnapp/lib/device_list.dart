@@ -45,7 +45,7 @@ class _DeviceListPageState extends State<DeviceListPage> {
     super.dispose();
   }
 
-  Widget _buildDevice(BuildContext context, ConnectedDevice device) {
+  Widget _buildDevice(BuildContext context, ConnectedDevice device, int _) {
     final theme = Theme.of(context);
     final homeCtx = HomeContext.of(context)!;
     final upgradeEligibility = device.firmwareUpgradeEligibility();
