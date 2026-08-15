@@ -118,6 +118,36 @@ where
         }
     }
 
+    /// Centroid of the probe points whose press lands on the confirm button —
+    /// geometry introspection against this widget's own hit-testing (the
+    /// button returns no `KeyTouch`, so this probes its latched state).
+    /// Requires constraints. Each probe is a press+release pair; the hold
+    /// integral only accrues across draws, so no confirm can fire. Makes the
+    /// button visible (a faded-out button ignores touches) — probe shadow
+    /// constructions, not a live screen.
+    pub fn button_probe_centroid(&mut self) -> Option<Point> {
+        self.button_fader_mut().set_visible();
+        const STEP: i32 = 8;
+        let size: Size = self.sizing().into();
+        let (mut sum, mut n) = (Point::zero(), 0);
+        let mut y = STEP / 2;
+        while y < size.height as i32 {
+            let mut x = STEP / 2;
+            while x < size.width as i32 {
+                let p = Point::new(x, y);
+                self.handle_touch(p, crate::Instant::from_millis(0), false);
+                if self.button().state() == CircleButtonState::Pressed {
+                    sum += p;
+                    n += 1;
+                }
+                self.handle_touch(p, crate::Instant::from_millis(0), true);
+                x += STEP;
+            }
+            y += STEP;
+        }
+        (n > 0).then(|| Point::new(sum.x / n, sum.y / n))
+    }
+
     pub fn button_mut(&mut self) -> &mut CircleButton {
         self.content.child.child.child.children.1.child.child_mut()
     }
