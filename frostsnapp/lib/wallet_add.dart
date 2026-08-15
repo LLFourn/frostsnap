@@ -50,6 +50,7 @@ class WalletAddColumn extends StatelessWidget {
           emphasize: true,
           isThreeLine: true,
           icon: Icon(Icons.add_rounded, size: iconSize),
+          // The sim-8 driver targets this card by its title's semantic label.
           title: 'Create a multi-sig wallet',
           subtitle: 'Set up a secure wallet using multiple Frostsnap devices',
         ),

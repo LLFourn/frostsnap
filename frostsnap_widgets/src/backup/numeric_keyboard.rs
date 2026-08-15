@@ -237,6 +237,15 @@ impl NumericKeyboard {
         Self { keyboard }
     }
 
+    /// Centroid of the probe points that hit-test to `key` ('0'–'9' or '✓'),
+    /// in keyboard-local coordinates — found by scanning this keyboard's own
+    /// [`handle_touch`](crate::DynWidget::handle_touch), so there is no
+    /// duplicated layout math to drift. Requires constraints to be set;
+    /// disabled keys don't hit-test (enable the bottom row first for '0'/'✓').
+    pub fn key_point(&mut self, key: char) -> Option<Point> {
+        crate::DynWidget::key_probe_centroid(self, |k| k == crate::Key::Keyboard(key))
+    }
+
     /// Helper method to enable/disable the 0 button and checkmark based on whether any digits have been entered
     pub fn set_bottom_buttons_enabled(&mut self, enabled: bool) {
         // Access the bottom row (4th row in the column)

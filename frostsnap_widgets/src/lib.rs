@@ -213,6 +213,37 @@ pub trait DynWidget {
         // Default implementation does nothing
         // Widgets that need this functionality should override
     }
+
+    /// Centroid of the probe points (8 px grid over this widget's sizing)
+    /// whose [`Self::handle_touch`] press yields a key matching `matches` —
+    /// geometry introspection derived from the widget's own hit-testing so
+    /// instruments never duplicate layout math. Probes are presses that are
+    /// never released, so no key action fires; widgets whose press already
+    /// mutates state must not use this.
+    fn key_probe_centroid(&mut self, matches: impl Fn(Key) -> bool) -> Option<Point>
+    where
+        Self: Sized,
+    {
+        const STEP: i32 = 8;
+        let size = self.sizing();
+        let (mut sum, mut n) = (Point::zero(), 0);
+        let mut y = STEP / 2;
+        while y < size.height as i32 {
+            let mut x = STEP / 2;
+            while x < size.width as i32 {
+                let p = Point::new(x, y);
+                if let Some(touch) = self.handle_touch(p, Instant::from_millis(0), false) {
+                    if matches(touch.key) {
+                        sum += p;
+                        n += 1;
+                    }
+                }
+                x += STEP;
+            }
+            y += STEP;
+        }
+        (n > 0).then(|| Point::new(sum.x / n, sum.y / n))
+    }
 }
 
 /// A trait that combines DynWidget with Any for downcasting
