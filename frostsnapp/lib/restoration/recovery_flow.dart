@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:frostsnap/contexts.dart';
 import 'package:frostsnap/global.dart';
 import 'package:frostsnap/restoration/candidate_ready_view.dart';
 import 'package:frostsnap/restoration/enter_backup_view.dart';
@@ -468,7 +469,12 @@ class _WalletRecoveryFlowState extends State<WalletRecoveryFlow> {
       case EnterRestorationDetailsStage():
         child = EnterWalletNameView(
           initialWalletName: null,
-          initialBitcoinNetwork: null,
+          // Same non-subscribing read wallet creation uses: the composition
+          // root decides the session's network — restoring must not silently
+          // pin mainnet when the wallet being restored was created elsewhere.
+          initialBitcoinNetwork: context
+              .getInheritedWidgetOfExactType<FrostsnapContext>()
+              ?.defaultNetwork,
           onWalletNameEntered: (walletName, bitcoinNetwork) {
             setState(() {
               pushPrevState();

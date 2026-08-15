@@ -1,0 +1,30 @@
+#!/bin/sh
+# fsim — the app-simulator CLI (sim-14). The single entrypoint for the Frostsnap app sim:
+#
+#   ./fsim serve [--devices N] [--android] [--agent-owns-keyboard]   launch the session, keep it
+#                                                        alive (--android runs on an emulator)
+#   ./fsim <cmd> ...                                   drive the running session (chain,
+#                                                        disconnect, tap, shot, down, …)
+#   ./fsim test [NAME]                                 run e2e driver test NAME (a
+#                                                        *_drive.dart stem), or all with no NAME
+#
+# `serve` and `test` launch/build the app, so we first run the project's shared gen-ensure
+# (`just maybe-gen`: re-run FRB bindgen if the Rust API changed, then build_runner) — the
+# single source of truth for codegen, which the sim consumes but does not own. Forwarded
+# commands talk to an already-running app, so they skip gen-ensure (and stay fast).
+set -e
+
+# Capture the INVOCATION cwd before we cd into the package: it's the default session identity, so a
+# session's state root is <invocation-cwd>/.fsim. Dart reads FSIM_INVOCATION_CWD (never Directory.current,
+# which the `cd` below moves to the package dir). `--dir <path>` overrides it.
+FSIM_INVOCATION_CWD="$PWD"
+export FSIM_INVOCATION_CWD
+
+root="$(cd "$(dirname "$0")" && pwd)"
+
+case "${1:-}" in
+  serve | test) (cd "$root" && just maybe-gen) ;;
+esac
+
+cd "$root/frostsnapp"
+exec dart run test_driver/fsim.dart "$@"
