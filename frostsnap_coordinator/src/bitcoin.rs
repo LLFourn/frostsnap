@@ -1,4 +1,5 @@
 pub mod chain_sync;
+pub mod coin_select;
 mod handler_state;
 pub mod outgoing;
 pub mod psbt;
