@@ -175,18 +175,29 @@ impl CoordSuperWallet {
                     .map_or(0, |lr| lr + 1);
                 self.chain_client.monitor_keychain(keychain_id, next_index);
             }
-            let all_txs = self
-                .tx_graph
-                .graph()
-                .full_txs()
-                .map(|tx| tx.tx.clone())
-                .collect::<Vec<_>>();
             // FIXME: This should be done by BDK automatically in a version soon.
-            // FIXME: We want a high enough last-derived-index before doing indexing otherwise we
-            // may misindex some txs.
-            for tx in &all_txs {
-                let _ = self.tx_graph.MUTATE_NO_PERSIST().index.index_tx(tx);
-            }
+            Self::index_graph_txs(self.tx_graph.MUTATE_NO_PERSIST());
+        }
+    }
+
+    /// Re-scan every tx in the graph against the currently derived spks.
+    ///
+    /// bdk indexes a tx once, against whatever spks existed at that moment, and never revisits it
+    /// when more are derived. Revealing therefore strands the outputs of txs already in the graph:
+    /// `index_of_spk` starts recognising them (so they keep counting towards the balance) while the
+    /// outpoint set coin selection reads stays empty, making the coins unspendable. Callers must
+    /// run this after any reveal so that "every tx in the graph is indexed against the current spk
+    /// set" holds.
+    ///
+    /// The outpoint set is derived state rebuilt on load, so nothing here needs persisting.
+    fn index_graph_txs(tx_graph: &mut WalletIndexedTxGraph) {
+        let txs = tx_graph
+            .graph()
+            .full_txs()
+            .map(|tx_node| tx_node.tx.clone())
+            .collect::<Vec<_>>();
+        for tx in &txs {
+            let _ = tx_graph.index.index_tx(tx);
         }
     }
 
@@ -400,11 +411,13 @@ impl CoordSuperWallet {
                 let indexer_changeset = tx_graph
                     .index
                     .reveal_to_target_multi(&update.last_active_indices);
-                let tx_changeset = tx_graph.apply_update(update.tx_update);
-                let changed = !(chain_changeset.is_empty()
-                    && indexer_changeset.is_empty()
-                    && tx_changeset.is_empty());
-                Ok((changed, (tx_changeset, chain_changeset)))
+                if !indexer_changeset.is_empty() {
+                    Self::index_graph_txs(tx_graph);
+                }
+                let mut changeset = tx_graph.apply_update(update.tx_update);
+                changeset.indexer.merge(indexer_changeset);
+                let changed = !(chain_changeset.is_empty() && changeset.is_empty());
+                Ok((changed, (changeset, chain_changeset)))
             })?;
         Ok(changed)
     }
@@ -928,8 +941,263 @@ pub struct ConfirmationTime {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::bitcoin::chain_sync::{ConnectionHandler, ElectrumConfig};
+    use crate::settings::ElectrumEnabled;
+    use bdk_chain::{bitcoin::hashes::Hash, BlockId, TxUpdate};
     use bitcoin::key::{Secp256k1, TweakedPublicKey};
     use frostsnap_core::{schnorr_fun::fun::Point, tweak::AppTweak};
+
+    const NETWORK: bitcoin::Network = bitcoin::Network::Bitcoin;
+
+    fn test_db() -> Arc<Mutex<rusqlite::Connection>> {
+        Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()))
+    }
+
+    /// The handler owns the receiving ends of the client's channels, so it has to outlive every
+    /// `ChainClient` call or `monitor_keychain`'s send panics.
+    fn test_chain_client(
+        db: &Arc<Mutex<rusqlite::Connection>>,
+    ) -> (ChainClient, ConnectionHandler) {
+        let trusted_certificates = {
+            let mut conn = db.lock().unwrap();
+            Persisted::new(&mut *conn, NETWORK).unwrap()
+        };
+        ChainClient::new(
+            bitcoin::constants::genesis_block(NETWORK).block_hash(),
+            ElectrumConfig {
+                enabled: ElectrumEnabled::None,
+                primary: String::new(),
+                backup: String::new(),
+            },
+            trusted_certificates,
+            db.clone(),
+        )
+    }
+
+    fn confirmed_at(height: u32) -> (BlockId, ConfirmationBlockTime) {
+        let block_id = BlockId {
+            height,
+            hash: BlockHash::from_byte_array([height as u8; 32]),
+        };
+        (
+            block_id,
+            ConfirmationBlockTime {
+                block_id,
+                confirmation_time: 1_700_000_000,
+            },
+        )
+    }
+
+    fn funding_tx(spk: ScriptBuf, value: u64) -> bitcoin::Transaction {
+        bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn::default()],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: spk,
+            }],
+        }
+    }
+
+    /// What the app sums to show a balance: owned outputs of every canonical tx, where "owned" is
+    /// decided by `index_of_spk`.
+    fn balance_of(wallet: &mut CoordSuperWallet, master_appkey: MasterAppkey) -> u64 {
+        wallet
+            .list_transactions(master_appkey)
+            .iter()
+            .flat_map(|tx| {
+                tx.inner
+                    .output
+                    .iter()
+                    .filter(|txo| tx.is_mine.contains_key(&txo.script_pubkey))
+                    .map(|txo| txo.value.to_sat())
+            })
+            .sum()
+    }
+
+    fn spendable_outpoint_count(wallet: &CoordSuperWallet, master_appkey: MasterAppkey) -> usize {
+        wallet
+            .tx_graph
+            .index
+            .keychain_outpoints_in_range(CoordSuperWallet::key_index_range(master_appkey))
+            .count()
+    }
+
+    /// What the "send max" button offers.
+    fn send_max(wallet: &mut CoordSuperWallet, master_appkey: MasterAppkey) -> i64 {
+        wallet.calculate_avaliable_value(master_appkey, Vec::<bitcoin::Address>::new(), 1.0, true)
+    }
+
+    /// A wallet holding one confirmed output on the internal keychain, at an index far enough past
+    /// `last_revealed` that only a reveal can bring it into view.
+    struct FarOutputWallet {
+        db: Arc<Mutex<rusqlite::Connection>>,
+        chain_client: ChainClient,
+        _handler: ConnectionHandler,
+        master_appkey: MasterAppkey,
+        keychain: KeychainId,
+        index: u32,
+        spk: ScriptBuf,
+        tx: bitcoin::Transaction,
+        block_id: BlockId,
+        anchor: ConfirmationBlockTime,
+    }
+
+    impl FarOutputWallet {
+        const VALUE: u64 = 100_000;
+
+        fn new() -> Self {
+            let db = test_db();
+            let (chain_client, _handler) = test_chain_client(&db);
+            let master_appkey =
+                MasterAppkey::derive_from_rootkey(Point::random(&mut rand::thread_rng()));
+            let account_keychain = BitcoinAccountKeychain::internal();
+            let index = KeychainTxOutIndex::<KeychainId>::default().lookahead() + 15;
+            let spk = crate::bitcoin::peek_spk(
+                master_appkey,
+                BitcoinBip32Path {
+                    account_keychain,
+                    index,
+                },
+            );
+            let (block_id, anchor) = confirmed_at(100);
+            Self {
+                db,
+                chain_client,
+                _handler,
+                master_appkey,
+                keychain: (master_appkey, account_keychain),
+                index,
+                tx: funding_tx(spk.clone(), Self::VALUE),
+                spk,
+                block_id,
+                anchor,
+            }
+        }
+
+        fn load(&self) -> CoordSuperWallet {
+            let mut wallet =
+                CoordSuperWallet::load_or_init(self.db.clone(), NETWORK, self.chain_client.clone())
+                    .unwrap();
+            wallet.list_addresses(self.master_appkey);
+            wallet
+        }
+
+        /// A sync carrying the funding tx. `reveals` mirrors whether the chain source reported the
+        /// keychain index as active.
+        fn funding_sync(&self, reveals: bool) -> bdk_electrum_streaming::Update<KeychainId> {
+            bdk_electrum_streaming::Update {
+                tx_update: {
+                    let mut tx_update = TxUpdate::default();
+                    tx_update.txs = vec![Arc::new(self.tx.clone())];
+                    tx_update.anchors = [(self.anchor, self.tx.compute_txid())].into();
+                    tx_update
+                },
+                chain_update: Some(
+                    CheckPoint::from_block_ids([
+                        BlockId {
+                            height: 0,
+                            hash: bitcoin::constants::genesis_block(NETWORK).block_hash(),
+                        },
+                        self.block_id,
+                    ])
+                    .unwrap(),
+                ),
+                ..self.reveal_sync(reveals)
+            }
+        }
+
+        fn reveal_sync(&self, reveals: bool) -> bdk_electrum_streaming::Update<KeychainId> {
+            bdk_electrum_streaming::Update {
+                last_active_indices: if reveals {
+                    [(self.keychain, self.index)].into()
+                } else {
+                    Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        fn assert_fully_spendable(&self, wallet: &mut CoordSuperWallet, context: &str) {
+            assert!(
+                wallet
+                    .tx_graph
+                    .index
+                    .index_of_spk(self.spk.clone())
+                    .is_some(),
+                "{context}: spk should be recognised"
+            );
+            assert_eq!(
+                balance_of(wallet, self.master_appkey),
+                Self::VALUE,
+                "{context}: balance should include the output"
+            );
+            assert_eq!(
+                spendable_outpoint_count(wallet, self.master_appkey),
+                1,
+                "{context}: coin selection should see the outpoint"
+            );
+            let available = send_max(wallet, self.master_appkey);
+            assert!(
+                available > 90_000,
+                "{context}: send max should offer the balance, offered {available}"
+            );
+        }
+    }
+
+    /// The reported symptom: after a restart the balance still shows the coin but send max offers
+    /// nothing, because the reveal that brought the output into view was never persisted and the
+    /// reload re-indexes against a window too narrow to see it.
+    #[test]
+    fn output_past_the_reveal_window_stays_spendable_across_a_restart() {
+        let fixture = FarOutputWallet::new();
+
+        let mut wallet = fixture.load();
+        wallet.apply_update(fixture.funding_sync(true)).unwrap();
+        fixture.assert_fully_spendable(&mut wallet, "before restart");
+
+        drop(wallet);
+        let mut wallet = fixture.load();
+        wallet.apply_update(fixture.reveal_sync(true)).unwrap();
+        fixture.assert_fully_spendable(&mut wallet, "after restart");
+    }
+
+    /// The reveal a sync performs has to reach the database, otherwise the next load derives too
+    /// few spks to re-index the txs it just loaded.
+    #[test]
+    fn reveal_from_a_sync_is_persisted() {
+        let fixture = FarOutputWallet::new();
+
+        let mut wallet = fixture.load();
+        wallet.apply_update(fixture.funding_sync(true)).unwrap();
+        drop(wallet);
+
+        let mut wallet = fixture.load();
+        assert_eq!(
+            wallet.tx_graph.index.last_revealed_index(fixture.keychain),
+            Some(fixture.index),
+        );
+        fixture.assert_fully_spendable(&mut wallet, "reloaded without syncing");
+    }
+
+    /// Wallets already in the broken state have a tx stored against a `last_revealed` too low to
+    /// index it. The reveal that follows must re-scan them, or those coins stay unspendable.
+    #[test]
+    fn reveal_reindexes_txs_already_in_the_graph() {
+        let fixture = FarOutputWallet::new();
+        let mut wallet = fixture.load();
+
+        wallet.apply_update(fixture.funding_sync(false)).unwrap();
+        assert_eq!(
+            spendable_outpoint_count(&wallet, fixture.master_appkey),
+            0,
+            "the output is past the derived window, so nothing should have matched yet"
+        );
+
+        wallet.apply_update(fixture.reveal_sync(true)).unwrap();
+        fixture.assert_fully_spendable(&mut wallet, "after the reveal");
+    }
 
     #[test]
     fn wallet_descriptors_match_our_tweaking() {
