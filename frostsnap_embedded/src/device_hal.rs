@@ -88,10 +88,11 @@ pub trait FirmwareServices {
     fn firmware_digest(&self) -> Sha256Digest;
 
     /// Handle an `Upgrade`/`Challenge` coordinator message. `PrepareUpgrade`
-    /// stages an upgrade; `EnterUpgradeMode` takes over the serial links
-    /// (`enter_upgrade_mode`) and returns `ResetRequested`; `Challenge` returns a
-    /// `SignedChallenge` to forward. The sim impl stages nothing (its seeded
-    /// digest means no upgrade is ever offered) and signs no challenge.
+    /// stages an upgrade; `EnterUpgradeMode` takes over the serial links for
+    /// the image transfer and returns `ResetRequested`; `Challenge` returns a
+    /// `SignedChallenge` to forward. esp: real OTA + DS signing. Sim: a
+    /// RAM-only mirror that drains-and-discards the image and signs no
+    /// challenge — see `SimFirmware`'s module doc for its fidelity limits.
     fn handle<U, D>(
         &mut self,
         msg: &CoordinatorSendBody,

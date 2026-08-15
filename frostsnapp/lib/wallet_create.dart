@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:frostsnap/animated_gradient_card.dart';
+import 'package:frostsnap/contexts.dart';
 import 'package:frostsnap/device_action_fullscreen_dialog.dart';
 import 'package:frostsnap/device_action_upgrade.dart';
 import 'package:frostsnap/hex.dart';
@@ -42,7 +43,9 @@ class WalletCreateException implements Exception {
 }
 
 class WalletCreateForm {
-  BitcoinNetwork network = BitcoinNetwork.bitcoin;
+  WalletCreateForm({this.network = BitcoinNetwork.bitcoin});
+
+  BitcoinNetwork network;
   String? name;
 
   final Set<DeviceId> selectedDevices = <DeviceId>{};
@@ -86,7 +89,7 @@ final _host = Platform.isAndroid || Platform.isIOS ? 'phone' : 'computer';
 
 class WalletCreateController extends ChangeNotifier {
   WalletCreateStep _step = WalletCreateStep.values.first;
-  final WalletCreateForm _form = WalletCreateForm();
+  final WalletCreateForm _form;
   final _nameController = TextEditingController();
   String? _nameError;
   late final StreamSubscription _deviceListSub;
@@ -99,7 +102,9 @@ class WalletCreateController extends ChangeNotifier {
   FullscreenActionDialogController? _keygenController;
   AccessStructureRef? _asRef;
 
-  WalletCreateController() {
+  WalletCreateController({
+    BitcoinNetwork defaultNetwork = BitcoinNetwork.bitcoin,
+  }) : _form = WalletCreateForm(network: defaultNetwork) {
     {
       bool firstRun = true;
       _nameController.addListener(() {
@@ -706,7 +711,14 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
   @override
   void initState() {
     super.initState();
-    _controller = WalletCreateController();
+    // Non-subscribing read (FrostsnapContext never changes): the composition root decides the
+    // default network, keeping the sim/regtest branch out of this flow.
+    final defaultNetwork =
+        context
+            .getInheritedWidgetOfExactType<FrostsnapContext>()
+            ?.defaultNetwork ??
+        BitcoinNetwork.bitcoin;
+    _controller = WalletCreateController(defaultNetwork: defaultNetwork);
     _controller.addListener(() => mounted ? setState(() {}) : null);
   }
 
@@ -726,19 +738,24 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
 
   Widget buildWalletNameBody(BuildContext context) {
     return SliverToBoxAdapter(
-      child: TextField(
-        autofocus: true,
-        controller: _controller.nameController,
-        decoration: InputDecoration(
-          border: OutlineInputBorder(),
-          errorText: _controller.nameError,
+      // Accessible name for the field (screen readers + the sim-8 driver target it).
+      child: Semantics(
+        label: 'Wallet name',
+        textField: true,
+        child: TextField(
+          autofocus: true,
+          controller: _controller.nameController,
+          decoration: InputDecoration(
+            border: OutlineInputBorder(),
+            errorText: _controller.nameError,
+          ),
+          maxLength: keyNameMaxLength(),
+          inputFormatters: [nameInputFormatter],
+          textCapitalization: TextCapitalization.words,
+          onSubmitted: (_) {
+            _controller.next(context);
+          },
         ),
-        maxLength: keyNameMaxLength(),
-        inputFormatters: [nameInputFormatter],
-        textCapitalization: TextCapitalization.words,
-        onSubmitted: (_) {
-          _controller.next(context);
-        },
       ),
     );
   }
@@ -749,7 +766,7 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
     return MultiSliver(
       children: [
         SliverDeviceList(
-          deviceBuilder: (context, device) {
+          deviceBuilder: (context, device, index) {
             final cs = Theme.of(context).colorScheme;
 
             if (device.name != null) {
@@ -775,7 +792,7 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
             return device.firmwareUpgradeEligibility().when(
               upToDate: () => _deviceRow(
                 context: context,
-                title: _inlineNameField(context, device),
+                title: _inlineNameField(context, device, index),
                 // The name field it focuses is itself a Tab stop.
                 trailing: ExcludeFocusTraversal(
                   child: IconButton(
@@ -951,7 +968,11 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
   final Map<DeviceId, TextEditingController> _nameControllers = {};
   final Map<DeviceId, FocusNode> _nameFocusNodes = {};
 
-  Widget _inlineNameField(BuildContext context, ConnectedDevice device) {
+  Widget _inlineNameField(
+    BuildContext context,
+    ConnectedDevice device,
+    int index,
+  ) {
     final cs = Theme.of(context).colorScheme;
     final currentName = _controller.form.deviceNames[device.id] ?? '';
     final textController = _nameControllers.putIfAbsent(
@@ -959,23 +980,29 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
       () => TextEditingController(text: currentName),
     );
     final isDuplicate = _controller.duplicateNamedDeviceIds.contains(device.id);
-    return TextField(
-      controller: textController,
-      focusNode: _nameFocusNodes.putIfAbsent(device.id, () => FocusNode()),
-      style: monospaceTextStyle,
-      maxLength: DeviceName.maxLength(),
-      inputFormatters: [nameInputFormatter],
-      textCapitalization: TextCapitalization.sentences,
-      decoration: InputDecoration(
-        hintText: 'Enter device name',
-        hintStyle: monospaceTextStyle.copyWith(color: cs.onSurfaceVariant),
-        border: InputBorder.none,
-        isDense: true,
-        contentPadding: EdgeInsets.zero,
-        counterText: '',
-        errorText: isDuplicate ? 'Name already used in this wallet' : null,
+    // Accessible name for the field, numbered by position so screen readers and the
+    // sim driver can target each device's field unambiguously when several are listed.
+    return Semantics(
+      label: 'Device name ${index + 1}',
+      textField: true,
+      child: TextField(
+        controller: textController,
+        focusNode: _nameFocusNodes.putIfAbsent(device.id, () => FocusNode()),
+        style: monospaceTextStyle,
+        maxLength: DeviceName.maxLength(),
+        inputFormatters: [nameInputFormatter],
+        textCapitalization: TextCapitalization.sentences,
+        decoration: InputDecoration(
+          hintText: 'Enter device name',
+          hintStyle: monospaceTextStyle.copyWith(color: cs.onSurfaceVariant),
+          border: InputBorder.none,
+          isDense: true,
+          contentPadding: EdgeInsets.zero,
+          counterText: '',
+          errorText: isDuplicate ? 'Name already used in this wallet' : null,
+        ),
+        onChanged: (name) => _controller.setDeviceName(device.id, name),
       ),
-      onChanged: (name) => _controller.setDeviceName(device.id, name),
     );
   }
 

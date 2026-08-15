@@ -3,12 +3,52 @@ import 'package:flutter/services.dart';
 import 'package:frostsnap/src/rust/api.dart';
 import 'package:frostsnap/src/rust/api/coordinator.dart';
 import 'package:frostsnap/src/rust/api/device_list.dart';
+import 'package:frostsnap/settings.dart';
+import 'package:frostsnap/src/rust/api/settings.dart';
+import 'package:frostsnap/src/rust/api/sim.dart';
 import 'package:frostsnap/stream_ext.dart';
 import 'serialport.dart';
+
+/// Compile-time flag selecting the sim entrypoint (`api.loadSim`). Off by
+/// default; enable with `--dart-define=SIM=true`.
+const bool kSim = bool.fromEnvironment('SIM');
 
 late Coordinator coord;
 late Api api;
 late HostPortHandler? globalHostPortHandler;
+
+/// Set only on the SIM entrypoint; owns the virtual device thread and feeds the
+/// debug device tray. Null on a normal build.
+DevicePool? simDevicePool;
+
+/// The regtest electrs URL the harness wired in, set on the SIM entrypoint when a faucet backend is
+/// live. Its presence is the "regtest active" signal: new sim wallets default to Regtest (so faucet
+/// funds land) and the tray shows the faucet column. Null on a normal build or an offline sim.
+String? simRegtestElectrumUrl;
+
+/// The regtest electrs URL for the app's BACKUP slot — the harness's second front door. Present
+/// only when the harness wired up two servers; without it the sim keeps one server in both slots
+/// with only the primary enabled, exactly as before.
+String? simRegtestElectrumBackupUrl;
+
+/// Path to the `sim_regtest` faucet control socket, set alongside [simRegtestElectrumUrl]. The sim
+/// tray's "Test BTC" column drives the faucet (balance/mine/fund) over this socket via [SimFaucet].
+/// Null on a normal build or offline sim.
+String? simRegtestControlSocket;
+
+/// The app's [Settings], published on the SIM entrypoint so the harness's app channel can repoint
+/// electrum servers directly — driving the Edit Server dialog to move a url would test the dialog.
+/// Null on a normal build.
+///
+/// NOT for reading chain status: `subscribeChainStatus` installs a SINGLE-owner sink in the
+/// coordinator, so subscribing here would displace the UI's subscription and leave it deaf. Status
+/// is read through [simSettingsContext].
+Settings? simSettings;
+
+/// The live [SettingsContext] the UI is built with, published on the SIM entrypoint. It owns the
+/// one per-network chain-status subject, so the app channel and the UI observe the same stream
+/// and a harness read cannot cost the app its updates. Null on a normal build.
+SettingsContext? simSettingsContext;
 
 final nameInputFormatter = TextInputFormatter.withFunction((
   oldValue,
