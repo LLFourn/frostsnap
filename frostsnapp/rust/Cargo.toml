@@ -10,6 +10,9 @@ crate-type = ["cdylib", "staticlib"]
 anyhow = "1"
 frostsnap_coordinator = { workspace = true }
 frostsnap_core = { workspace = true }
+# SDL-free virtual device for the debug `load_sim()` entrypoint (compiled
+# unconditionally; the SIM entrypoint is selected at runtime via --dart-define).
+frostsnap_virtual_device = { path = "../../tools/virtual_device" }
 lazy_static = "1.4"
 tracing-subscriber = { version = "0.3" }
 tracing = { workspace = true, features = ["std"] }

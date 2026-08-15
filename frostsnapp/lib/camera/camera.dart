@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:frostsnap/global.dart';
+import 'package:frostsnap/sim_camera.dart';
 import 'package:frostsnap/src/rust/api/qr.dart';
 import 'package:frostsnap/src/rust/api/camera.dart' as camera;
 import 'camera_native.dart';
@@ -10,6 +12,11 @@ import 'frame_scanner.dart';
 export 'frame_scanner.dart' show FrameScanResult;
 
 LensBuilder _platformLens() {
+  // A virtual device has no camera, so the sim points the scanner at [simCameraScene].
+  // Only the lens is substituted — everything downstream of a frame is the real scanner.
+  if (kSim) {
+    return (onFrame) => SimCameraLens(onFrame: onFrame);
+  }
   if (Platform.isLinux || Platform.isWindows) {
     return (onFrame) => NativeCameraLens(onFrame: onFrame);
   }
