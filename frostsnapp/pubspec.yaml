@@ -69,6 +69,8 @@ dev_dependencies:
   flutter_lints: ^5.0.0
   integration_test:
     sdk: flutter
+  flutter_driver:
+    sdk: flutter
   icons_launcher: ^3.0.1
   flutter_native_splash: ^2.4.6
 
