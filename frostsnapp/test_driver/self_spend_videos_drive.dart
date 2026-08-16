@@ -8,15 +8,15 @@ import 'sim_harness.dart';
 // Films the device sign prompt's self-spend screens: four hand-built PSBTs — an
 // ordinary send (unchanged), a pure self-spend, a send that also pays one of our
 // own receive addresses, and a self-spend whose fee trips the proportional
-// high-fee warning (impossible before the self screen existed). Each signing is
+// high-fee warning (impossible before the self screen existed) — plus the app's
+// own Send flow paying the wallet's own receive address. Each signing is
 // sampled off the device framebuffer (device(1).screen) into
 // build/self-spend-videos/<scenario>/frame_*.png for ffmpeg assembly.
 //
 // The PSBTs are built node-level (createpsbt + descriptorprocesspsbt over the
-// wallet's own descriptor) rather than via the app's Send flow because the
-// app's builder marks every typed recipient foreign — only the PSBT path
-// classifies outputs by ownership, which is what puts local outputs in front
-// of the device.
+// wallet's own descriptor) for exact control of outputs and fee; the final
+// scenario goes through the Send flow itself, which classifies recipients the
+// wallet derives as Local since recognise-own-address.
 //
 // Run: `./fsim test self_spend_videos`.
 
@@ -76,6 +76,74 @@ class _ScreenSampler {
       await Future<void>.delayed(const Duration(milliseconds: 50));
     }
   }
+}
+
+/// Film device 1 signing: sample its framebuffer while [trigger] dispatches the
+/// sign request, walk the prompt at film pace, hold to sign, then broadcast and
+/// dismiss so the next scenario starts from the wallet home.
+Future<void> _filmSigning(
+  AppSession h,
+  SimFaucet faucet,
+  String name,
+  int pages,
+  Future<void> Function() trigger,
+) async {
+  final sampler = _ScreenSampler(h, Directory('build/self-spend-videos/$name'))
+    ..start();
+  try {
+    await trigger();
+
+    // Paced walkthrough for the film: settle on each page, then swipe.
+    await Future<void>.delayed(const Duration(seconds: 2));
+    for (var i = 0; i < pages - 1; i++) {
+      await h
+          .device(1)
+          .swipe(120, 240, 120, 80, const Duration(milliseconds: 250));
+      await Future<void>.delayed(const Duration(milliseconds: 1800));
+    }
+    await h
+        .device(1)
+        .holdConfirm(_confirmX, _confirmY, const Duration(milliseconds: 3400));
+    var ok = await h.exists(RegExp('Signed'));
+    for (var round = 0; round < 8 && !ok; round++) {
+      await h
+          .device(1)
+          .swipe(120, 240, 120, 80, const Duration(milliseconds: 250));
+      await h
+          .device(1)
+          .holdConfirm(
+            _confirmX,
+            _confirmY,
+            const Duration(milliseconds: 3400),
+          );
+      ok = await h.exists(RegExp('Signed'));
+    }
+    if (!ok) {
+      throw StateError('$name: the device never signed');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 800));
+  } finally {
+    await sampler.stop();
+  }
+
+  // Broadcasting keeps the wallet's activity truthful but isn't what's on
+  // film, and this sheet's labels vary by flow — so try, don't gate.
+  var canBroadcast = false;
+  for (var i = 0; i < 15 && !canBroadcast; i++) {
+    canBroadcast = await h.exists(RegExp('Broadcast'));
+    if (!canBroadcast) {
+      await Future<void>.delayed(const Duration(seconds: 1));
+    }
+  }
+  if (canBroadcast) {
+    await h.tap(RegExp('Broadcast'));
+    await Future<void>.delayed(const Duration(seconds: 2));
+    await faucet.mine(1);
+    await Future<void>.delayed(const Duration(seconds: 3));
+  }
+  await h.dismissSheetOrDialog();
+  await Future<void>.delayed(const Duration(seconds: 1));
+  stdout.writeln('SELF_SPEND_VIDEO_OK: $name');
 }
 
 Future<int> _voutOf(SimFaucet faucet, String txid, String address) async {
@@ -151,11 +219,11 @@ Future<void> main() async {
         final chgDesc = await _singleDescriptor(faucet, descriptor, 1);
         final changeAddr =
             ((await faucet.rpc('deriveaddresses', [
-                      chgDesc,
-                      [0, 0],
-                    ]))
-                    as List)
-                .single
+                          chgDesc,
+                          [0, 0],
+                        ]))
+                        as List)
+                    .single
                 as String;
         final foreignAddr = await faucet.faucetAddress();
 
@@ -219,76 +287,53 @@ Future<void> main() async {
           }
           await h.tapUntil('Scan', RegExp('Scan PSBT'));
 
-          final sampler = _ScreenSampler(
+          await _filmSigning(
             h,
-            Directory('build/self-spend-videos/${scenario.name}'),
-          )..start();
-          try {
-            await h.showPsbtQr(psbt);
-            // With the signer already plugged the app opens straight into the
-            // signing sheet, whose merged labels the driver finder can't wait
-            // on — so pace on time and let the Signed poll below synchronize.
-            await Future<void>.delayed(const Duration(seconds: 6));
-            await h.hideQr();
-
-            // Paced walkthrough for the film: settle on each page, then swipe.
-            await Future<void>.delayed(const Duration(seconds: 2));
-            for (var i = 0; i < scenario.pages - 1; i++) {
-              await h
-                  .device(1)
-                  .swipe(120, 240, 120, 80, const Duration(milliseconds: 250));
-              await Future<void>.delayed(const Duration(milliseconds: 1800));
-            }
-            await h
-                .device(1)
-                .holdConfirm(
-                  _confirmX,
-                  _confirmY,
-                  const Duration(milliseconds: 3400),
-                );
-            var ok = await h.exists(RegExp('Signed'));
-            for (var round = 0; round < 8 && !ok; round++) {
-              await h
-                  .device(1)
-                  .swipe(120, 240, 120, 80, const Duration(milliseconds: 250));
-              await h
-                  .device(1)
-                  .holdConfirm(
-                    _confirmX,
-                    _confirmY,
-                    const Duration(milliseconds: 3400),
-                  );
-              ok = await h.exists(RegExp('Signed'));
-            }
-            if (!ok) {
-              throw StateError('${scenario.name}: the device never signed');
-            }
-            await Future<void>.delayed(const Duration(milliseconds: 800));
-          } finally {
-            await sampler.stop();
-          }
-
-          // Broadcasting keeps the wallet's activity truthful but isn't what's
-          // on film, and this sheet's labels vary by flow — so try, don't gate.
-          var canBroadcast = false;
-          for (var i = 0; i < 15 && !canBroadcast; i++) {
-            canBroadcast = await h.exists(RegExp('Broadcast'));
-            if (!canBroadcast) {
-              await Future<void>.delayed(const Duration(seconds: 1));
-            }
-          }
-          if (canBroadcast) {
-            await h.tap(RegExp('Broadcast'));
-            await Future<void>.delayed(const Duration(seconds: 2));
-            await faucet.mine(1);
-            await Future<void>.delayed(const Duration(seconds: 3));
-          }
-          await h.dismissSheetOrDialog();
-          await Future<void>.delayed(const Duration(seconds: 1));
-          stdout.writeln('SELF_SPEND_VIDEO_OK: ${scenario.name}');
+            faucet,
+            scenario.name,
+            scenario.pages,
+            () async {
+              await h.showPsbtQr(psbt);
+              // With the signer already plugged the app opens straight into the
+              // signing sheet, whose merged labels the driver finder can't wait
+              // on — so pace on time and let the Signed poll synchronize.
+              await Future<void>.delayed(const Duration(seconds: 6));
+              await h.hideQr();
+            },
+          );
         }
 
-        stdout.writeln('SELF_SPEND_VIDEOS_DRIVE_OK: 4 scenarios filmed');
+        // The fifth film goes through the app's OWN Send flow: after
+        // recognise-own-address, a recipient the wallet derives is classified
+        // Local, so a send-max to our own receive address reaches the device
+        // as a pure self-spend.
+        await h.tap('Send');
+        await h.waitFor(
+          RegExp('Paste|Later'),
+          timeout: const Duration(seconds: 30),
+        );
+        if (await h.exists('Later')) await h.tap('Later');
+        await h.waitFor('Paste');
+        await h.enterFocusedText(address);
+        await h.tapUntil('Confirm recipient', RegExp('Send Max|Custom'));
+        if (await h.exists(RegExp('Custom'))) {
+          await h.tapUntil(RegExp('Custom'), 'Confirm');
+          await h.tap('Confirm');
+        }
+        await h.waitFor(RegExp('Send Max'));
+        await h.tap(RegExp('Send Max'));
+        await h.tapUntil('Confirm amount', RegExp('Select Signers'));
+        // 1-of-1 may arrive pre-selected; a tap would deselect it.
+        if (!await h.exists(RegExp('Sign transaction'))) {
+          await h.tap(RegExp('SimDev1'));
+        }
+        await h.waitFor(RegExp('Sign transaction'));
+        await _filmSigning(h, faucet, 'app-send-to-self', 3, () async {
+          await h.tap(RegExp('Sign transaction'));
+          await Future<void>.delayed(const Duration(seconds: 4));
+        });
+
+        stdout.writeln('SELF_SPEND_VIDEOS_DRIVE_OK: 5 scenarios filmed');
       } finally {
         await faucet.close();
       }

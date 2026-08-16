@@ -593,10 +593,28 @@ impl CoordSuperWallet {
         }
 
         for txo in target_outputs {
-            template_tx.push_foreign_output(txo);
+            match self.local_spk(master_appkey, txo.script_pubkey.clone()) {
+                Some(owner) => template_tx.push_owned_output(txo.value, owner),
+                None => template_tx.push_foreign_output(txo),
+            }
         }
 
         Ok(template_tx)
+    }
+
+    /// The signing wallet's own view of `spk`: `Some` iff `master_appkey` itself derives
+    /// it. An spk another tracked wallet derives is still foreign HERE — stamping this
+    /// wallet's appkey on someone else's derivation path would make the template's
+    /// output spk diverge from the real one.
+    fn local_spk(&self, master_appkey: MasterAppkey, spk: bitcoin::ScriptBuf) -> Option<LocalSpk> {
+        let &((owner, account_keychain), index) = self.tx_graph.index.index_of_spk(spk)?;
+        (owner == master_appkey).then_some(LocalSpk {
+            master_appkey,
+            bip32_path: BitcoinBip32Path {
+                account_keychain,
+                index,
+            },
+        })
     }
 
     pub fn calculate_avaliable_value(
@@ -959,5 +977,123 @@ mod test {
                 xonly.into()
             )),
         );
+    }
+
+    #[test]
+    fn send_to_classifies_recipients_we_own() {
+        use crate::bitcoin::chain_sync::{ChainClient, ElectrumConfig};
+        use crate::bitcoin::tofu::trusted_certs::TrustedCertificates;
+        use crate::persist::Persisted;
+        use crate::settings::ElectrumEnabled;
+        use bitcoin::hashes::Hash;
+        use frostsnap_core::tweak::Keychain;
+        use std::sync::{Arc, Mutex};
+
+        let network = bitcoin::Network::Regtest;
+        let db = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+        let trusted =
+            Persisted::<TrustedCertificates>::new(&mut *db.lock().unwrap(), network).unwrap();
+        let (chain_client, _conn_handler) = ChainClient::new(
+            bitcoin::constants::genesis_block(network).block_hash(),
+            ElectrumConfig {
+                enabled: ElectrumEnabled::None,
+                primary: String::new(),
+                backup: String::new(),
+            },
+            trusted,
+            db.clone(),
+        );
+        let mut wallet = CoordSuperWallet::load_or_init(db.clone(), network, chain_client).unwrap();
+
+        let master_appkey =
+            MasterAppkey::derive_from_rootkey(Point::random(&mut rand::thread_rng()));
+        wallet.lazily_initialize_key(master_appkey);
+
+        let (_index, own_spk) = wallet
+            .tx_graph
+            .mutate(&mut *db.lock().unwrap(), |g| {
+                Ok(g.index
+                    .next_unused_spk((master_appkey, BitcoinAccountKeychain::external()))
+                    .expect("key was initialized"))
+            })
+            .unwrap();
+
+        let funding = bitcoin::Transaction {
+            version: bitcoin::blockdata::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::all_zeros(),
+                    vout: 0,
+                },
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: own_spk.clone(),
+            }],
+        };
+        let txid = funding.compute_txid();
+        wallet
+            .tx_graph
+            .mutate(&mut *db.lock().unwrap(), |g| Ok(((), g.insert_tx(funding))))
+            .unwrap();
+        wallet
+            .tx_graph
+            .mutate(&mut *db.lock().unwrap(), |g| {
+                Ok(((), g.insert_seen_at(txid, 1)))
+            })
+            .unwrap();
+
+        let foreign_spk = {
+            let point = Point::random(&mut rand::thread_rng());
+            let xonly = bitcoin::XOnlyPublicKey::from_slice(&point.to_xonly_bytes()).unwrap();
+            bitcoin::ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(xonly))
+        };
+        let own_address = bitcoin::Address::from_script(&own_spk, network).unwrap();
+        let foreign_address = bitcoin::Address::from_script(&foreign_spk, network).unwrap();
+
+        let template = wallet
+            .send_to(
+                master_appkey,
+                [
+                    (own_address, Some(300_000)),
+                    (foreign_address, Some(200_000)),
+                ],
+                1.0,
+            )
+            .unwrap();
+
+        let own_output = template
+            .outputs()
+            .iter()
+            .find(|o| o.owner.spk() == own_spk)
+            .expect("an output pays our own address");
+        let local = own_output
+            .owner
+            .local_owner()
+            .expect("our own address must be classified Local");
+        assert_eq!(local.master_appkey, master_appkey);
+        assert_eq!(
+            local.bip32_path.account_keychain.keychain,
+            Keychain::External
+        );
+        assert_eq!(own_output.value, 300_000);
+
+        let foreign_output = template
+            .outputs()
+            .iter()
+            .find(|o| o.owner.spk() == foreign_spk)
+            .expect("an output pays the foreign address");
+        assert!(foreign_output.owner.local_owner().is_none());
+
+        let other_appkey =
+            MasterAppkey::derive_from_rootkey(Point::random(&mut rand::thread_rng()));
+        wallet.lazily_initialize_key(other_appkey);
+        assert!(
+            wallet.local_spk(other_appkey, own_spk.clone()).is_none(),
+            "another wallet's key must not claim an spk it does not derive"
+        );
+        assert!(wallet.local_spk(master_appkey, own_spk).is_some());
     }
 }
