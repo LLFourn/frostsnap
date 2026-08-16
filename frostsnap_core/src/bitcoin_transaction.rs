@@ -9,7 +9,7 @@ use bitcoin::{
 };
 
 use crate::{
-    tweak::{AppTweak, BitcoinBip32Path},
+    tweak::{AppTweak, BitcoinBip32Path, Keychain},
     MasterAppkey,
 };
 
@@ -316,8 +316,34 @@ impl TransactionTemplate {
         // Calculate fee rate in sats/vB
         let fee_rate_sats_per_vbyte = self.feerate();
 
+        let mut change_sats: Vec<u64> = Vec::new();
+        let mut to_self_sats: Vec<u64> = Vec::new();
+        for (_, output, local) in self.iter_locally_owned_outputs() {
+            match local.bip32_path.account_keychain.keychain {
+                Keychain::Internal => change_sats.push(output.value),
+                Keychain::External => to_self_sats.push(output.value),
+            }
+        }
+        // A single change output alongside a foreign recipient is the shape of an
+        // ordinary send; disclosing it would train users to skim past the self
+        // screen. Any other local output — or more than one change output — is
+        // value returning to us that the signer must be shown.
+        if !foreign_recipients.is_empty() && change_sats.len() == 1 {
+            change_sats.clear();
+        }
+        let self_payment =
+            if foreign_recipients.is_empty() || !to_self_sats.is_empty() || !change_sats.is_empty()
+            {
+                Some(bitcoin::Amount::from_sat(
+                    to_self_sats.iter().chain(change_sats.iter()).sum(),
+                ))
+            } else {
+                None
+            };
+
         PromptSignBitcoinTx {
             foreign_recipients,
+            self_payment,
             fee,
             fee_rate_sats_per_vbyte,
         }
@@ -327,6 +353,10 @@ impl TransactionTemplate {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PromptSignBitcoinTx {
     pub foreign_recipients: Vec<(bitcoin::Address, bitcoin::Amount)>,
+    /// Value paid back to the signing wallet that the prompt must disclose.
+    /// `None` only when the sole local output is the single change output of an
+    /// ordinary send.
+    pub self_payment: Option<bitcoin::Amount>,
     pub fee: bitcoin::Amount,
     /// Fee rate in sats/vB
     pub fee_rate_sats_per_vbyte: Option<f64>,
@@ -339,6 +369,13 @@ impl PromptSignBitcoinTx {
             .iter()
             .map(|(_, amount)| *amount)
             .sum()
+    }
+
+    /// Total value the prompt itemises as moving: foreign recipients plus any
+    /// disclosed self payment. The proportional high-fee warning is measured
+    /// against this.
+    pub fn value_moved(&self) -> bitcoin::Amount {
+        self.total_sent() + self.self_payment.unwrap_or(bitcoin::Amount::ZERO)
     }
 }
 

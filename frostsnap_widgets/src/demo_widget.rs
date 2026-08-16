@@ -468,7 +468,8 @@ macro_rules! demo_widget {
                         (p2sh_address, bitcoin::Amount::from_sat(400_000)),   // 0.004 BTC
                         (p2pkh_address, bitcoin::Amount::from_sat(500_000)),  // 0.005 BTC
                     ],
-                    fee: bitcoin::Amount::from_sat(80_000), // 0.00080 BTC (>5% fee triggers warning)
+                    self_payment: Some(bitcoin::Amount::from_sat(150_000)),
+                    fee: bitcoin::Amount::from_sat(90_000), // >5% of the value moved, so the warning page shows
                     fee_rate_sats_per_vbyte: Some(12.5), // Example: 12.5 sats/vB fee rate
                 };
 

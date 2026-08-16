@@ -9,7 +9,11 @@ use crate::{
     widget_list::{WidgetList, WidgetListItem},
     GrayToAlpha, HoldToConfirm, Image,
 };
-use alloc::{boxed::Box, format, string::ToString};
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+};
 use embedded_graphics::{
     geometry::Size,
     pixelcolor::{Gray8, Rgb565},
@@ -55,8 +59,17 @@ pub struct AmountPage {
 impl AmountPage {
     #[inline(never)]
     pub fn new(index: usize, amount_sats: u64) -> Self {
+        Self::with_title(format!("Send Amount #{}", index + 1), amount_sats)
+    }
+
+    #[inline(never)]
+    pub fn new_self_payment(amount_sats: u64) -> Self {
+        Self::with_title("To This Wallet".to_string(), amount_sats)
+    }
+
+    fn with_title(title: String, amount_sats: u64) -> Self {
         let title = Text::new(
-            format!("Send Amount #{}", index + 1),
+            title,
             Gray4TextStyle::new(FONT_PAGE_HEADER, PALETTE.text_secondary),
         );
 
@@ -174,7 +187,7 @@ pub struct WarningPage {
 
 impl WarningPage {
     #[inline(never)]
-    fn new(fee_sats: u64, _total_sent: u64) -> Self {
+    fn new(fee_sats: u64) -> Self {
         let warning_bmp =
             Bmp::<Gray8>::from_slice(WARNING_ICON_DATA).expect("Failed to load warning icon BMP");
         let warning_icon = Image::new(GrayToAlpha::new(warning_bmp, PALETTE.warning));
@@ -201,8 +214,8 @@ impl WarningPage {
             ("Fee is greater".to_string(), "than 0.001 BTC".to_string())
         } else {
             (
-                "Fee exceeds 5% of the".to_string(),
-                "amount being sent".to_string(),
+                "Fee exceeds 5% of".to_string(),
+                "the value moved".to_string(),
             )
         };
 
@@ -289,11 +302,12 @@ type SignPromptPage = AnyOf<(
 )>;
 
 impl SignPromptPageList {
-    fn new_with_seed(prompt: PromptSignBitcoinTx, rand_seed: u32) -> Self {
+    pub fn new_with_seed(prompt: PromptSignBitcoinTx, rand_seed: u32) -> Self {
         let num_recipients = prompt.foreign_recipients.len();
+        let has_self = prompt.self_payment.is_some();
         let has_warning = Self::has_high_fee(&prompt);
 
-        let total_pages = num_recipients * 2 + 1 + if has_warning { 1 } else { 0 } + 1;
+        let total_pages = num_recipients * 2 + has_self as usize + has_warning as usize + 2;
 
         Self {
             prompt,
@@ -309,16 +323,8 @@ impl SignPromptPageList {
             return true;
         }
 
-        let total_sent: u64 = prompt
-            .foreign_recipients
-            .iter()
-            .map(|(_, amount)| amount.to_sat())
-            .sum();
-        if total_sent > 0 && fee_sats > total_sent * HIGH_FEE_PERCENTAGE_THRESHOLD / 100 {
-            return true;
-        }
-
-        false
+        let moved_sats = prompt.value_moved().to_sat();
+        moved_sats > 0 && fee_sats > moved_sats * HIGH_FEE_PERCENTAGE_THRESHOLD / 100
     }
 }
 
@@ -337,6 +343,11 @@ impl WidgetList for SignPromptPageList {
         let num_recipients = self.prompt.foreign_recipients.len();
         let recipient_pages = num_recipients * 2;
         let has_warning = Self::has_high_fee(&self.prompt);
+
+        let self_page = self.prompt.self_payment.map(|_| recipient_pages);
+        let after_self = recipient_pages + self_page.is_some() as usize;
+        let warning_page = if has_warning { Some(after_self) } else { None };
+        let fee_page = after_self + has_warning as usize;
 
         let (page, use_fb) = if index < recipient_pages {
             let recipient_idx = index / 2;
@@ -359,20 +370,18 @@ impl WidgetList for SignPromptPageList {
                     true,
                 )
             }
-        } else if has_warning && index == recipient_pages {
-            let total_sent: u64 = self
-                .prompt
-                .foreign_recipients
-                .iter()
-                .map(|(_, amount)| amount.to_sat())
-                .sum();
+        } else if Some(index) == self_page {
+            let self_payment = self.prompt.self_payment.expect("self page exists");
             (
-                SignPromptPage::new(WarningPage::new(self.prompt.fee.to_sat(), total_sent)),
+                SignPromptPage::new(AmountPage::new_self_payment(self_payment.to_sat())),
                 false,
             )
-        } else if (has_warning && index == recipient_pages + 1)
-            || (!has_warning && index == recipient_pages)
-        {
+        } else if Some(index) == warning_page {
+            (
+                SignPromptPage::new(WarningPage::new(self.prompt.fee.to_sat())),
+                false,
+            )
+        } else if index == fee_page {
             (
                 SignPromptPage::new(FeePage::new(
                     self.prompt.fee.to_sat(),
