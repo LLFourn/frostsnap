@@ -1066,6 +1066,32 @@ mod test {
         assert!(err.to_string().contains("not enough"), "got: {err}");
     }
 
+    /// The other refusal: the coins cover the fee and what is left is under the dust floor.
+    /// Separate from the case above because both share one message, and that one passes with
+    /// the floor deleted.
+    #[test]
+    fn consolidation_refuses_a_dust_change_output() {
+        let mut f = Fixture::new();
+        f.fund(0, 1_000_000, 100);
+        // 1_400 covers the 1_110 sat fee and leaves 290: a real output, below the relay floor.
+        f.fund(21, 1_400, 101);
+        assert_eq!(f.wallet.gap_stranded_value(f.master_appkey), (1, 1_400));
+
+        let err = f
+            .wallet
+            .plan_consolidate(f.master_appkey, 10.0)
+            .expect_err("290 sats of change is dust");
+        assert!(err.to_string().contains("not enough"), "got: {err}");
+
+        // Same coin, same fee, enough left over: the refusal above was the floor and not a
+        // shortfall.
+        let mut f = Fixture::new();
+        f.fund(0, 1_000_000, 100);
+        f.fund(21, 1_600, 101);
+        let plan = f.wallet.plan_consolidate(f.master_appkey, 10.0).unwrap();
+        assert_eq!(plan.change_value, Some(490));
+    }
+
     /// Committing flows through the ordinary change allocation, and broadcasting the result is
     /// the remedy the nudge promised: the stranded set empties.
     #[test]
@@ -1366,5 +1392,30 @@ mod test {
         let fresh = f.plan(10_000);
         f.wallet.commit_send(&fresh, []).unwrap();
         assert_eq!(f.last_revealed_internal(), Some(0));
+    }
+
+    /// The asymmetry's obligation: the indexer reaches a frontier the server was never asked
+    /// about, so a local reveal has to become a subscription or the coin is spendable while its
+    /// own spend goes unseen.
+    #[test]
+    fn a_frontier_reached_locally_is_pushed_to_the_chain_source() {
+        use bdk_electrum_streaming::ClientAction;
+
+        let mut f = Fixture::new();
+        // Past SUBSCRIPTION_LOOKAHEAD, so only a fresh track_descriptor can cover it.
+        let far = 400;
+        f.fund_keychain(BitcoinAccountKeychain::internal(), far, 60_000, 100);
+
+        let mut widest = None;
+        while let Ok(action) = f._handler.client_recv.try_recv() {
+            if let ClientAction::AddDescriptor { next_index, .. } = action {
+                widest = Some(widest.map_or(next_index, |w: u32| w.max(next_index)));
+            }
+        }
+
+        assert!(
+            widest.is_some_and(|w| w > far),
+            "the chain source must be told to look past {far}, got {widest:?}"
+        );
     }
 }
