@@ -118,6 +118,16 @@ impl WordSelector {
             shown_at: None,
         }
     }
+
+    /// Centroid of the probe points hit-testing to `word`'s button, in
+    /// selector-local coordinates — scanned from the selector's own layout
+    /// (its inner columns: the appearance grace gates real touches, not
+    /// geometry). Requires constraints to be set.
+    pub fn word_point(&mut self, word: &str) -> Option<Point> {
+        use crate::DynWidget;
+        self.columns
+            .key_probe_centroid(|k| matches!(k, crate::Key::WordSelector(w) if w == word))
+    }
 }
 
 impl crate::DynWidget for WordSelector {

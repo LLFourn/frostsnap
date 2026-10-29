@@ -1,0 +1,16 @@
+# Strip DWARF from DEBUG builds of this crate's .so.
+#
+# Why: since the Android build moved to uncompressed/16 KB-aligned native libs
+# (useLegacyPackaging=false, AGP's mergeNativeLibs), an *oversized* debug .so gets
+# truncated into a broken ELF — the section-header offset is left pointing past EOF, so
+# the app can't dlopen it ("invalid shdr offset/size"). Our debug .so carries ~375 MB of
+# DWARF, which trips this. Stripping debug info keeps the packaged .so small and valid.
+#
+# Scope: this file is per-crate, so the riscv32 firmware crates (device, cst816s) are
+# untouched and keep their debug info for gdb/jtag. Limited to `debug` so RELEASE builds
+# (playstore/direct production) keep full symbols for crash symbolication.
+cargo:
+  debug:
+    extra_flags:
+      - "--config"
+      - 'profile.dev.strip="debuginfo"'

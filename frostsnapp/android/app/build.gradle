@@ -5,10 +5,36 @@ plugins {
     id "dev.flutter.flutter-gradle-plugin"
 }
 
+def getFlutterDartDefine = { String name ->
+    def encodedDefines = project.findProperty('dart-defines')
+    if (encodedDefines == null) {
+        return null
+    }
+
+    for (def encodedDefine : encodedDefines.toString().split(',')) {
+        if (encodedDefine.isEmpty()) {
+            continue
+        }
+
+        def decodedDefine = new String(java.util.Base64.getDecoder().decode(encodedDefine), 'UTF-8')
+        def parts = decodedDefine.split('=', 2)
+        if (parts.length == 2 && parts[0] == name) {
+            return parts[1]
+        }
+    }
+
+    return null
+}
+def frostsnapSimBuild = getFlutterDartDefine('SIM') == 'true'
+
 android {
     namespace = "com.frostsnap"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
+
+    buildFeatures {
+        buildConfig = true
+    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -27,6 +53,7 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        buildConfigField "boolean", "FROSTSNAP_SIM", frostsnapSimBuild.toString()
 
         // Support for 16 KB page sizes (required for Android 15+ devices starting Nov 2025)
         ndk {
