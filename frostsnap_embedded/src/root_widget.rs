@@ -28,6 +28,10 @@ impl RootWidget {
     pub fn current_mut(&mut self) -> &mut WidgetTree {
         self.page_switcher.current_mut()
     }
+
+    pub fn current(&self) -> &WidgetTree {
+        self.page_switcher.current()
+    }
 }
 
 impl DynWidget for RootWidget {

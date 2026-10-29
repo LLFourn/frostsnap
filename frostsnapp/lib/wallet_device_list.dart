@@ -4,7 +4,8 @@ import 'package:frostsnap/global.dart';
 import 'package:frostsnap/src/rust/api/device_list.dart';
 import 'package:sliver_tools/sliver_tools.dart';
 
-typedef DeviceBuilder = Widget Function(BuildContext, ConnectedDevice);
+typedef DeviceBuilder =
+    Widget Function(BuildContext, ConnectedDevice, int index);
 
 /// Animated sliver rendering the devices described by [updates], which defaults to
 /// [GlobalStreams.deviceListSubject].
@@ -66,7 +67,8 @@ class _SliverDeviceListState extends State<SliverDeviceList> {
           final removed = devices.removeAt(change.index);
           listState?.removeItem(
             change.index,
-            (context, animation) => _buildItem(context, removed, animation),
+            (context, animation) =>
+                _buildItem(context, removed, change.index, animation),
           );
         case DeviceListChangeKind.named:
         case DeviceListChangeKind.recoveryMode:
@@ -88,7 +90,7 @@ class _SliverDeviceListState extends State<SliverDeviceList> {
           key: _listKey,
           initialItemCount: devices.length,
           itemBuilder: (context, index, animation) =>
-              _buildItem(context, devices[index], animation),
+              _buildItem(context, devices[index], index, animation),
         ),
         if (devices.isEmpty && widget.noDeviceWidget != null)
           SliverToBoxAdapter(child: widget.noDeviceWidget),
@@ -99,11 +101,12 @@ class _SliverDeviceListState extends State<SliverDeviceList> {
   Widget _buildItem(
     BuildContext context,
     ConnectedDevice device,
+    int index,
     Animation<double> animation,
   ) => SizeTransition(
     sizeFactor: animation.drive(
       CurveTween(curve: Curves.easeInOutCubicEmphasized),
     ),
-    child: widget.deviceBuilder(context, device),
+    child: widget.deviceBuilder(context, device, index),
   );
 }

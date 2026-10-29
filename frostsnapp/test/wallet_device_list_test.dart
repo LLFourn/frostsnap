@@ -59,14 +59,12 @@ Widget harness(Stream<DeviceListUpdate> updates) => MaterialApp(
     slivers: [
       SliverDeviceList(
         updates: updates,
-        deviceBuilder: (context, d) => SizedBox(
+        deviceBuilder: (context, d, _) => SizedBox(
           height: 50,
-          child: Text(
-            switch (d.genuine) {
-              GenuineStatus_Genuine() => '${d.name} genuine',
-              GenuineStatus_Unverified() => d.name!,
-            },
-          ),
+          child: Text(switch (d.genuine) {
+            GenuineStatus_Genuine() => '${d.name} genuine',
+            GenuineStatus_Unverified() => d.name!,
+          }),
         ),
         noDeviceWidget: const Text('none'),
       ),
@@ -168,9 +166,10 @@ void main() {
 
     final verified = device(2, 'B', genuine: genuine);
     updates.add(
-      update([a, verified], [
-        change(DeviceListChangeKind.refreshed, 1, verified),
-      ]),
+      update(
+        [a, verified],
+        [change(DeviceListChangeKind.refreshed, 1, verified)],
+      ),
     );
     await tester.pump();
     await tester.pump();
