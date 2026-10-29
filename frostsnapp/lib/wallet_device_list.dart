@@ -5,7 +5,8 @@ import 'global.dart';
 
 typedef OnDeviceListChange = Function(DeviceListState);
 
-typedef DeviceBuilder = Widget Function(BuildContext, ConnectedDevice);
+typedef DeviceBuilder =
+    Widget Function(BuildContext, ConnectedDevice, int index);
 
 class SliverDeviceList extends StatefulWidget {
   final OnDeviceListChange? onDeviceListChange;
@@ -89,7 +90,7 @@ class _SliverDeviceListState extends State<SliverDeviceList> {
       ),
       child: device == null
           ? SizedBox()
-          : widget.deviceBuilder(context, device),
+          : widget.deviceBuilder(context, device, index),
     );
   }
 }

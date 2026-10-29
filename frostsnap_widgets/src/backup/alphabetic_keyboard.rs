@@ -124,6 +124,29 @@ impl AlphabeticKeyboard {
             self.needs_redraw = true;
         }
     }
+
+    /// Full rendered height of the letter grid; the scroll range is
+    /// `content_height() - viewport_height` (clamped in [`Self::scroll`]).
+    pub fn content_height() -> u32 {
+        FRAMEBUFFER_HEIGHT
+    }
+
+    /// Center of `letter`'s key at the given scroll offset, in keyboard-local
+    /// coordinates — the same grid math [`Self::handle_touch`] inverts. `None`
+    /// for non-letters; ignores enablement and visibility (callers pick a
+    /// scroll that brings the key into view).
+    pub fn letter_point(letter: char, scroll: i32) -> Option<Point> {
+        let idx = (letter as u32).wrapping_sub('A' as u32) as usize;
+        if idx >= NUM_LETTERS {
+            return None;
+        }
+        let row = idx / TOTAL_COLS;
+        let col = idx % TOTAL_COLS;
+        Some(Point::new(
+            col as i32 * KEY_WIDTH as i32 + KEY_WIDTH as i32 / 2,
+            row as i32 * KEY_HEIGHT as i32 + KEY_HEIGHT as i32 / 2 - scroll,
+        ))
+    }
 }
 
 impl crate::DynWidget for AlphabeticKeyboard {

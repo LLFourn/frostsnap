@@ -498,6 +498,32 @@ impl BackupDisplay {
         false
     }
 
+    /// The current page index (0 = key number, last = hold-to-confirm).
+    pub fn current_page(&self) -> usize {
+        self.page_slider.current_index()
+    }
+
+    /// Center of the confirmation page's hold-to-confirm button on a
+    /// `screen`-sized display — probed from the page's own hit-testing (the
+    /// layout is content-independent, so instruments can plan the hold
+    /// without a live display). Screen coordinates.
+    pub fn confirm_point(screen: Size) -> Option<Point> {
+        let mut page = BackupConfirmationScreen::new();
+        page.set_constraints(screen);
+        page.hold_confirm.button_probe_centroid()
+    }
+
+    /// A vertical swipe (start → end, screen coordinates) that advances the
+    /// paged display: an up-drag well past the slider's threshold, kept
+    /// inside the page area.
+    pub fn page_advance_swipe(screen: Size) -> (Point, Point) {
+        let x = screen.width as i32 / 2;
+        (
+            Point::new(x, screen.height as i32 * 3 / 4),
+            Point::new(x, screen.height as i32 / 4),
+        )
+    }
+
     pub fn is_finished(&mut self) -> bool {
         if self.page_slider.current_index() == self.page_slider.total_pages() - 1 {
             let current_widget = self.page_slider.current_widget();
