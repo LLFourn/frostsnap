@@ -1,0 +1,56 @@
+name: Sim E2E
+
+# Manual-only: the suite takes ~12-14 min warm, so it is not part of every PR's checks. Trigger it
+# from the Actions tab (or `gh workflow run sim-e2e.yml --ref <branch>`) once the workflow is on the
+# default branch.
+on:
+  workflow_dispatch:
+
+jobs:
+  sim-e2e:
+    name: Sim e2e tests (Linux host)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@just
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version-file: frostsnapp/.fvmrc
+          cache: true
+      - uses: ./.github/actions/fetch-cargo-deps
+      - uses: ./.github/actions/fetch-dart-deps
+      - uses: ./.github/actions/generate-frb
+      - uses: ./.github/actions/install-cargo-bins
+      # Debug profile: the sim app + sim_regtest build --debug (electrsd's downloaded bitcoind/electrs
+      # land under target/debug too).
+      - uses: ./.github/actions/cache-rust-target
+        with:
+          key: "sim-e2e-v0"
+          path: |
+            target/debug
+      - name: APT install dependencies (GTK, Xvfb, software GL)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libstdc++-12-dev libgtk-3-0 libgtk-3-dev cmake clang xvfb libgl1-mesa-dri
+      # The tests drive the app via FlutterDriver semantics, so a virtual framebuffer with software GL is
+      # all the "display" they need. fsim builds the debug sim app + sim_regtest itself; --jobs 2 for the
+      # 4-vCPU runner. No --retries: a failure is a failure (fsim default).
+      - name: Run sim e2e suite
+        working-directory: frostsnapp
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: xvfb-run -a -s "-screen 0 1920x1080x24" dart run test_driver/fsim.dart test --jobs 2 --junit sim-junit.xml
+      - name: Upload JUnit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-junit
+          path: frostsnapp/sim-junit.xml
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-failures
+          path: frostsnapp/build/sim-failures/
