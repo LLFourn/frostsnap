@@ -1,0 +1,48 @@
+# A Linux VM on a Mac for repro's local Linux builds. The VM is only a
+# container host: the build itself runs in the pinned image (run.sh), as
+# it does on CI. Rosetta lets the same VM run the x86_64 image too.
+#
+#   limactl start --name=repro-a --cpus=4 tools/repro/linux/lima.yaml
+#
+# Give a second VM a different identity, to stand in for a second machine:
+#   limactl start --name=repro-b --cpus=6 --memory=10 \
+#     --set '.user.name="builder" | .param.TZ="Asia/Tokyo" | .param.LOCALE="de_DE.UTF-8"' \
+#     tools/repro/linux/lima.yaml
+#   limactl shell repro-a -- tools/repro/linux/run.sh [--platform linux/amd64] /tmp/lima/work -- \
+#     build linux --commit HEAD --env dev --unsigned-firmware \
+#     --firmware /tmp/lima/work/fw.bin --out /tmp/lima/work/out
+#   limactl stop repro-a
+vmType: vz
+vmOpts:
+  vz:
+    rosetta:
+      enabled: true
+      binfmt: true
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+cpus: 4
+memory: "8GiB"
+disk: "40GiB"
+mounts:
+  - location: "~"
+    writable: false
+  - location: "/tmp/lima"
+    writable: true
+param:
+  TZ: "Australia/Sydney"
+  LOCALE: "en_AU.UTF-8"
+containerd:
+  system: false
+  user: false
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      timedatectl set-timezone "{{.Param.TZ}}"
+      locale-gen "{{.Param.LOCALE}}"
+      update-locale LANG="{{.Param.LOCALE}}"
+      apt-get update
+      apt-get install -y docker.io
+      usermod -aG docker "{{.User}}"

@@ -1,0 +1,57 @@
+# Two clean builds of the Linux app on separate runners, compared byte for
+# byte (tools/repro/README.md).
+#
+# Kept here so it cannot run until it is deliberately copied to
+# .github/workflows/.
+#
+# Each build runs tools/repro/linux/run.sh, the same script the local VMs
+# run: the container image pinned in tools/repro/repro.toml, with every apt
+# package from the config's archive snapshot. The tool refuses to build
+# unless the OS and the whole installed package set match the pins.
+name: Linux reproducibility
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [repro-ci-experiment]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2]
+    name: build (run-${{ matrix.run }})
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # BUILD_VERSION is `git describe --tags`.
+          fetch-depth: 0
+      - name: Fetch the release tags
+        # Forks don't carry them, and `git describe` must match a local build.
+        run: git fetch --quiet --tags --force https://github.com/frostsnap/frostsnap.git
+      - name: Placeholder firmware
+        run: head -c 1048576 /dev/zero | LC_ALL=C tr '\0' 'F' > "$RUNNER_TEMP/firmware.bin"
+      - name: Build the app in the pinned image
+        run: >-
+          tools/repro/linux/run.sh "$RUNNER_TEMP" -- build linux --commit "$(git rev-parse HEAD)"
+          --env dev --unsigned-firmware --firmware "$RUNNER_TEMP/firmware.bin" --out "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-repro-run-${{ matrix.run }}
+          path: ${{ runner.temp }}/out
+
+  compare:
+    needs: build
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+      - name: Compare manifests
+        run: cargo run --locked --release --manifest-path tools/repro/Cargo.toml -- compare out/linux-repro-run-1/manifest out/linux-repro-run-2/manifest

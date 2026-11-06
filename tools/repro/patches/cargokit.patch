@@ -1,0 +1,134 @@
+--- a/frostsnapp/rust_builder/cargokit/build_tool/lib/src/artifacts_provider.dart	2026-10-28 14:51:21
++++ b/frostsnapp/rust_builder/cargokit/build_tool/lib/src/artifacts_provider.dart	2026-10-28 14:51:31
+@@ -12,7 +12,6 @@
+ import 'crate_hash.dart';
+ import 'options.dart';
+ import 'precompile_binaries.dart';
+-import 'rustup.dart';
+ import 'target.dart';
+ 
+ class Artifact {
+@@ -63,10 +62,8 @@
+       return result;
+     }
+ 
+-    final rustup = Rustup();
+     for (final target in targets) {
+       final builder = RustBuilder(target: target, environment: environment);
+-      builder.prepare(rustup);
+       _log.info('Building ${environment.crateInfo.packageName} for $target');
+       final targetDir = await builder.build();
+       // For local build accept both static and dynamic libraries.
+--- a/frostsnapp/rust_builder/cargokit/build_tool/lib/src/builder.dart	2026-10-28 14:51:21
++++ b/frostsnapp/rust_builder/cargokit/build_tool/lib/src/builder.dart	2026-10-28 14:51:21
+@@ -140,11 +140,8 @@
+     final extraArgs = _buildOptions?.flags ?? [];
+     final manifestPath = path.join(environment.manifestDir, 'Cargo.toml');
+     runCommand(
+-      'rustup',
++      'cargo',
+       [
+-        'run',
+-        _toolchain,
+-        'cargo',
+         'build',
+         ...extraArgs,
+         '--manifest-path',
+--- a/frostsnapp/rust_builder/cargokit/run_build_tool.sh	2026-11-05 17:57:11
++++ b/frostsnapp/rust_builder/cargokit/run_build_tool.sh	2026-11-05 17:57:11
+@@ -3,15 +3,6 @@
+ set -e
+ 
+ BASEDIR=$(dirname "$0")
+-
+-mkdir -p "$CARGOKIT_TOOL_TEMP_DIR"
+-
+-cd "$CARGOKIT_TOOL_TEMP_DIR"
+-
+-# Write a very simple bin package in temp folder that depends on build_tool package
+-# from Cargokit. This is done to ensure that we don't pollute Cargokit folder
+-# with .dart_tool contents.
+-
+ BUILD_TOOL_PKG_DIR="$BASEDIR/build_tool"
+ 
+ if [[ -z $FLUTTER_ROOT ]]; then # not defined
+@@ -20,75 +11,7 @@
+   DART="$FLUTTER_ROOT/bin/cache/dart-sdk/bin/dart"
+ fi
+ 
+-cat << EOF > "pubspec.yaml"
+-name: build_tool_runner
+-version: 1.0.0
+-publish_to: none
+-
+-environment:
+-  sdk: '>=3.0.0 <4.0.0'
+-
+-dependencies:
+-  build_tool:
+-    path: "$BUILD_TOOL_PKG_DIR"
+-EOF
+-
+-mkdir -p "bin"
+-
+-cat << EOF > "bin/build_tool_runner.dart"
+-import 'package:build_tool/build_tool.dart' as build_tool;
+-void main(List<String> args) {
+-  build_tool.runMain(args);
+-}
+-EOF
+-
+-# Create alias for `shasum` if it does not exist and `sha1sum` exists
+-if ! [ -x "$(command -v shasum)" ] && [ -x "$(command -v sha1sum)" ]; then
+-  shopt -s expand_aliases
+-  alias shasum="sha1sum"
+-fi
+-
+-# Dart run will not cache any package that has a path dependency, which
+-# is the case for our build_tool_runner. So instead we precompile the package
+-# ourselves.
+-# To invalidate the cached kernel we use the hash of ls -LR of the build_tool
+-# package directory. This should be good enough, as the build_tool package
+-# itself is not meant to have any path dependencies.
+-
+-if [[ "$OSTYPE" == "darwin"* ]]; then
+-  PACKAGE_HASH=$(ls -lTR "$BUILD_TOOL_PKG_DIR" | shasum)
+-else
+-  PACKAGE_HASH=$(ls -lR --full-time "$BUILD_TOOL_PKG_DIR" | shasum)
+-fi
+-
+-PACKAGE_HASH_FILE=".package_hash"
+-
+-if [ -f "$PACKAGE_HASH_FILE" ]; then
+-    EXISTING_HASH=$(cat "$PACKAGE_HASH_FILE")
+-    if [ "$PACKAGE_HASH" != "$EXISTING_HASH" ]; then
+-        rm "$PACKAGE_HASH_FILE"
+-    fi
+-fi
+-
+-# Run pub get if needed.
+-if [ ! -f "$PACKAGE_HASH_FILE" ]; then
+-    "$DART" pub get --no-precompile
+-    "$DART" compile kernel bin/build_tool_runner.dart
+-    echo "$PACKAGE_HASH" > "$PACKAGE_HASH_FILE"
+-fi
+-
+-set +e
+-
+-"$DART" bin/build_tool_runner.dill "$@"
+-
+-exit_code=$?
+-
+-# 253 means invalid snapshot version.
+-if [ $exit_code == 253 ]; then
+-  "$DART" pub get --no-precompile
+-  "$DART" compile kernel bin/build_tool_runner.dart
+-  "$DART" bin/build_tool_runner.dill "$@"
+-  exit_code=$?
+-fi
+-
+-exit $exit_code
++# Patched for reproducible builds: run build_tool under its own committed
++# pubspec.lock, rather than from a generated wrapper package that has none.
++(cd "$BUILD_TOOL_PKG_DIR" && "$DART" pub get --enforce-lockfile --no-precompile)
++exec "$DART" --packages="$BUILD_TOOL_PKG_DIR/.dart_tool/package_config.json" "$BUILD_TOOL_PKG_DIR/bin/build_tool.dart" "$@"

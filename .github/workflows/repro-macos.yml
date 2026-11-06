@@ -1,0 +1,76 @@
+# Cross-machine check that the macOS app builds byte for byte the same
+# (tools/repro/README.md).
+#
+# Kept here so it cannot run until it is deliberately copied to
+# .github/workflows/. Each matrix entry runs on its own GitHub-hosted VM, so
+# the pair is two machines.
+#
+# Every pin, Xcode's included, comes from tools/repro/repro.toml: the tool
+# refuses to build unless the runner's Xcode is at the pinned path with the
+# pinned tree hash. The xcode-27 image keeps Xcode 27.1 at that same path.
+#
+# A shared runner label does not guarantee a shared image, so each job
+# records its ImageVersion, and the compare job prints both. It fails on a
+# missing record or a differing manifest.
+name: macOS reproducibility
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [repro-ci-experiment]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [runner-1, runner-2]
+    name: build (${{ matrix.name }})
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # BUILD_VERSION is `git describe --tags`.
+          fetch-depth: 0
+      - name: Fetch the release tags
+        # Forks don't carry them, and `git describe` must match a local build.
+        run: git fetch --quiet --tags --force https://github.com/frostsnap/frostsnap.git
+      - name: Build the tool
+        run: cargo build --locked --release --manifest-path tools/repro/Cargo.toml
+      - name: Placeholder firmware
+        run: head -c 1048576 /dev/zero | LC_ALL=C tr '\0' 'F' > "$RUNNER_TEMP/firmware.bin"
+      - name: Build the app
+        run: tools/repro/target/release/repro build macos --commit "$(git rev-parse HEAD)" --env dev --unsigned-firmware --firmware "$RUNNER_TEMP/firmware.bin" --out "$RUNNER_TEMP/out"
+      - name: Record the runner image
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          { echo "image_os=${ImageOS:?}"; echo "image_version=${ImageVersion:?}"; } >> "$RUNNER_TEMP/out/build.env"
+      - name: Record the runner's Xcode, to find what differs from the pin
+        if: failure()
+        shell: bash
+        run: |
+          xcode=$(sed -n 's/^path = "\(.*Xcode.*\)"/\1/p' tools/repro/repro.toml)
+          tools/repro/target/release/repro manifest "$xcode" > "$RUNNER_TEMP/out/xcode.manifest" || ls -la /Applications > "$RUNNER_TEMP/out/applications.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-repro-${{ matrix.name }}
+          path: ${{ runner.temp }}/out
+
+  compare:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+      - name: Runner images
+        shell: bash
+        run: grep -h -E '^(image_version|os_build)=' out/macos-repro-runner-*/build.env
+      - name: Compare manifests
+        run: cargo run --locked --release --manifest-path tools/repro/Cargo.toml -- compare out/macos-repro-runner-1/manifest out/macos-repro-runner-2/manifest
