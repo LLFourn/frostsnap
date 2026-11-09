@@ -1,0 +1,27 @@
+name: repro macOS (throwaway)
+on:
+  pull_request:
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [runner-1, runner-2]
+    name: build (${{ matrix.name }})
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - run: git fetch --quiet --tags --force https://github.com/frostsnap/frostsnap.git
+      - run: curl -sSfL -o "$RUNNER_TEMP/firmware.bin" https://github.com/frostsnap/frostsnap/releases/download/v0.4.1/firmware.bin
+      - run: cargo build --locked --release --manifest-path tools/repro/Cargo.toml
+      - run: tools/repro/target/release/repro build macos --commit "$(git rev-parse HEAD~1)" --firmware "$RUNNER_TEMP/firmware.bin" --out "$RUNNER_TEMP/out"
+      - if: always()
+        run: echo "image_version=${ImageVersion}" >> "$RUNNER_TEMP/out/build.env"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-${{ matrix.name }}
+          path: ${{ runner.temp }}/out

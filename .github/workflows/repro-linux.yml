@@ -1,0 +1,35 @@
+name: repro Linux (throwaway)
+on:
+  pull_request:
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - run: git fetch --quiet --tags --force https://github.com/frostsnap/frostsnap.git
+      - name: Host setup
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap uidmap
+          grep -q "^$(id -un):" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
+          curl -sSfL -o "$RUNNER_TEMP/firmware.bin" https://github.com/frostsnap/frostsnap/releases/download/v0.4.1/firmware.bin
+      - run: cargo build --locked --release --manifest-path tools/repro/Cargo.toml
+      - run: tools/repro/target/release/repro build linux --arch ${{ matrix.arch }} --commit "$(git rev-parse HEAD~1)" --firmware "$RUNNER_TEMP/firmware.bin" --out "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/out
