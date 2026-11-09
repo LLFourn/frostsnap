@@ -1,0 +1,53 @@
+# A Linux VM on a Mac for building the Linux app with repro. The VM needs
+# only bubblewrap: repro makes the build root itself. Rosetta lets the same VM
+# build for x86_64 as well as aarch64.
+#
+#   limactl start --name=repro tools/repro/linux/lima.yaml
+#   limactl shell repro
+#   export CARGO_TARGET_DIR=/tmp/lima/target   # your checkout is mounted read-only
+#   cargo run --release --manifest-path tools/repro/Cargo.toml -- \
+#     build linux --commit v0.4.1 --firmware /tmp/lima/firmware.bin --out /tmp/lima/out [--arch x86_64]
+#
+# A second VM with a different identity stands in for a second machine:
+#   limactl start --name=repro-b --cpus=6 --memory=10 \
+#     --set '.user.name="builder" | .param.TZ="Asia/Tokyo" | .param.LOCALE="de_DE.UTF-8"' \
+#     tools/repro/linux/lima.yaml
+vmType: vz
+vmOpts:
+  vz:
+    rosetta:
+      enabled: true
+      binfmt: true
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+cpus: 4
+memory: "8GiB"
+disk: "40GiB"
+mounts:
+  - location: "~"
+    writable: false
+  - location: "/tmp/lima"
+    writable: true
+param:
+  TZ: "Australia/Sydney"
+  LOCALE: "en_AU.UTF-8"
+containerd:
+  system: false
+  user: false
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      timedatectl set-timezone "{{.Param.TZ}}"
+      locale-gen "{{.Param.LOCALE}}"
+      update-locale LANG="{{.Param.LOCALE}}"
+      apt-get update
+      # bubblewrap and uidmap for the build; the rest builds repro itself.
+      apt-get install -y bubblewrap uidmap curl git build-essential
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      command -v cargo || curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal
