@@ -1,0 +1,51 @@
+# The Linux build's own pins, read together with repro.toml. Keys named by
+# arch are as `uname -m` names the target: x86_64 or aarch64.
+
+os = { id = "ubuntu", version_id = "24.04" }
+apt_snapshot = "20261101T000000Z"
+
+# Ubuntu's base root filesystem. The build root is unpacked from it afresh
+# each time, and the packages below are installed into it from the snapshot.
+[base]
+x86_64 = { url = "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.5-base-amd64.tar.gz", sha256 = "e77b6f10c2590cef872b33ee9f635a0e3fd1f57fb074c0e52b5c7f56147a0c86" }
+aarch64 = { url = "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.5-base-arm64.tar.gz", sha256 = "a91d5a93010193712d346d761372b7c9db6dfcf093893161c64ca107f05914f2" }
+
+# Every installed package, not only those named below: the hash of
+# `dpkg-query -W -f '${Package} ${Version} ${Architecture}\n'`, without its
+# final newline, in the build root once the packages are installed.
+[installed_sha256]
+x86_64 = "856f6f81019cd6fba16f17626eeaa8c40ac4dc62badf48cc3c603ed12188d3d7"
+aarch64 = "6eef22f640abbbe679669aa982830541498bf3b78f8bf60220e8b041d1c9f8f0"
+
+[packages]
+build-essential = "12.10ubuntu1"
+ca-certificates = "20260816ubuntu0.24.04.1"
+clang = "1:18.0-59~exp2"
+cmake = "3.28.3-1build7"
+curl = "8.5.0-2ubuntu10.16"
+file = "1:5.45-3build1"
+git = "1:2.43.0-1ubuntu7.4"
+libclang-dev = "1:18.0-59~exp2"
+libgtk-3-dev = "3.24.41-4ubuntu1.3"
+liblzma-dev = "5.6.1+really5.4.5-1ubuntu0.4"
+libudev-dev = "255.4-1ubuntu8.18"
+ninja-build = "1.11.1-2"
+patch = "2.7.6-7build3"
+pkg-config = "1.8.1-2build1"
+unzip = "6.0-28ubuntu4.1"
+xz-utils = "5.6.1+really5.4.5-1ubuntu0.4"
+
+# The Rust installed into the build root, per host triple.
+[rust]
+aarch64-unknown-linux-gnu = [
+  { url = "https://static.rust-lang.org/dist/2026-04-16/rustc-1.95.0-aarch64-unknown-linux-gnu.tar.xz", sha256 = "0fe3689eeaed603e5ef24572d11597d3edadaefd2cb181674ad621260f2501d2" },
+  { url = "https://static.rust-lang.org/dist/2026-04-16/rust-std-1.95.0-aarch64-unknown-linux-gnu.tar.xz", sha256 = "3a21b271b1ff973b94d69b25e7a39992f9fbcae1ab6d9475844a23e6ad3908ac" },
+  { url = "https://static.rust-lang.org/dist/2026-04-16/cargo-1.95.0-aarch64-unknown-linux-gnu.tar.xz", sha256 = "7c070aeba9bbf12073646995a03f36c346bb5f541d0078ba6d9dc2a7adaaf6af" },
+  { url = "https://static.rust-lang.org/dist/2026-04-16/rustfmt-1.95.0-aarch64-unknown-linux-gnu.tar.xz", sha256 = "64cce868f0f3d29f1524e11e9bab01ac9d538a31665fea1cd6b78af46a1c0a41" },
+]
+x86_64-unknown-linux-gnu = [
+  { url = "https://static.rust-lang.org/dist/2026-04-16/rustc-1.95.0-x86_64-unknown-linux-gnu.tar.xz", sha256 = "8426a3d170a5879f5682f5fbdd024a1779b3951e7baba685af2d6dc32a6dfc15" },
+  { url = "https://static.rust-lang.org/dist/2026-04-16/rust-std-1.95.0-x86_64-unknown-linux-gnu.tar.xz", sha256 = "047ea7098803d3500fa1072e9cee5392697e21525559e4458128a2bf874aa382" },
+  { url = "https://static.rust-lang.org/dist/2026-04-16/cargo-1.95.0-x86_64-unknown-linux-gnu.tar.xz", sha256 = "e74edd2cf7d0f1f1383b4f00eb90c843750bc489e2ccf7214e6476678a907425" },
+  { url = "https://static.rust-lang.org/dist/2026-04-16/rustfmt-1.95.0-x86_64-unknown-linux-gnu.tar.xz", sha256 = "f1b2a7301513ffdd95ebf22ebbdd932e4d17fc806f748d93924740d0297b1396" },
+]

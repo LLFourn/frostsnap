@@ -1,0 +1,52 @@
+# What every platform's build of the Frostsnap app shares, pinned by content
+# hash. Each platform's own pins are in macos.toml and linux.toml. Inputs
+# pinned by a lockfile are not repeated: Cargo.lock and pubspec.lock carry a
+# checksum per crate and package, and cargo and pub check them.
+
+root = "/var/tmp/frostsnap-repro"
+
+# The Rust that builds the app: on macOS, the rustc on PATH must be this
+# version; on Linux, linux.toml pins its tarballs.
+[rust]
+version = "1.95.0"
+
+[flutter]
+version = "3.38.5"
+git = "https://github.com/flutter/flutter.git"
+commit = "f6ff1529fd6d8af5f706051d9251ac9231c83407"
+
+# Flutter's bootstrap would download this and run it before anything could
+# check it, so the tool installs it first.
+[flutter.dart_sdk]
+aarch64-apple-darwin = { url = "https://storage.googleapis.com/flutter_infra_release/flutter/1527ae0ec577a4ef50e65f6fefcfc1326707d9bf/dart-sdk-darwin-arm64.zip", sha256 = "dec1e780936c8d8a6636ed1bffb9e34d370297dce1d51d8ce7878f2c7df522db" }
+aarch64-unknown-linux-gnu = { url = "https://storage.googleapis.com/flutter_infra_release/flutter/1527ae0ec577a4ef50e65f6fefcfc1326707d9bf/dart-sdk-linux-arm64.zip", sha256 = "91676d65e0d0108a797005b918c9a6eb8beb60b52076badb8178910ff59ebb56" }
+x86_64-unknown-linux-gnu = { url = "https://storage.googleapis.com/flutter_infra_release/flutter/1527ae0ec577a4ef50e65f6fefcfc1326707d9bf/dart-sdk-linux-x64.zip", sha256 = "d7fabb4e5645320fbdcdf6c453740ea43217c076b15e0c6f0e923b07a19d8717" }
+
+# Flutter's bootstrap resolves flutter_tools with `pub upgrade` and no
+# lockfile; this is the lockfile that produced at the pinned commit, which the
+# tool enforces instead. Relative to this file.
+[flutter.tools_lockfile]
+path = "locks/flutter_tools-3.38.5.pubspec.lock"
+sha256 = "246d46461bdfa97d5734a188d16fc2741dddc88d111eeb49dfe6bc6087bc771f"
+
+# Keyed by Flutter's target platform. A Linux build with no pin yet stops
+# after the download and prints the hash to pin here; it can only be taken on
+# Linux.
+[flutter.cache]
+macos = "9a039dd13713c28267535f4cf83a14fa94b50303407525ce0b9cd166b1d8ee4b"
+linux-arm64 = "edf342fddc7e1516e1c303cae0f645751fd8251699adab1b980ca6c737115e70"
+linux-x64 = "1434df18a763154fe49d1699a04f3639118807a4c922d03c75b0ae5bbe3a4b02"
+
+# flutter_rust_bridge_codegen runs `cargo expand`, and installs it from the
+# network if missing.
+[[cargo_tools]]
+name = "flutter_rust_bridge_codegen"
+version = "2.11.1"
+url = "https://static.crates.io/crates/flutter_rust_bridge_codegen/flutter_rust_bridge_codegen-2.11.1.crate"
+sha256 = "8196d44913683419189948ec655f23f6d6166883ec0e5081ba443c62e5570260"
+
+[[cargo_tools]]
+name = "cargo-expand"
+version = "1.0.95"
+url = "https://static.crates.io/crates/cargo-expand/cargo-expand-1.0.95.crate"
+sha256 = "7387bf18a4b0f6ea69a213a0fa8464bc68cd571b3da604633827ca7a9047046e"

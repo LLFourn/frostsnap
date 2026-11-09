@@ -1,0 +1,26 @@
+[package]
+name = "frostsnap_repro"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "repro"
+path = "src/main.rs"
+
+# Kept out of the app workspace so its lockfile, and so the tool that checks a
+# build, doesn't move when the app's dependencies do.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+
+[profile.dev]
+# Hashing Xcode in an unoptimised build takes minutes.
+opt-level = 3
