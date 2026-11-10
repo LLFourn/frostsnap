@@ -1,4 +1,19 @@
 [toolchain]
 channel = "1.95.0"
 components = ["rust-src", "rustfmt", "clippy"]
-targets = ["riscv32imc-unknown-none-elf"]
+# Cargokit doesn't install targets itself, so every target the app builds
+# for is listed here alongside the firmware's.
+targets = [
+    "riscv32imc-unknown-none-elf",
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "x86_64-linux-android",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "x86_64-apple-ios",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
