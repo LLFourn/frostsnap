@@ -1,0 +1,46 @@
+name: repro Linux on Arch (throwaway)
+on:
+  pull_request:
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            image: archlinux:latest
+    name: arch (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - run: git fetch --quiet --tags --force https://github.com/frostsnap/frostsnap.git
+      - run: curl -sSfL -o "$RUNNER_TEMP/firmware.bin" https://github.com/frostsnap/frostsnap/releases/download/v0.4.1/firmware.bin
+      - run: cargo build --locked --release --manifest-path tools/repro/Cargo.toml
+      - name: Build inside Arch Linux
+        run: |
+          # The container shares the runner's Ubuntu kernel, whose AppArmor policy is the one that applies.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          mkdir -p "$RUNNER_TEMP/out"
+          docker run --rm --privileged -e UID_HOST="$(id -u)" \
+            -v "$PWD:/src" -v "$RUNNER_TEMP:/work" ${{ matrix.image }} bash -euxc '
+              pacman -Syu --noconfirm --quiet bubblewrap git curl tar
+              useradd -m -u "$UID_HOST" builder
+              usermod --add-subuids 100000-165535 --add-subgids 100000-165535 builder
+              # Docker drops the file capabilities Arch gives newuidmap; setuid works in their place.
+              getcap /usr/bin/newuidmap || true
+              chmod u+s /usr/bin/newuidmap /usr/bin/newgidmap
+              cat /etc/os-release; uname -a; bwrap --version
+              chown builder /work/out
+              runuser -u builder -- git config --global --add safe.directory /src
+              runuser -u builder -- bash -euxc "cd /src && tools/repro/target/release/repro build linux --arch ${{ matrix.arch }} \
+                --commit \$(git rev-parse HEAD~1) --firmware /work/firmware.bin --out /work/out/r"
+            '
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arch-${{ matrix.arch }}
+          path: ${{ runner.temp }}/out/r
