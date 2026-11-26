@@ -60,9 +60,13 @@ impl AddressInput {
     /// Accepts a bare address or a `bitcoin:` URI, with surrounding whitespace.
     pub fn parse(text: &str, network: Network) -> Self {
         let trimmed = text.trim();
-        let parsed = match trimmed.parse::<bip21::Uri<NetworkUnchecked>>() {
-            Ok(uri) => Some(uri.address),
-            Err(_) => trimmed.parse::<Address<NetworkUnchecked>>().ok(),
+        let parsed = if has_uri_scheme(trimmed) {
+            trimmed
+                .parse::<bip21::Uri<NetworkUnchecked>>()
+                .ok()
+                .map(|uri| uri.address)
+        } else {
+            trimmed.parse::<Address<NetworkUnchecked>>().ok()
         };
         if let Some(address) = parsed {
             return AddressInput {
@@ -82,15 +86,19 @@ impl AddressInput {
     }
 }
 
+/// bip21 slices its first eight bytes unchecked and panics when that cuts a character, so it only
+/// gets text this accepts.
+fn has_uri_scheme(text: &str) -> bool {
+    text.get(..URI_SCHEME.len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(URI_SCHEME))
+}
+
 /// Returns the address part of `text` and its byte offset within `text`.
 fn strip_uri(text: &str) -> (usize, &str) {
     let trimmed = text.trim_start();
     let mut offset = text.len() - trimmed.len();
     let mut rest = trimmed;
-    if rest
-        .get(..URI_SCHEME.len())
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(URI_SCHEME))
-    {
+    if has_uri_scheme(rest) {
         offset += URI_SCHEME.len();
         rest = &rest[URI_SCHEME.len()..];
     }
@@ -276,6 +284,14 @@ mod test {
             parse(&format!("bitcoin:{MAINNET_TAPROOT}?")).status,
             NotAnAddress
         );
+    }
+
+    #[test]
+    fn a_multi_byte_character_across_the_scheme_boundary_is_not_a_panic() {
+        assert_eq!(parse("bitcoin\u{2236}x").status, NotAnAddress);
+        let input = parse("bc1p5cy\u{e9}");
+        assert_eq!(input.status, InvalidCharacters);
+        assert_eq!(input.bad_chars, vec![7]);
     }
 
     #[test]
