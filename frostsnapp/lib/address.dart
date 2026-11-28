@@ -247,7 +247,7 @@ class _AddressLookupState extends State<AddressLookup> {
                 key: const Key('search-not-found'),
                 icon: Icons.block,
                 color: theme.colorScheme.onSurfaceVariant,
-                title: 'Not in this wallet',
+                title: 'No match in the checked range',
                 children: [
                   Text('Not among ${_indexRange(0, checkedTo)}.'),
                   const SizedBox(height: 8),
@@ -432,17 +432,21 @@ class _HighlightingController extends TextEditingController {
       backgroundColor: colors.error,
       fontWeight: FontWeight.bold,
     );
+    // Rust reports where each bad character starts; one outside the BMP spans two code units.
+    bool isBad(int i) =>
+        badChars.contains(i) ||
+        (badChars.contains(i - 1) &&
+            (text.codeUnitAt(i - 1) & 0xFC00) == 0xD800);
     final spans = <TextSpan>[];
     var runStart = 0;
     for (var i = 0; i <= text.length; i++) {
       final boundary =
-          i == text.length ||
-          (i > runStart && badChars.contains(i) != badChars.contains(runStart));
+          i == text.length || (i > runStart && isBad(i) != isBad(runStart));
       if (!boundary) continue;
       spans.add(
         TextSpan(
           text: text.substring(runStart, i),
-          style: badChars.contains(runStart) ? badStyle : null,
+          style: isBad(runStart) ? badStyle : null,
         ),
       );
       runStart = i;

@@ -95,6 +95,21 @@ void main() {
       expect(highlighted(tester), isEmpty);
     });
 
+    testWidgets('a highlight covers the whole of an emoji', (tester) async {
+      final harness = Harness();
+      await tester.pumpWidget(harness.build());
+      await enter(tester, withCharAt(mainnetTaproot, 20, '\u{1F600}'));
+      expect(highlighted(tester), {20, 21});
+      final span = tester
+          .state<EditableTextState>(find.byType(EditableText))
+          .buildTextSpan();
+      final highlightedText = span.children!
+          .cast<TextSpan>()
+          .where((child) => child.style?.backgroundColor != null)
+          .map((child) => child.text);
+      expect(highlightedText, ['\u{1F600}']);
+    });
+
     testWidgets('a scanned URI fills the field and starts the search', (
       tester,
     ) async {
